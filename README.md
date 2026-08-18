@@ -4,6 +4,8 @@
 
 完整设计见 [项目架构文档](docs/travel-agent-architecture.md)。
 
+如果你正在跟随项目学习，请从 [v0.1 学习与实现文档](docs/v0.1/README.md) 开始。该目录只描述当前已经落地的代码，并包含请求生命周期、代码导读、LangGraph 原理、约束验证、运行测试和练习。
+
 ## 当前进度
 
 当前完成的是第一条可运行主线：
@@ -120,4 +122,3 @@ docs/                    # 完整架构文档
 3. 接入高德 POI/路线 API，并增加缓存、超时和重试。
 4. 增加自然语言 Requirement Parser，同时保留结构化 API 输入。
 5. 将开发期内存 Checkpoint 替换为 PostgreSQL Checkpoint。
-
