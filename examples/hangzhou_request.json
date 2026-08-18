@@ -1,0 +1,44 @@
+{
+  "trip": {
+    "destination": "杭州",
+    "start_date": "2026-10-02",
+    "end_date": "2026-10-04",
+    "travelers": 3,
+    "arrival": {
+      "name": "杭州东站",
+      "at": "2026-10-02T10:30:00+08:00",
+      "coordinate": {
+        "longitude": 120.212,
+        "latitude": 30.2909
+      }
+    },
+    "departure": {
+      "name": "杭州东站",
+      "at": "2026-10-04T19:00:00+08:00",
+      "coordinate": {
+        "longitude": 120.212,
+        "latitude": 30.2909
+      }
+    },
+    "accommodation": {
+      "name": "西湖东侧",
+      "coordinate": {
+        "longitude": 120.165,
+        "latitude": 30.25
+      }
+    },
+    "total_budget": "1500",
+    "interests": ["自然", "美食", "人文"],
+    "avoid": ["高强度"],
+    "must_visit": ["灵隐寺"],
+    "pace": "relaxed",
+    "mobility": {
+      "max_daily_walking_meters": 6000,
+      "max_daily_activity_minutes": 360,
+      "needs_frequent_rest": true
+    },
+    "daily_start": "09:00:00",
+    "daily_end": "20:00:00"
+  },
+  "max_replan_rounds": 2
+}
