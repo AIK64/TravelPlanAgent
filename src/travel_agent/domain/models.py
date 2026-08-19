@@ -122,6 +122,35 @@ class POI(BaseModel):
     source: str = "mock"
 
 
+class PlanningAssumption(BaseModel):
+    field: str
+    value: str
+    reason: str
+    policy_version: str = "v0.2-default-1"
+    created_at: datetime
+
+
+class PlanningPOI(BaseModel):
+    facts: "POIFacts"
+    opening_windows: dict[date, TimeWindow]
+    duration_minutes: int
+    party_cost: Decimal | None
+    assumptions: list[PlanningAssumption] = Field(default_factory=list)
+    data_confidence: float = Field(ge=0, le=1)
+
+
+class POIResolution(BaseModel):
+    poi: PlanningPOI | None
+    missing_fields: list[str] = Field(default_factory=list)
+
+
+class POIResolutionIssue(BaseModel):
+    poi_id: str
+    poi_name: str
+    missing_fields: list[str]
+    required: bool = False
+
+
 class PlanItem(BaseModel):
     type: ItemType
     name: str
