@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Mapping
 
 from travel_agent.domain.tool_models import ProviderMode, UnknownFactPolicy
@@ -10,7 +10,7 @@ from travel_agent.domain.tool_models import ProviderMode, UnknownFactPolicy
 @dataclass(frozen=True, slots=True)
 class Settings:
     provider: ProviderMode = ProviderMode.MOCK
-    amap_api_key: str | None = None
+    amap_api_key: str | None = field(default=None, repr=False)
     tool_timeout_seconds: float = 5.0
     tool_max_attempts: int = 3
     tool_backoff_base_seconds: float = 0.25

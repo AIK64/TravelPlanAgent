@@ -31,6 +31,15 @@ def test_amap_accepts_non_empty_key():
     assert settings.amap_api_key == "test-key"
 
 
+def test_settings_repr_does_not_expose_amap_api_key():
+    """若配置被日志记录，真实 Provider 凭证不得出现在日志中。"""
+    settings = Settings.from_env(
+        {"TRAVEL_PROVIDER": "amap", "AMAP_API_KEY": "test-key"}
+    )
+
+    assert "test-key" not in repr(settings)
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
