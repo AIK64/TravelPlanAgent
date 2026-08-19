@@ -43,6 +43,23 @@ class ToolProviderError(Exception):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ToolRetryExhausted(Exception):
+    """工具调用在重试预算耗尽或遇到永久错误后的结构化失败。"""
+
+    last_error: ToolProviderError
+    attempts: int
+
+    def __post_init__(self) -> None:
+        if self.attempts < 1:
+            raise ValueError("attempts must be at least 1")
+        Exception.__init__(
+            self,
+            f"Tool provider retry exhausted after {self.attempts} attempts: "
+            f"{self.last_error.safe_message}"
+        )
+
+
 @dataclass
 class ToolUnavailableError(Exception):
     result: ToolResult[Any]
