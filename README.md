@@ -2,6 +2,12 @@
 
 一个面向中国城市旅行场景的约束感知自适应规划 Agent。项目采用 LangGraph 构建有状态的 `Plan → Execute → Validate → Replan` 工作流，并将 LLM 语义职责、确定性约束验证和路线优化解耦。
 
+## 项目定位与开发优先级
+
+本项目首先是一个用于简历和面试展示的 **Agent Engineering 项目**。开发优先级是 Agent 的显式状态、Tool Use、条件路由、验证与 Replan Loop、上下文管理、Human-in-the-loop、执行轨迹和评测；地图 Provider、缓存、重试、API 与存储是支撑这些 Agent 能力可靠运行的工程层，不追求脱离 Agent 目标的全面业务覆盖。
+
+每个版本都必须说明新增了什么 Agent 能力、它如何改变 Graph 轨迹，以及怎样通过日志、测试或 Benchmark 证明。长期约束见 [项目记忆与开发原则](AGENTS.md)。
+
 完整设计见 [项目架构文档](docs/travel-agent-architecture.md)。
 
 如果你正在跟随项目学习，请从 [v0.1 学习与实现文档](docs/v0.1/README.md) 开始。该目录只描述当前已经落地的代码，并包含请求生命周期、代码导读、LangGraph 原理、约束验证、运行测试和练习。
@@ -17,6 +23,7 @@
 - 时间、预算、营业时间、到离站缓冲、步行与必去地点校验
 - LangGraph `Plan → Validate → Replan` 有界循环
 - 基于 `InMemorySaver` 的开发期 Checkpoint
+- 带 `thread_id` 关联的结构化链路日志（INFO / DEBUG）
 - FastAPI 健康检查和同步规划接口
 - 单元、工作流和 API 测试
 
@@ -55,6 +62,7 @@ validate_candidates
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+$env:APP_LOG_LEVEL = "INFO"
 .\.venv\Scripts\python.exe -m uvicorn travel_agent.app:app --reload
 ```
 
@@ -63,17 +71,31 @@ python -m venv .venv
 - OpenAPI：<http://127.0.0.1:8000/docs>
 - 健康检查：<http://127.0.0.1:8000/health>
 
+规划链路日志会输出到运行 Uvicorn 的终端。需要查看每天的候选行程和具体违规时，将 `APP_LOG_LEVEL` 改为 `DEBUG`。详细事件说明见 [v0.1 可观测性与链路日志](docs/v0.1/09-observability-and-logging.md)。
+
 ## 调用示例
 
 请求体位于 [`examples/hangzhou_request.json`](examples/hangzhou_request.json)。
 
 ```powershell
-$body = Get-Content .\examples\hangzhou_request.json -Raw
+$body = Get-Content `
+  -LiteralPath .\examples\hangzhou_request.json `
+  -Raw `
+  -Encoding UTF8
+
+$null = $body | ConvertFrom-Json
+
 Invoke-RestMethod `
   -Method Post `
   -Uri http://127.0.0.1:8000/api/v1/plans `
-  -ContentType "application/json" `
+  -ContentType "application/json; charset=utf-8" `
   -Body $body
+```
+
+也可以直接运行兼容 Windows PowerShell 5.1 和 PowerShell 7 的脚本：
+
+```powershell
+.\scripts\invoke-hangzhou-example.ps1
 ```
 
 接口返回：

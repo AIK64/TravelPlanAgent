@@ -6,6 +6,7 @@ from travel_agent.domain.models import PlanCandidate, POI, TripSpec
 
 
 class TravelState(TypedDict):
+    thread_id: str
     trip: TripSpec
     pois: list[POI]
     candidates: list[PlanCandidate]
@@ -14,4 +15,3 @@ class TravelState(TypedDict):
     max_replan_rounds: int
     status: str
     message: str | None
-

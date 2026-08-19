@@ -341,17 +341,21 @@ Plan
 
 ## 12. 怎样观察 Graph
 
-初学阶段可以在每个节点加入日志，观察：
+当前版本已经在工作流中加入链路日志。使用 `INFO` 可以观察：
 
 ```text
-节点名
-当前 status
-candidates 数量
-iterations
-合法候选数量
+planning.started
+node.started / node.completed
+candidate.generated / candidate.validated
+routing.decision
+replan.started / replan.completed
+plan.selected 或 planning.infeasible
+planning.completed
 ```
 
-不要打印整个 State，因为后续路线矩阵和 POI 数据会很大，也可能包含敏感信息。
+关键事件都包含 `thread_id`。切换到 `DEBUG` 后，还能看到每天的候选行程摘要和具体违规。日志不会打印整个 State，因为后续路线矩阵和 POI 数据会很大，也可能包含敏感信息。
+
+运行方式、字段含义和完整事件目录见 [可观测性与链路日志](09-observability-and-logging.md)。
 
 ## 13. 未来扩展位置
 

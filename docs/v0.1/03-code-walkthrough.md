@@ -10,6 +10,7 @@ LearnAgent/
 │   └── hangzhou_request.json
 ├── src/travel_agent/
 │   ├── app.py
+│   ├── logging_config.py
 │   ├── api/
 │   │   └── routes.py
 │   ├── domain/
@@ -26,6 +27,7 @@ LearnAgent/
     ├── conftest.py
     ├── test_api.py
     ├── test_domain_models.py
+    ├── test_logging.py
     └── test_workflow.py
 ```
 
@@ -378,6 +380,10 @@ feedback.py
 
 而不让 `app.py` 变成一个巨大的文件。
 
+### logging_config.py
+
+集中配置 Python 标准库 `logging`。它从 `APP_LOG_LEVEL` 读取日志级别，默认使用 `INFO`；未知值会安全回退为 `INFO`。工作流使用模块级 Logger 记录事件，避免散落的 `print` 无法筛选级别或关联请求。
+
 ## 11. tests：可执行的行为说明
 
 测试不仅是检查错误，也是最可靠的使用示例。
@@ -398,6 +404,10 @@ feedback.py
 
 从 HTTP 接口层验证整个调用链。
 
+### test_logging.py
+
+验证日志级别配置、正常规划流、DEBUG 候选日程摘要以及 Replan 到无解的完整日志流。
+
 ## 12. 模块依赖方向
 
 ```mermaid
@@ -412,4 +422,3 @@ flowchart TD
 ```
 
 `domain` 不依赖 FastAPI 或 LangGraph。这意味着核心业务模型可以脱离 Web 框架使用，是一个健康的依赖方向。
-

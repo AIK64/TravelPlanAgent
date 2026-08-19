@@ -33,8 +33,8 @@ v0.1 是一个：
 - 核心框架：FastAPI、Pydantic、LangGraph
 - 数据来源：杭州 Mock POI
 - Checkpoint：`InMemorySaver`
-- 测试数量：6
-- 当前测试结果：6 passed
+- 测试数量：11
+- 当前测试结果：11 passed
 - 当前代码覆盖率：93%
 
 ## 推荐阅读顺序
@@ -46,6 +46,8 @@ v0.1 是一个：
 5. [约束验证、评分与 Replan](05-validation-and-replanning.md)
 6. [运行、测试与新手练习](06-running-testing-and-exercises.md)
 7. [从 v0.1 到 v0.2 的路线](07-roadmap-to-v0.2.md)
+8. [常见问题与排障](08-troubleshooting.md)
+9. [可观测性与链路日志](09-observability-and-logging.md)
 
 ## 文档与代码的对应关系
 
@@ -58,6 +60,7 @@ v0.1 是一个：
 | Loop 怎样形成 | `graph/workflow.py` | 04 |
 | API 怎样接收请求 | `api/routes.py`、`app.py` | 02、03 |
 | 怎样保证功能没有被改坏 | `tests/` | 06 |
+| 怎样观察节点流转和中间结果 | `logging_config.py`、`graph/workflow.py` | 09 |
 
 ## 关键术语
 
@@ -107,4 +110,3 @@ LangGraph 对执行状态的保存。v0.1 使用内存 Checkpoint，只能用于
 4. 它应该由 LLM、算法还是普通代码实现？
 
 能够回答这四个问题，比记住某个框架 API 更重要。
-

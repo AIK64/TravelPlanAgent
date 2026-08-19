@@ -52,9 +52,20 @@ editable 模式下修改 `src/travel_agent` 后不需要每次重新安装包。
 
 ## 3. 启动 API
 
+默认使用 `INFO` 级别，能够看到节点流转和候选验证摘要：
+
 ```powershell
+$env:APP_LOG_LEVEL = "INFO"
 .\.venv\Scripts\python.exe -m uvicorn travel_agent.app:app --reload
 ```
+
+如果需要查看每天的候选行程与具体违规，将级别改为：
+
+```powershell
+$env:APP_LOG_LEVEL = "DEBUG"
+```
+
+日志显示在运行 Uvicorn 的终端，而不是执行 `Invoke-RestMethod` 的客户端终端。完整说明见 [可观测性与链路日志](09-observability-and-logging.md)。
 
 命令解释：
 
@@ -82,14 +93,27 @@ FastAPI 会自动生成 Swagger UI，可以直接在网页里测试接口。
 另开一个 PowerShell：
 
 ```powershell
-$body = Get-Content .\examples\hangzhou_request.json -Raw
+$body = Get-Content `
+  -LiteralPath .\examples\hangzhou_request.json `
+  -Raw `
+  -Encoding UTF8
+
+$null = $body | ConvertFrom-Json
 
 Invoke-RestMethod `
   -Method Post `
   -Uri http://127.0.0.1:8000/api/v1/plans `
-  -ContentType "application/json" `
+  -ContentType "application/json; charset=utf-8" `
   -Body $body
 ```
+
+或者直接运行：
+
+```powershell
+.\scripts\invoke-hangzhou-example.ps1
+```
+
+显式写 `-Encoding UTF8` 是为了兼容 Windows PowerShell 5.1。具体原因和排查方法见 [常见问题与排障](08-troubleshooting.md)。
 
 重点观察返回值：
 
@@ -266,4 +290,3 @@ ChengduMockProvider
 - [ ] 为什么无解不是程序异常？
 - [ ] InMemorySaver 为什么不能用于生产？
 - [ ] v0.1 哪些部分是真实实现，哪些仍是未来设计？
-
