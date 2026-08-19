@@ -9,11 +9,13 @@ from travel_agent.domain.models import (
     TimeWindow,
     TripSpec,
 )
-from travel_agent.domain.tool_models import POIFacts, UnknownFactPolicy
+from travel_agent.domain.tool_models import POIFacts, UnknownFactPolicy, ValueSource
 
 
-PlanningPOI.model_rebuild(_types_namespace={"POIFacts": POIFacts})
-POIResolution.model_rebuild(_types_namespace={"POIFacts": POIFacts})
+_MODEL_TYPES = {"POIFacts": POIFacts, "ValueSource": ValueSource}
+PlanningAssumption.model_rebuild(_types_namespace=_MODEL_TYPES)
+PlanningPOI.model_rebuild(_types_namespace=_MODEL_TYPES)
+POIResolution.model_rebuild(_types_namespace=_MODEL_TYPES)
 
 
 DEFAULT_OPENING_WINDOW = TimeWindow(start="10:00", end="16:00")
@@ -30,16 +32,18 @@ class POIDefaultPolicy:
 
     def resolve(self, facts: POIFacts, trip: TripSpec) -> POIResolution:
         """解析给定行程日期范围内的 POI 规划事实。"""
-        opening_windows, missing_opening_window = self._resolve_opening_windows(facts, trip)
+        opening_windows, opening_window_sources, default_opening_dates = self._resolve_opening_windows(
+            facts, trip
+        )
         missing_fields = [
-            *( ["opening_window"] if missing_opening_window else [] ),
+            *( ["opening_window"] if default_opening_dates else [] ),
             *( ["duration_minutes"] if facts.suggested_duration_minutes is None else [] ),
             *( ["party_cost"] if facts.average_cost_per_person is None else [] ),
         ]
         if self.unknown_fact_policy is UnknownFactPolicy.STRICT and missing_fields:
             return POIResolution(poi=None, missing_fields=missing_fields)
 
-        assumptions = self._build_assumptions(facts, missing_fields)
+        assumptions = self._build_assumptions(facts, missing_fields, default_opening_dates)
         duration_minutes = facts.suggested_duration_minutes or DEFAULT_DURATION_MINUTES
         party_cost = (
             facts.average_cost_per_person * trip.travelers
@@ -57,15 +61,30 @@ class POIDefaultPolicy:
                 duration_minutes=duration_minutes,
                 party_cost=party_cost,
                 assumptions=assumptions,
+                field_sources={
+                    "duration_minutes": (
+                        ValueSource.PROVIDER
+                        if facts.suggested_duration_minutes is not None
+                        else ValueSource.DEFAULT
+                    ),
+                    "party_cost": (
+                        ValueSource.DERIVED
+                        if facts.average_cost_per_person is not None
+                        else ValueSource.DEFAULT
+                    ),
+                    "data_confidence": ValueSource.DERIVED,
+                },
+                opening_window_sources=opening_window_sources,
                 data_confidence=data_confidence,
             )
         )
 
     def _resolve_opening_windows(
         self, facts: POIFacts, trip: TripSpec
-    ) -> tuple[dict[date, TimeWindow], bool]:
+    ) -> tuple[dict[date, TimeWindow], dict[date, ValueSource], list[date]]:
         windows: dict[date, TimeWindow] = {}
-        missing_opening_window = False
+        sources: dict[date, ValueSource] = {}
+        default_dates: list[date] = []
         trip_date = trip.start_date
         while trip_date <= trip.end_date:
             if facts.today_opening_date == trip_date and facts.today_opening_window is not None:
@@ -73,15 +92,19 @@ class POIDefaultPolicy:
             else:
                 window = facts.opening_windows_by_weekday.get(trip_date.weekday())
             if window is None:
-                missing_opening_window = True
                 window = DEFAULT_OPENING_WINDOW
+                source = ValueSource.DEFAULT
+                default_dates.append(trip_date)
+            else:
+                source = ValueSource.PROVIDER
             windows[trip_date] = window
+            sources[trip_date] = source
             trip_date += timedelta(days=1)
-        return windows, missing_opening_window
+        return windows, sources, default_dates
 
     @staticmethod
     def _build_assumptions(
-        facts: POIFacts, missing_fields: list[str]
+        facts: POIFacts, missing_fields: list[str], default_opening_dates: list[date]
     ) -> list[PlanningAssumption]:
         details = {
             "opening_window": (
@@ -102,6 +125,8 @@ class POIDefaultPolicy:
                 field=field,
                 value=details[field][0],
                 reason=details[field][1],
+                source=ValueSource.DEFAULT,
+                affected_dates=default_opening_dates if field == "opening_window" else [],
                 created_at=facts.fetched_at,
             )
             for field in missing_fields

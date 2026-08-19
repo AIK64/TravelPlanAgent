@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 
 from travel_agent.domain.models import Coordinate, TimeWindow
-from travel_agent.domain.tool_models import POIFacts, UnknownFactPolicy
+from travel_agent.domain.tool_models import POIFacts, UnknownFactPolicy, ValueSource
 from travel_agent.planning.defaults import POIDefaultPolicy
 
 
@@ -41,6 +41,26 @@ def test_assume_policy_marks_missing_hours_duration_and_cost(hangzhou_trip, poi_
         "duration_minutes",
         "party_cost",
     }
+    assert resolution.poi.field_sources == {
+        "duration_minutes": ValueSource.DEFAULT,
+        "party_cost": ValueSource.DEFAULT,
+        "data_confidence": ValueSource.DERIVED,
+    }
+    assert resolution.poi.opening_window_sources == {
+        date(2026, 10, 2): ValueSource.DEFAULT,
+        date(2026, 10, 3): ValueSource.DEFAULT,
+        date(2026, 10, 4): ValueSource.DEFAULT,
+    }
+    assumptions_by_field = {item.field: item for item in resolution.poi.assumptions}
+    assert {item.source for item in assumptions_by_field.values()} == {ValueSource.DEFAULT}
+    assert assumptions_by_field["opening_window"].source is ValueSource.DEFAULT
+    assert assumptions_by_field["opening_window"].affected_dates == [
+        date(2026, 10, 2),
+        date(2026, 10, 3),
+        date(2026, 10, 4),
+    ]
+    assert assumptions_by_field["duration_minutes"].affected_dates == []
+    assert assumptions_by_field["party_cost"].affected_dates == []
     assert resolution.poi.data_confidence == pytest.approx(0.45)
 
 
@@ -84,4 +104,14 @@ def test_policy_resolves_hours_by_trip_date_and_only_uses_matching_today_value(h
     assert resolution.poi.duration_minutes == 120
     assert resolution.poi.party_cost == Decimal("150")
     assert resolution.poi.assumptions == []
+    assert resolution.poi.field_sources == {
+        "duration_minutes": ValueSource.PROVIDER,
+        "party_cost": ValueSource.DERIVED,
+        "data_confidence": ValueSource.DERIVED,
+    }
+    assert resolution.poi.opening_window_sources == {
+        date(2026, 10, 2): ValueSource.PROVIDER,
+        date(2026, 10, 3): ValueSource.PROVIDER,
+        date(2026, 10, 4): ValueSource.PROVIDER,
+    }
     assert resolution.poi.data_confidence == 0.9

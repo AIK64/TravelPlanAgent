@@ -126,6 +126,8 @@ class PlanningAssumption(BaseModel):
     field: str
     value: str
     reason: str
+    source: "ValueSource"
+    affected_dates: list[date] = Field(default_factory=list)
     policy_version: str = "v0.2-default-1"
     created_at: datetime
 
@@ -136,6 +138,8 @@ class PlanningPOI(BaseModel):
     duration_minutes: int
     party_cost: Decimal | None
     assumptions: list[PlanningAssumption] = Field(default_factory=list)
+    field_sources: dict[str, "ValueSource"] = Field(default_factory=dict)
+    opening_window_sources: dict[date, "ValueSource"] = Field(default_factory=dict)
     data_confidence: float = Field(ge=0, le=1)
 
 
