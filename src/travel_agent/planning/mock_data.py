@@ -107,6 +107,7 @@ HANGZHOU_POIS: tuple[POI, ...] = (
 
 
 def get_mock_pois(city: str) -> list[POI]:
+    """Return isolated copies so Provider adapters cannot mutate the fixture."""
     normalized = city.strip().removesuffix("市")
     if normalized != "杭州":
         return []
