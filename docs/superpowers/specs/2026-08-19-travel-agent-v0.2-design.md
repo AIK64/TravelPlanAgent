@@ -11,10 +11,26 @@ v0.1 已经实现一个确定性的 LangGraph 旅行规划闭环：加载杭州 
 
 v0.2 的单一目标是建立可替换、可测试、可观察的 Tool Provider 层，并完成高德 POI 2.0 与驾车路径规划 2.0 适配器。默认运行模式仍是 Mock；高德模式在配置 Key 后启用。两种模式共享协议但严格隔离，真实模式失败时不得回退到 Mock。
 
+### 1.1 简历项目与 Agent 能力优先级
+
+本项目首先是一个用于简历和面试展示的旅行规划 Agent。v0.2 建设 Provider 和 Tool Gateway 的目的，是把 v0.1 的静态数据调用升级为真实、可靠、可观察的 **Tool Use**，而不是把本版本做成地图 API SDK。
+
+本版本的展示重点按以下顺序排列：
+
+1. Agent 怎样根据旅行需求形成工具查询意图；
+2. Graph 怎样进入工具节点并把标准化结果写回 State；
+3. 候选生成怎样消费工具结果，而不是依赖 LLM 或本地猜测事实；
+4. Validator 怎样产生反馈，Conditional Edge 怎样触发 Select、Replan 或 Stop；
+5. 工具超时、重试耗尽和业务无解怎样走不同控制路径；
+6. 日志和轨迹测试怎样证明 Tool Use 与 Loop 实际发生。
+
+Provider 字段覆盖、缓存算法和 HTTP 工程只实现支撑上述 Agent 轨迹所需的范围。与 Agent 展示无直接关系的供应商能力不在 v0.2 扩张。
+
 ## 2. 目标与非目标
 
 ### 2.1 目标
 
+- 让 `Search Intent → Tool Use → State Update → Plan → Validate → Replan` 成为可观察、可测试的 Agent 轨迹。
 - 定义与供应商无关的 `POIProvider` 和 `RouteProvider` 异步协议。
 - 让 Mock 与高德实现相同协议。
 - 使用独立 `SearchPlanBuilder` 生成确定性 POI 检索任务。
@@ -53,6 +69,7 @@ v0.2 不实现：
 8. 不构建所有 POI 的完整两两路线矩阵，只查询候选实际使用的路线段。
 9. 外部缺失字段不能被静默伪装成 Provider 事实。
 10. 缺失事实默认采用 `assume_with_warning`；同时提供 `strict` 策略。
+11. Provider 与 Gateway 是 Agent Tool Use 的支撑层；不得让供应商集成细节淹没 Graph Loop、State 变化和决策轨迹。
 
 ## 4. 总体架构
 
@@ -690,6 +707,8 @@ retryable
 - 业务无解仍返回正常 `PlanningResponse`；
 - UTF-8 JSON 行为保持。
 
+除最终响应断言外，Graph 测试必须断言关键轨迹：工具节点被调用、工具结果写回 State、Validation 反馈产生、条件边选择正确，以及 Replan 只在满足条件时发生。
+
 ### 14.5 可选真实冒烟测试
 
 - 默认跳过；
@@ -797,6 +816,7 @@ v0.2 完成必须同时满足：
 - Planner 的道路距离和驾车耗时来自当前 Provider。
 - 估算步行距离和缺失 POI 字段具有显式来源与警告。
 - `assume_with_warning` 与 `strict` 均有测试。
+- Tool Use、State 更新、条件路由和 Replan Loop 具有轨迹级测试与可观察日志。
 - API Key 不出现在日志、异常或响应。
 - 所有普通测试离线通过，覆盖率不低于 90%。
 - v0.2 学习文档完整且与代码一致。
