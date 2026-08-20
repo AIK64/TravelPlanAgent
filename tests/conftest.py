@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
 from datetime import date, datetime, time, timezone, timedelta
 from decimal import Decimal
 
@@ -13,9 +15,94 @@ from travel_agent.domain.models import (
     TransportAnchor,
     TripSpec,
 )
+from travel_agent.domain.tool_models import POIFacts, POISearchQuery, RouteQuery, RouteResult
+from travel_agent.graph.workflow import build_workflow
+from travel_agent.planning.defaults import POIDefaultPolicy
+from travel_agent.domain.tool_models import UnknownFactPolicy
+from travel_agent.tools.cache import AsyncTTLCache
+from travel_agent.tools.gateway import ToolGateway
+from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
+from travel_agent.tools.retry import RetryPolicy
 
 
 CHINA_TZ = timezone(timedelta(hours=8))
+
+
+class RecordingMockPOIProvider(MockPOIProvider):
+    def __init__(self) -> None:
+        self.calls: list[POISearchQuery] = []
+
+    async def search_pois(self, query: POISearchQuery) -> list[POIFacts]:
+        self.calls.append(query)
+        return await super().search_pois(query)
+
+
+class RecordingMockRouteProvider(MockRouteProvider):
+    def __init__(self) -> None:
+        self.calls: list[RouteQuery] = []
+
+    async def get_driving_route(self, query: RouteQuery) -> RouteResult:
+        self.calls.append(query)
+        return await super().get_driving_route(query)
+
+
+@dataclass(frozen=True)
+class WorkflowHarness:
+    workflow: object
+    gateway: ToolGateway
+    poi_provider: RecordingMockPOIProvider
+    route_provider: RecordingMockRouteProvider
+
+
+def make_gateway(
+    *,
+    poi_provider=None,
+    route_provider=None,
+    max_attempts: int = 1,
+) -> ToolGateway:
+    return ToolGateway(
+        poi_provider=poi_provider or RecordingMockPOIProvider(),
+        route_provider=route_provider or RecordingMockRouteProvider(),
+        cache=AsyncTTLCache(max_entries=100),
+        retry=RetryPolicy(
+            max_attempts=max_attempts,
+            base_delay_seconds=0,
+            max_delay_seconds=0,
+            jitter=lambda: 0.0,
+        ),
+        semaphore=asyncio.Semaphore(5),
+        poi_cache_ttl_seconds=60,
+        route_cache_ttl_seconds=60,
+    )
+
+
+@pytest.fixture
+def workflow_harness() -> WorkflowHarness:
+    poi_provider = RecordingMockPOIProvider()
+    route_provider = RecordingMockRouteProvider()
+    gateway = make_gateway(
+        poi_provider=poi_provider,
+        route_provider=route_provider,
+    )
+    return WorkflowHarness(
+        workflow=build_workflow(
+            gateway,
+            POIDefaultPolicy(UnknownFactPolicy.ASSUME_WITH_WARNING),
+        ),
+        gateway=gateway,
+        poi_provider=poi_provider,
+        route_provider=route_provider,
+    )
+
+
+@pytest.fixture
+def mock_workflow(workflow_harness):
+    return workflow_harness.workflow
+
+
+@pytest.fixture
+def gateway_factory():
+    return make_gateway
 
 
 @pytest.fixture

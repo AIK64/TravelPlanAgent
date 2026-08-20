@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from decimal import Decimal
 
+import pytest
+
 from travel_agent.app import create_app
 from travel_agent.domain.models import PlanningRequest
 from travel_agent.graph.workflow import run_planning
@@ -20,10 +22,12 @@ def test_create_app_applies_configured_log_level(monkeypatch):
         app_logger.setLevel(previous_level)
 
 
-def test_info_logs_show_planning_flow(caplog, hangzhou_trip):
-    caplog.set_level(logging.INFO, logger="travel_agent.graph.workflow")
+@pytest.mark.asyncio
+async def test_info_logs_show_planning_flow(caplog, hangzhou_trip, mock_workflow):
+    caplog.set_level(logging.INFO)
 
-    run_planning(
+    await run_planning(
+        mock_workflow,
         PlanningRequest(trip=hangzhou_trip, max_replan_rounds=2),
         thread_id="log-flow-test",
     )
@@ -32,7 +36,10 @@ def test_info_logs_show_planning_flow(caplog, hangzhou_trip):
     expected_events = {
         "planning.started",
         "node.started",
-        "context.loaded",
+        "search_plan.created",
+        "poi_context.loaded",
+        "candidate_drafts.prepared",
+        "routes.loaded",
         "candidate.generated",
         "candidate.validated",
         "routing.decision",
@@ -51,10 +58,16 @@ def test_info_logs_show_planning_flow(caplog, hangzhou_trip):
     assert all("thread_id=log-flow-test" in message for message in flow_messages)
 
 
-def test_debug_logs_include_candidate_day_summaries(caplog, hangzhou_trip):
+@pytest.mark.asyncio
+async def test_debug_logs_include_candidate_day_summaries(
+    caplog,
+    hangzhou_trip,
+    mock_workflow,
+):
     caplog.set_level(logging.DEBUG, logger="travel_agent.graph.workflow")
 
-    run_planning(
+    await run_planning(
+        mock_workflow,
         PlanningRequest(trip=hangzhou_trip, max_replan_rounds=2),
         thread_id="log-debug-test",
     )
@@ -70,13 +83,19 @@ def test_debug_logs_include_candidate_day_summaries(caplog, hangzhou_trip):
     assert any("poi_names=" in message for message in schedule_messages)
 
 
-def test_info_logs_show_replan_to_infeasible_flow(caplog, hangzhou_trip):
+@pytest.mark.asyncio
+async def test_info_logs_show_replan_to_infeasible_flow(
+    caplog,
+    hangzhou_trip,
+    mock_workflow,
+):
     caplog.set_level(logging.INFO, logger="travel_agent.graph.workflow")
     constrained_trip = hangzhou_trip.model_copy(
         update={"total_budget": Decimal("10")}
     )
 
-    run_planning(
+    await run_planning(
+        mock_workflow,
         PlanningRequest(trip=constrained_trip, max_replan_rounds=1),
         thread_id="log-replan-test",
     )

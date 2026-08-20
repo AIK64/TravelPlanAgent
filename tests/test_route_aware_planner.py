@@ -271,12 +271,8 @@ def test_route_queries_reject_unknown_draft_poi_id(hangzhou_trip, planning_pois)
 
 
 def test_materialization_uses_provider_route_values(
-    hangzhou_trip, single_draft, planning_pois, monkeypatch
+    hangzhou_trip, single_draft, planning_pois
 ):
-    monkeypatch.setattr(
-        "travel_agent.planning.planner.estimate_route",
-        _forbid_route_estimate,
-    )
     query = collect_route_queries(
         hangzhou_trip, [single_draft], planning_pois
     )[0]
