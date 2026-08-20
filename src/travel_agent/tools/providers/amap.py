@@ -304,9 +304,9 @@ class AMapRouteProvider:
             "strategy": query.strategy,
         }
         if query.origin_poi_id is not None:
-            params["origin_id"] = query.origin_poi_id
+            params["originid"] = query.origin_poi_id
         if query.destination_poi_id is not None:
-            params["destination_id"] = query.destination_poi_id
+            params["destinationid"] = query.destination_poi_id
 
         payload = await self._amap_client.request_json(
             "route.driving",

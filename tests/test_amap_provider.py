@@ -112,8 +112,8 @@ async def test_amap_route_provider_formats_coordinates_and_omits_absent_poi_ids(
 
     assert seen[0].url.params["origin"] == "120.100000,30.100000"
     assert seen[0].url.params["destination"] == "120.200000,30.200000"
-    assert "origin_id" not in seen[0].url.params
-    assert "destination_id" not in seen[0].url.params
+    assert "originid" not in seen[0].url.params
+    assert "destinationid" not in seen[0].url.params
 
 
 @pytest.mark.asyncio
@@ -126,8 +126,8 @@ async def test_amap_route_provider_passes_present_poi_ids(load_fixture):
 
     await provider.get_driving_route(query)
 
-    assert seen[0].url.params["origin_id"] == "origin-poi"
-    assert seen[0].url.params["destination_id"] == "destination-poi"
+    assert seen[0].url.params["originid"] == "origin-poi"
+    assert seen[0].url.params["destinationid"] == "destination-poi"
 
 
 @pytest.mark.asyncio
