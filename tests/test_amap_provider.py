@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
@@ -16,6 +17,18 @@ from travel_agent.tools.providers.amap import AMapClient, AMapPOIProvider
 
 QUERY = POISearchQuery(city="杭州", keyword="博物馆", limit=10)
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "amap"
+SECRET_KEY = "test-secret-key"
+
+
+def assert_public_error_has_no_sensitive_chain(error: ToolProviderError) -> None:
+    rendered = "".join(traceback.format_exception(error))
+
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert SECRET_KEY not in rendered
+    assert "key=" not in rendered
+    assert "RAW_RESPONSE_PAYLOAD" not in rendered
+    assert "RAW_NORMALIZATION_PAYLOAD" not in rendered
 
 
 @pytest.fixture
@@ -41,7 +54,7 @@ def amap_poi_provider(
         transport=httpx.MockTransport(handler),
         base_url="https://restapi.amap.com",
     )
-    return AMapPOIProvider(AMapClient(client, api_key="test-secret-key")), seen
+    return AMapPOIProvider(AMapClient(client, api_key=SECRET_KEY)), seen
 
 
 @pytest.mark.asyncio
@@ -122,7 +135,7 @@ async def test_amap_provider_maps_error_envelopes_without_leaking_key(
     error = raised.value
     assert error.category is expected_category
     assert error.retryable is expected_retryable
-    assert "test-secret-key" not in str(error)
+    assert SECRET_KEY not in str(error)
 
 
 @pytest.mark.asyncio
@@ -139,7 +152,7 @@ async def test_amap_provider_rejects_missing_coordinates_without_leaking_key(
 
     assert raised.value.category is ToolErrorCategory.INVALID_RESPONSE
     assert raised.value.retryable is False
-    assert "test-secret-key" not in str(raised.value)
+    assert SECRET_KEY not in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -152,7 +165,7 @@ async def test_amap_provider_maps_http_503_without_leaking_key(load_fixture):
 
     assert raised.value.category is ToolErrorCategory.UPSTREAM_UNAVAILABLE
     assert raised.value.retryable is True
-    assert "test-secret-key" not in str(raised.value)
+    assert SECRET_KEY not in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -165,14 +178,14 @@ async def test_amap_provider_maps_timeout_without_leaking_key():
         transport=httpx.MockTransport(timeout_handler),
         base_url="https://restapi.amap.com",
     )
-    provider = AMapPOIProvider(AMapClient(client, api_key="test-secret-key"))
+    provider = AMapPOIProvider(AMapClient(client, api_key=SECRET_KEY))
 
     with pytest.raises(ToolProviderError) as raised:
         await provider.search_pois(QUERY)
 
     assert raised.value.category is ToolErrorCategory.TIMEOUT
     assert raised.value.retryable is True
-    assert "test-secret-key" not in str(raised.value)
+    assert SECRET_KEY not in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -184,11 +197,100 @@ async def test_amap_provider_rejects_invalid_json_without_leaking_key():
         ),
         base_url="https://restapi.amap.com",
     )
-    provider = AMapPOIProvider(AMapClient(client, api_key="test-secret-key"))
+    provider = AMapPOIProvider(AMapClient(client, api_key=SECRET_KEY))
 
     with pytest.raises(ToolProviderError) as raised:
         await provider.search_pois(QUERY)
 
     assert raised.value.category is ToolErrorCategory.INVALID_RESPONSE
     assert raised.value.retryable is False
-    assert "test-secret-key" not in str(raised.value)
+    assert SECRET_KEY not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_amap_http_status_error_exposes_no_sensitive_exception_chain():
+    """HTTP 异常链若保留请求对象，会将带 key 的 URL 暴露给调用方。"""
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, content=b"RAW_RESPONSE_PAYLOAD")
+        ),
+        base_url="https://restapi.amap.com",
+    )
+    provider = AMapPOIProvider(AMapClient(client, api_key=SECRET_KEY))
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.search_pois(QUERY)
+
+    assert raised.value.category is ToolErrorCategory.UPSTREAM_UNAVAILABLE
+    assert_public_error_has_no_sensitive_chain(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_amap_timeout_exposes_no_sensitive_exception_chain():
+    """超时底层异常同样不能作为公开安全异常的链路。"""
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("RAW_RESPONSE_PAYLOAD", request=request)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(timeout_handler),
+        base_url="https://restapi.amap.com",
+    )
+    provider = AMapPOIProvider(AMapClient(client, api_key=SECRET_KEY))
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.search_pois(QUERY)
+
+    assert raised.value.category is ToolErrorCategory.TIMEOUT
+    assert_public_error_has_no_sensitive_chain(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_amap_invalid_json_exposes_no_sensitive_exception_chain():
+    """JSON 解码错误的正文不能通过 traceback 泄露。"""
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=b"RAW_RESPONSE_PAYLOAD")
+        ),
+        base_url="https://restapi.amap.com",
+    )
+    provider = AMapPOIProvider(AMapClient(client, api_key=SECRET_KEY))
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.search_pois(QUERY)
+
+    assert raised.value.category is ToolErrorCategory.INVALID_RESPONSE
+    assert_public_error_has_no_sensitive_chain(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_amap_business_error_exposes_no_sensitive_exception_chain():
+    """业务失败响应不应把供应商 `info` 带到公开异常链中。"""
+    provider, _ = amap_poi_provider(
+        {
+            "status": "0",
+            "info": "RAW_RESPONSE_PAYLOAD",
+            "infocode": "10016",
+        }
+    )
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.search_pois(QUERY)
+
+    assert raised.value.category is ToolErrorCategory.UPSTREAM_UNAVAILABLE
+    assert_public_error_has_no_sensitive_chain(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_amap_normalization_error_exposes_no_sensitive_exception_chain(
+    load_fixture,
+):
+    """归一化失败的供应商字段不能通过异常详情泄露。"""
+    payload = load_fixture("poi_success.json")
+    payload["pois"][0]["location"] = "RAW_NORMALIZATION_PAYLOAD"
+    provider, _ = amap_poi_provider(payload)
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.search_pois(QUERY)
+
+    assert raised.value.category is ToolErrorCategory.INVALID_RESPONSE
+    assert_public_error_has_no_sensitive_chain(raised.value)

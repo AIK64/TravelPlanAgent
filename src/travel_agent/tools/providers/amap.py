@@ -67,6 +67,8 @@ class AMapClient:
         path: str,
         params: dict[str, object],
     ) -> dict[str, object]:
+        error: ToolProviderError | None = None
+        response: httpx.Response | None = None
         try:
             response = await self._client.get(
                 path,
@@ -74,31 +76,36 @@ class AMapClient:
                 timeout=self.timeout_seconds,
             )
             response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise ToolProviderError.timeout(operation) from exc
-        except httpx.ConnectError as exc:
-            raise ToolProviderError(
+        except httpx.TimeoutException:
+            error = ToolProviderError.timeout(operation)
+        except httpx.ConnectError:
+            error = ToolProviderError(
                 category=ToolErrorCategory.CONNECTION,
                 code="connection",
                 operation=operation,
                 retryable=True,
                 safe_message="The provider connection failed. Please try again.",
-            ) from exc
+            )
         except httpx.HTTPStatusError as exc:
-            raise self._http_error(operation, exc.response.status_code) from exc
-        except httpx.RequestError as exc:
-            raise ToolProviderError(
+            error = self._http_error(operation, exc.response.status_code)
+        except httpx.RequestError:
+            error = ToolProviderError(
                 category=ToolErrorCategory.CONNECTION,
                 code="request_error",
                 operation=operation,
                 retryable=True,
                 safe_message="The provider request failed. Please try again.",
-            ) from exc
+            )
+        if error is not None:
+            raise error
+        assert response is not None
 
         try:
             payload = response.json()
-        except ValueError as exc:
-            raise self._invalid_response(operation) from exc
+        except ValueError:
+            error = self._invalid_response(operation)
+        if error is not None:
+            raise error
 
         if not isinstance(payload, dict):
             raise self._invalid_response(operation)
@@ -224,10 +231,14 @@ class AMapPOIProvider:
             raise AMapClient._invalid_response("poi.search")
 
         fetched_at = datetime.now(timezone.utc)
+        error: ToolProviderError | None = None
         try:
-            return [self._normalize_poi(raw_poi, fetched_at) for raw_poi in raw_pois]
-        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-            raise AMapClient._invalid_response("poi.search") from exc
+            facts = [self._normalize_poi(raw_poi, fetched_at) for raw_poi in raw_pois]
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            error = AMapClient._invalid_response("poi.search")
+        if error is not None:
+            raise error
+        return facts
 
     def _normalize_poi(self, raw_poi: object, fetched_at: datetime) -> POIFacts:
         if not isinstance(raw_poi, dict):
