@@ -10,12 +10,21 @@ import httpx
 import pytest
 
 from travel_agent.domain.models import Coordinate
-from travel_agent.domain.tool_models import POISearchQuery, ToolErrorCategory
+from travel_agent.domain.tool_models import (
+    POISearchQuery,
+    RouteMode,
+    RouteQuery,
+    ToolErrorCategory,
+)
 from travel_agent.tools.errors import ToolProviderError
-from travel_agent.tools.providers.amap import AMapClient, AMapPOIProvider
+from travel_agent.tools.providers.amap import AMapClient, AMapPOIProvider, AMapRouteProvider
 
 
 QUERY = POISearchQuery(city="杭州", keyword="博物馆", limit=10)
+ROUTE_QUERY = RouteQuery(
+    origin=Coordinate(longitude=120.1, latitude=30.1),
+    destination=Coordinate(longitude=120.2, latitude=30.2),
+)
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "amap"
 SECRET_KEY = "test-secret-key"
 
@@ -55,6 +64,108 @@ def amap_poi_provider(
         base_url="https://restapi.amap.com",
     )
     return AMapPOIProvider(AMapClient(client, api_key=SECRET_KEY)), seen
+
+
+def amap_route_provider(
+    payload: dict[str, object],
+    *,
+    status_code: int = 200,
+) -> tuple[AMapRouteProvider, list[httpx.Request]]:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(status_code, json=payload)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://restapi.amap.com",
+    )
+    return AMapRouteProvider(AMapClient(client, api_key=SECRET_KEY)), seen
+
+
+@pytest.mark.asyncio
+async def test_amap_route_provider_normalizes_distance_and_seconds(load_fixture):
+    """错误的距离或秒转分钟会让路线约束建立在错误事实之上。"""
+    provider, seen = amap_route_provider(load_fixture("route_success.json"))
+
+    result = await provider.get_driving_route(ROUTE_QUERY)
+
+    assert result.distance_meters == 8230
+    assert result.duration_minutes == 21
+    assert result.mode is RouteMode.DRIVING
+    assert result.provider == "amap"
+    assert result.data_confidence == 0.95
+    assert result.fetched_at.tzinfo is not None
+    assert seen[0].url.path == "/v5/direction/driving"
+    assert seen[0].url.params["strategy"] == "32"
+
+
+@pytest.mark.asyncio
+async def test_amap_route_provider_formats_coordinates_and_omits_absent_poi_ids(
+    load_fixture,
+):
+    """坐标精度或顺序错误会查询到错误路线；空 POI ID 不应污染请求。"""
+    provider, seen = amap_route_provider(load_fixture("route_success.json"))
+
+    await provider.get_driving_route(ROUTE_QUERY)
+
+    assert seen[0].url.params["origin"] == "120.100000,30.100000"
+    assert seen[0].url.params["destination"] == "120.200000,30.200000"
+    assert "origin_id" not in seen[0].url.params
+    assert "destination_id" not in seen[0].url.params
+
+
+@pytest.mark.asyncio
+async def test_amap_route_provider_passes_present_poi_ids(load_fixture):
+    """提供 POI ID 时必须将其传给供应商，避免同坐标候选被错误匹配。"""
+    provider, seen = amap_route_provider(load_fixture("route_success.json"))
+    query = ROUTE_QUERY.model_copy(
+        update={"origin_poi_id": "origin-poi", "destination_poi_id": "destination-poi"}
+    )
+
+    await provider.get_driving_route(query)
+
+    assert seen[0].url.params["origin_id"] == "origin-poi"
+    assert seen[0].url.params["destination_id"] == "destination-poi"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate_payload",
+    [
+        lambda payload: payload["route"].update({"paths": []}),
+        lambda payload: payload["route"]["paths"][0]["cost"].pop("duration"),
+        lambda payload: payload["route"]["paths"][0].update({"distance": "0"}),
+    ],
+    ids=["empty_paths", "missing_duration", "zero_distance"],
+)
+async def test_amap_route_provider_rejects_malformed_route_as_invalid_response(
+    load_fixture,
+    mutate_payload,
+):
+    """不完整或零值路线不能被伪造成可用的零成本事实。"""
+    payload = load_fixture("route_success.json")
+    mutate_payload(payload)
+    provider, _ = amap_route_provider(payload)
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.get_driving_route(ROUTE_QUERY)
+
+    assert raised.value.category is ToolErrorCategory.INVALID_RESPONSE
+    assert raised.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_amap_route_provider_keeps_server_busy_retryable(load_fixture):
+    """供应商繁忙不是路线不可行，Gateway 应得到可重试错误。"""
+    provider, _ = amap_route_provider(load_fixture("server_busy.json"))
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.get_driving_route(ROUTE_QUERY)
+
+    assert raised.value.category is ToolErrorCategory.UPSTREAM_UNAVAILABLE
+    assert raised.value.retryable is True
 
 
 @pytest.mark.asyncio

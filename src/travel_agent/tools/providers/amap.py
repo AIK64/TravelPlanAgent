@@ -13,6 +13,9 @@ from travel_agent.domain.models import Coordinate, TimeWindow
 from travel_agent.domain.tool_models import (
     POIFacts,
     POISearchQuery,
+    RouteMode,
+    RouteQuery,
+    RouteResult,
     ToolErrorCategory,
     ValueSource,
 )
@@ -286,6 +289,61 @@ class AMapPOIProvider:
         )
 
 
+class AMapRouteProvider:
+    """将高德驾车路线归一化为供应商无关路线事实。"""
+
+    name = "amap"
+
+    def __init__(self, amap_client: AMapClient) -> None:
+        self._amap_client = amap_client
+
+    async def get_driving_route(self, query: RouteQuery) -> RouteResult:
+        params: dict[str, object] = {
+            "origin": _format_coordinate(query.origin),
+            "destination": _format_coordinate(query.destination),
+            "strategy": query.strategy,
+        }
+        if query.origin_poi_id is not None:
+            params["origin_id"] = query.origin_poi_id
+        if query.destination_poi_id is not None:
+            params["destination_id"] = query.destination_poi_id
+
+        payload = await self._amap_client.request_json(
+            "route.driving",
+            "/v5/direction/driving",
+            params,
+        )
+        error: ToolProviderError | None = None
+        try:
+            route = payload.get("route")
+            if not isinstance(route, dict):
+                raise ValueError("route must be an object")
+            paths = route.get("paths")
+            if not isinstance(paths, list) or not paths:
+                raise ValueError("paths must be a non-empty list")
+            path = paths[0]
+            if not isinstance(path, dict):
+                raise ValueError("path must be an object")
+            cost = path.get("cost")
+            if not isinstance(cost, dict):
+                raise ValueError("cost must be an object")
+            distance = _parse_positive_int(path.get("distance"))
+            duration_seconds = _parse_positive_int(cost.get("duration"))
+            return RouteResult(
+                distance_meters=distance,
+                duration_minutes=math.ceil(duration_seconds / 60),
+                mode=RouteMode.DRIVING,
+                provider=self.name,
+                data_confidence=0.95,
+                fetched_at=datetime.now(timezone.utc),
+            )
+        except (TypeError, ValueError):
+            error = AMapClient._invalid_response("route.driving")
+        if error is not None:
+            raise error
+        raise AssertionError("unreachable")
+
+
 def _required_text(payload: dict[str, object], field: str) -> str:
     value = payload.get(field)
     if not isinstance(value, str) or not value.strip():
@@ -301,6 +359,24 @@ def _parse_coordinate(value: str) -> Coordinate:
     if not math.isfinite(longitude) or not math.isfinite(latitude):
         raise ValueError("invalid location")
     return Coordinate(longitude=longitude, latitude=latitude)
+
+
+def _format_coordinate(coordinate: Coordinate) -> str:
+    return f"{coordinate.longitude:.6f},{coordinate.latitude:.6f}"
+
+
+def _parse_positive_int(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("value must be an integer")
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        result = int(value.strip())
+    else:
+        raise ValueError("value must be an integer")
+    if result <= 0:
+        raise ValueError("value must be positive")
+    return result
 
 
 def _split_categories(value: object) -> list[str]:

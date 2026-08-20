@@ -1,0 +1,13 @@
+{
+  "status": "1",
+  "info": "OK",
+  "infocode": "10000",
+  "route": {
+    "origin": "120.100000,30.100000",
+    "destination": "120.200000,30.200000",
+    "paths": [{
+      "distance": "8230",
+      "cost": {"duration": "1260"}
+    }]
+  }
+}
