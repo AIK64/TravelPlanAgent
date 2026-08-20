@@ -1,24 +1,30 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 import os
 from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+from pydantic import ValidationError
+
 from travel_agent.domain.models import (
     DayPlan,
+    Coordinate,
     ItemType,
     PlanCandidate,
     PlanItem,
     PlanMetrics,
     PlanStyle,
     PlanningAssumption,
+    PlanningPOI,
+    TimeWindow,
     ValidationResult,
     ValidationStatus,
     Violation,
     ViolationSeverity,
 )
-from travel_agent.domain.tool_models import ValueSource
+from travel_agent.domain.tool_models import POIFacts, ValueSource
 from travel_agent.planning.validator import validate_candidate
 
 
@@ -114,6 +120,58 @@ def test_error_result_is_invalid():
     assert result.model_dump()["valid"] is False
 
 
+@pytest.mark.parametrize(
+    ("violations", "expected_status"),
+    [
+        ([], ValidationStatus.VALID),
+        (
+            [Violation(type="uncertain", severity=ViolationSeverity.WARNING, message="待确认")],
+            ValidationStatus.VALID_WITH_WARNINGS,
+        ),
+        (
+            [Violation(type="conflict", severity=ViolationSeverity.ERROR, message="冲突")],
+            ValidationStatus.INVALID,
+        ),
+        (
+            [
+                Violation(type="uncertain", severity=ViolationSeverity.WARNING, message="待确认"),
+                Violation(type="conflict", severity=ViolationSeverity.ERROR, message="冲突"),
+            ],
+            ValidationStatus.INVALID,
+        ),
+    ],
+)
+def test_validation_result_status_truth_table_round_trips(violations, expected_status):
+    """防止序列化后的 status 与 violations 关系被破坏，导致条件边路由错误。"""
+    result = ValidationResult.from_violations(violations)
+
+    assert result.status is expected_status
+    assert ValidationResult.model_validate(result.model_dump()) == result
+
+
+@pytest.mark.parametrize(
+    ("status", "violations"),
+    [
+        (
+            ValidationStatus.VALID,
+            [Violation(type="conflict", severity=ViolationSeverity.ERROR, message="冲突")],
+        ),
+        (
+            ValidationStatus.VALID_WITH_WARNINGS,
+            [],
+        ),
+        (
+            ValidationStatus.INVALID,
+            [Violation(type="uncertain", severity=ViolationSeverity.WARNING, message="待确认")],
+        ),
+    ],
+)
+def test_validation_result_rejects_status_inconsistent_with_violations(status, violations):
+    """防止外部直接构造矛盾结果绕过 from_violations。"""
+    with pytest.raises(ValidationError, match="status"):
+        ValidationResult(status=status, violations=violations)
+
+
 def test_unknown_cost_warns_without_claiming_budget_is_feasible(hangzhou_trip):
     """防止未知费用按零元累计后错误宣称预算通过。"""
     result = validate_candidate(
@@ -191,3 +249,80 @@ def test_default_assumptions_emit_one_warning_per_field(hangzhou_trip):
         ("duration_unverified", ViolationSeverity.WARNING),
         ("walking_distance_estimated", ViolationSeverity.WARNING),
     }
+
+
+def test_opening_hours_use_daily_provenance_for_hard_validation(hangzhou_trip):
+    """防止默认营业时间被当作 Provider 事实，从而误路由到不可行分支。"""
+    first_day = hangzhou_trip.start_date
+    second_day = first_day + timedelta(days=1)
+    provider_poi = PlanningPOI(
+        facts=POIFacts(
+            id="lingyin",
+            name="灵隐寺",
+            city="杭州",
+            coordinate=Coordinate(longitude=120.1, latitude=30.2),
+            categories=["人文"],
+            provider="mock",
+            fetched_at=hangzhou_trip.arrival.at,
+        ),
+        opening_windows={
+            first_day: TimeWindow(start="13:00", end="18:00"),
+            second_day: TimeWindow(start="13:00", end="18:00"),
+        },
+        duration_minutes=60,
+        party_cost=Decimal("100"),
+        opening_window_sources={
+            first_day: ValueSource.PROVIDER,
+            second_day: ValueSource.DEFAULT,
+        },
+        data_confidence=1,
+    )
+    timezone = hangzhou_trip.arrival.at.tzinfo
+    first_start = datetime.combine(first_day, TimeWindow(start="12:00", end="12:01").start, tzinfo=timezone)
+    second_start = datetime.combine(second_day, TimeWindow(start="12:00", end="12:01").start, tzinfo=timezone)
+    candidate = _candidate_with_activity(hangzhou_trip, estimated_cost=Decimal("200"))
+    candidate = candidate.model_copy(
+        update={
+            "days": [
+                DayPlan(
+                    date=first_day,
+                    theme="人文",
+                    primary_area="杭州",
+                    items=[
+                        PlanItem(
+                            type=ItemType.ACTIVITY,
+                            name="灵隐寺",
+                            poi_id="lingyin",
+                            start_at=first_start,
+                            end_at=first_start + timedelta(minutes=60),
+                            estimated_cost=Decimal("100"),
+                        )
+                    ],
+                ),
+                DayPlan(
+                    date=second_day,
+                    theme="人文",
+                    primary_area="杭州",
+                    items=[
+                        PlanItem(
+                            type=ItemType.ACTIVITY,
+                            name="灵隐寺",
+                            poi_id="lingyin",
+                            start_at=second_start,
+                            end_at=second_start + timedelta(minutes=60),
+                            estimated_cost=Decimal("100"),
+                        )
+                    ],
+                ),
+            ]
+        }
+    )
+
+    result = validate_candidate(hangzhou_trip, candidate, pois=[provider_poi])
+
+    assert [(item.type, item.day) for item in result.violations if item.severity is ViolationSeverity.ERROR] == [
+        ("outside_opening_hours", first_day)
+    ]
+    assert [(item.type, item.severity) for item in result.violations if item.severity is ViolationSeverity.WARNING] == [
+        ("opening_hours_unverified", ViolationSeverity.WARNING)
+    ]

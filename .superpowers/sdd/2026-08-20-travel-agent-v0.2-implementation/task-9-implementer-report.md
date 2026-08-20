@@ -26,3 +26,25 @@
 
 - Validator 只消费候选计划级 `assumptions` 以产生每类一次的告警；Task 10 必须在路线回退时为每个受影响 `PlanItem` 标记 `walking_distance_estimated=True`，并同时写入候选计划级 `walking_distance` 默认假设。否则不会产生该候选计划级告警。
 - 当已知成本本身已超预算且仍有未知成本时，Validator 会同时保留 ERROR 和 WARNING：前者是确定的硬违规，后者说明总成本仍不完整；状态因此为 `invalid`。
+
+## 第 1 轮评审修复
+
+### 1. 按日营业时间 provenance
+
+- RED：向 Validator 传入 `PlanningPOI` 时，旧实现读取不存在的 `poi.id`，无法消费按日期窗口和来源。
+- GREEN：Validator 以 `POI | PlanningPOI` 的兼容联合输入接收验证上下文。旧 `POI` 仍按既有单窗口 Provider 事实校验；`PlanningPOI` 必须按 `day.date` 读取 `opening_windows` 和 `opening_window_sources`。只有 `ValueSource.PROVIDER` 会产生 `outside_opening_hours` ERROR；DEFAULT 只合并为一次 `opening_hours_unverified` WARNING。
+
+### 2. ValidationResult 不变量
+
+- RED：可以直接构造 `valid + ERROR`、`valid_with_warnings + 空 violations`、`invalid + 仅 WARNING` 等矛盾结果。
+- GREEN：模型层通过 after-validator 以 severity 真值表拒绝矛盾状态，`from_violations` 复用同一推导函数。测试覆盖空、WARNING、ERROR、混合以及包含兼容 `valid` 的序列化 round-trip。
+
+### 3. PlanMetrics 成本下界
+
+- RED：`known_estimated_cost` 和兼容别名 `estimated_cost` 都可传入负数。
+- GREEN：恢复 `known_estimated_cost` 的 `ge=0`，两个输入名都触发同一字段约束。
+
+### 第 1 轮验证
+
+- `\.venv\Scripts\python.exe -m pytest tests/test_domain_models.py tests/test_data_quality_validation.py -v`：19 passed。
+- `\.venv\Scripts\python.exe -m pytest`：95 passed，1 个既有的 Starlette/httpx 弃用警告。

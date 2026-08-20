@@ -47,3 +47,18 @@ def test_cost_compatibility_fields_serialize_known_cost():
     assert metrics.model_dump()["estimated_cost"] == Decimal("120")
     assert metrics.model_dump()["unknown_cost_item_count"] == 2
 
+
+@pytest.mark.parametrize("cost_field", ["known_estimated_cost", "estimated_cost"])
+def test_plan_metrics_rejects_negative_known_cost_for_both_input_names(cost_field):
+    """防止新旧成本输入名之一绕过预算下界校验。"""
+    with pytest.raises(ValidationError):
+        PlanMetrics(
+            preference_match=0.8,
+            diversity=0.6,
+            data_confidence=0.7,
+            total_travel_minutes=40,
+            walking_distance_meters=1200,
+            fatigue_score=0.3,
+            **{cost_field: Decimal("-1")},
+        )
+

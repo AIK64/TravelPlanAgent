@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from travel_agent.domain.models import (
     ItemType,
     PlanCandidate,
+    PlanningPOI,
     POI,
+    TimeWindow,
     TripSpec,
     ValidationResult,
     Violation,
@@ -43,7 +45,11 @@ def _normalize(value: str) -> str:
     return value.strip().casefold()
 
 
-def _assumption_warnings(candidate: PlanCandidate) -> list[Violation]:
+def _assumption_warnings(
+    candidate: PlanCandidate,
+    *,
+    opening_hours_unverified: bool = False,
+) -> list[Violation]:
     """把默认事实收敛为候选计划级告警，避免每条日程重复报告。"""
     warnings_by_type: dict[str, Violation] = {}
     for assumption in candidate.assumptions:
@@ -61,16 +67,42 @@ def _assumption_warnings(candidate: PlanCandidate) -> list[Violation]:
                 message=message,
             ),
         )
+    if opening_hours_unverified:
+        warnings_by_type.setdefault(
+            "opening_hours_unverified",
+            Violation(
+                type="opening_hours_unverified",
+                severity=ViolationSeverity.WARNING,
+                message="部分日程营业时间来自默认假设，尚未由 Provider 验证",
+            ),
+        )
     return [warnings_by_type[key] for key in sorted(warnings_by_type)]
+
+
+def _poi_id(poi: POI | PlanningPOI) -> str:
+    return poi.id if isinstance(poi, POI) else poi.facts.id
+
+
+def _opening_window_for_day(
+    poi: POI | PlanningPOI,
+    day: date,
+) -> tuple[TimeWindow | None, ValueSource]:
+    if isinstance(poi, POI):
+        return poi.opening_window, ValueSource.PROVIDER
+    return (
+        poi.opening_windows.get(day),
+        poi.opening_window_sources.get(day, ValueSource.DEFAULT),
+    )
 
 
 def validate_candidate(
     trip: TripSpec,
     candidate: PlanCandidate,
-    pois: list[POI],
+    pois: list[POI | PlanningPOI],
 ) -> ValidationResult:
     violations: list[Violation] = []
-    poi_by_id = {poi.id: poi for poi in pois}
+    poi_by_id = {_poi_id(poi): poi for poi in pois}
+    opening_hours_unverified = False
     all_items = [item for day in candidate.days for item in day.items]
     activities = [item for item in all_items if item.type == ItemType.ACTIVITY]
 
@@ -140,20 +172,26 @@ def validate_candidate(
 
             if item.poi_id and item.poi_id in poi_by_id:
                 poi = poi_by_id[item.poi_id]
-                timezone = item.start_at.tzinfo
-                opening = datetime.combine(day.date, poi.opening_window.start, tzinfo=timezone)
-                closing = datetime.combine(day.date, poi.opening_window.end, tzinfo=timezone)
-                if item.start_at < opening or item.end_at > closing:
-                    violations.append(
-                        Violation(
-                            type="outside_opening_hours",
-                            severity=ViolationSeverity.ERROR,
-                            day=day.date,
-                            entity_ids=[poi.id],
-                            message=f"{poi.name} 的访问时间不在营业时间内",
-                            repair_hint="调整访问时间或移动到其他日期",
+                opening_window, opening_source = _opening_window_for_day(poi, day.date)
+                if opening_source is not ValueSource.PROVIDER:
+                    opening_hours_unverified = True
+                elif opening_window is not None:
+                    timezone = item.start_at.tzinfo
+                    opening = datetime.combine(day.date, opening_window.start, tzinfo=timezone)
+                    closing = datetime.combine(day.date, opening_window.end, tzinfo=timezone)
+                    poi_name = poi.name if isinstance(poi, POI) else poi.facts.name
+                    poi_id = _poi_id(poi)
+                    if item.start_at < opening or item.end_at > closing:
+                        violations.append(
+                            Violation(
+                                type="outside_opening_hours",
+                                severity=ViolationSeverity.ERROR,
+                                day=day.date,
+                                entity_ids=[poi_id],
+                                message=f"{poi_name} 的访问时间不在营业时间内",
+                                repair_hint="调整访问时间或移动到其他日期",
+                            )
                         )
-                    )
 
         if day.walking_distance_meters > trip.mobility.max_daily_walking_meters:
             violations.append(
@@ -218,5 +256,10 @@ def validate_candidate(
                 )
             )
 
-    violations.extend(_assumption_warnings(candidate))
+    violations.extend(
+        _assumption_warnings(
+            candidate,
+            opening_hours_unverified=opening_hours_unverified,
+        )
+    )
     return ValidationResult.from_violations(violations)

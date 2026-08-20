@@ -210,7 +210,8 @@ class PlanMetrics(BaseModel):
     total_travel_minutes: int = Field(ge=0)
     walking_distance_meters: int = Field(ge=0)
     known_estimated_cost: Decimal = Field(
-        validation_alias=AliasChoices("known_estimated_cost", "estimated_cost")
+        ge=0,
+        validation_alias=AliasChoices("known_estimated_cost", "estimated_cost"),
     )
     unknown_cost_item_count: int = Field(default=0, ge=0)
     fatigue_score: float = Field(ge=0, le=1)
@@ -235,6 +236,23 @@ class ValidationResult(BaseModel):
     status: ValidationStatus
     violations: list[Violation] = Field(default_factory=list)
 
+    @staticmethod
+    def _status_from_violations(violations: list[Violation]) -> ValidationStatus:
+        if any(item.severity is ViolationSeverity.ERROR for item in violations):
+            return ValidationStatus.INVALID
+        if violations:
+            return ValidationStatus.VALID_WITH_WARNINGS
+        return ValidationStatus.VALID
+
+    @model_validator(mode="after")
+    def validate_status(self) -> "ValidationResult":
+        expected_status = self._status_from_violations(self.violations)
+        if self.status is not expected_status:
+            raise ValueError(
+                "status must match the severity-derived result of violations"
+            )
+        return self
+
     @computed_field
     @property
     def valid(self) -> bool:
@@ -243,13 +261,10 @@ class ValidationResult(BaseModel):
 
     @classmethod
     def from_violations(cls, violations: list[Violation]) -> "ValidationResult":
-        if any(item.severity is ViolationSeverity.ERROR for item in violations):
-            status = ValidationStatus.INVALID
-        elif violations:
-            status = ValidationStatus.VALID_WITH_WARNINGS
-        else:
-            status = ValidationStatus.VALID
-        return cls(status=status, violations=violations)
+        return cls(
+            status=cls._status_from_violations(violations),
+            violations=violations,
+        )
 
 
 class PlanCandidate(BaseModel):
