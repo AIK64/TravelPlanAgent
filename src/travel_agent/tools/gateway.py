@@ -136,6 +136,7 @@ class ToolGateway:
                     provider=provider,
                     error=ToolErrorInfo.from_provider_error(exhausted.last_error),
                     attempt_count=exhausted.attempts,
+                    elapsed_ms=round((perf_counter() - started) * 1000, 2),
                 )
 
             fetched_at = self._utcnow()
@@ -224,13 +225,19 @@ class ToolGateway:
                 result.elapsed_ms,
             )
         else:
+            error = result.error
+            assert error is not None
             logger.info(
                 "tool.failed thread_id=%s provider=%s operation=%s "
-                "attempt_count=%s",
+                "attempt_count=%s elapsed_ms=%s category=%s code=%s retryable=%s",
                 context.thread_id,
                 provider,
                 operation,
                 result.attempt_count,
+                result.elapsed_ms,
+                error.category.value,
+                error.code,
+                error.retryable,
             )
 
 

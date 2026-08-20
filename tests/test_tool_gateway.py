@@ -80,6 +80,33 @@ class AlwaysTimeoutPOIProvider(FakePOIProvider):
         raise ToolProviderError.timeout("poi")
 
 
+class CoordinatedTimeoutPOIProvider(AlwaysTimeoutPOIProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_attempt_started = asyncio.Event()
+        self.release_first_attempt = asyncio.Event()
+
+    async def search_pois(self, query: POISearchQuery) -> list[POIFacts]:
+        self.calls += 1
+        if self.calls == 1:
+            self.first_attempt_started.set()
+            await self.release_first_attempt.wait()
+        raise ToolProviderError.timeout("poi")
+
+
+class BlockingPOIProvider(FakePOIProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def search_pois(self, query: POISearchQuery) -> list[POIFacts]:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return poi_facts()
+
+
 class MeasuringRouteProvider(FakeRouteProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -160,6 +187,8 @@ async def test_gateway_returns_failed_tool_result_after_retry_exhaustion():
     assert result.attempt_count == 3
     assert result.error is not None
     assert result.error.category is ToolErrorCategory.TIMEOUT
+    assert result.elapsed_ms is not None
+    assert result.elapsed_ms >= 0
     assert provider.calls == 3
 
 
@@ -172,6 +201,47 @@ async def test_gateway_does_not_cache_failed_poi_calls():
     await gateway.search_pois([QUERY], CONTEXT)
 
     assert provider.calls == 6
+
+
+@pytest.mark.asyncio
+async def test_gateway_shares_one_failed_in_flight_retry_cycle_then_retries_new_request():
+    provider = CoordinatedTimeoutPOIProvider()
+    gateway = make_gateway(poi_provider=provider)
+
+    first_request = asyncio.create_task(gateway.search_pois([QUERY], CONTEXT))
+    await provider.first_attempt_started.wait()
+    second_request = asyncio.create_task(gateway.search_pois([QUERY], CONTEXT))
+    await asyncio.sleep(0)
+    provider.release_first_attempt.set()
+    first, second = await asyncio.gather(first_request, second_request)
+
+    assert provider.calls == 3
+    assert [result.status for result in first + second] == [ToolStatus.FAILED] * 2
+    assert [result.attempt_count for result in first + second] == [3, 3]
+    assert first[0].error == second[0].error
+
+    await gateway.search_pois([QUERY], CONTEXT)
+
+    assert provider.calls == 6
+
+
+@pytest.mark.asyncio
+async def test_gateway_cancelling_one_waiter_does_not_cancel_shared_load():
+    provider = BlockingPOIProvider()
+    gateway = make_gateway(poi_provider=provider)
+
+    cancelled_waiter = asyncio.create_task(gateway.search_pois([QUERY], CONTEXT))
+    await provider.started.wait()
+    cancelled_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_waiter
+    provider.release.set()
+    await asyncio.sleep(0)
+
+    result = await gateway.search_pois([QUERY], CONTEXT)
+
+    assert provider.calls == 1
+    assert result[0].cache_hit is True
 
 
 @pytest.mark.asyncio
@@ -225,6 +295,44 @@ async def test_gateway_emits_safe_lifecycle_logs(caplog):
     }
     for event in expected_events:
         assert any(message.startswith(event) for message in messages), event
+    required_fields = {
+        "tool.started": {"thread_id=gateway-test", "provider=", "operation="},
+        "tool.retry_scheduled": {
+            "thread_id=gateway-test",
+            "provider=",
+            "operation=",
+            "attempt=",
+            "next_attempt=",
+            "delay_seconds=",
+        },
+        "tool.completed": {
+            "thread_id=gateway-test",
+            "provider=",
+            "operation=",
+            "attempt_count=",
+            "elapsed_ms=",
+        },
+        "tool.cache_hit": {
+            "thread_id=gateway-test",
+            "provider=",
+            "operation=",
+            "attempt_count=",
+            "elapsed_ms=",
+        },
+        "tool.failed": {
+            "thread_id=gateway-test",
+            "provider=",
+            "operation=",
+            "attempt_count=3",
+            "elapsed_ms=",
+            "category=timeout",
+            "code=timeout",
+            "retryable=True",
+        },
+    }
+    for event, fields in required_fields.items():
+        event_messages = [message for message in messages if message.startswith(event)]
+        assert any(all(field in message for field in fields) for message in event_messages), event
     assert all("thread_id=gateway-test" in message for message in messages)
     assert all("keyword" not in message and "museum" not in message for message in messages)
 

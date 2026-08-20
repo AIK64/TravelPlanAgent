@@ -40,8 +40,9 @@ class AsyncTTLCache(Generic[T]):
         self._max_entries = max_entries
         self._clock = clock
         self._entries: dict[object, _CacheEntry[T]] = {}
-        self._locks: dict[object, asyncio.Lock] = {}
-        self._lock_users: dict[object, int] = {}
+        self._inflight: dict[
+            object, asyncio.Task[tuple[CacheLookup[T], bool]]
+        ] = {}
 
     async def get_or_load(
         self,
@@ -50,59 +51,72 @@ class AsyncTTLCache(Generic[T]):
         loader: Callable[[], Awaitable[T]],
         should_cache: Callable[[T], bool] = lambda value: True,
     ) -> CacheLookup[T]:
-        now = self._clock()
-        entry = self._entries.get(key)
+        entry = self._get_live_entry(key)
         if entry is not None:
-            if now < entry.expires_at:
-                return CacheLookup(
-                    value=entry.value,
-                    hit=True,
-                    expires_at_monotonic=entry.expires_at,
-                )
-            del self._entries[key]
+            return CacheLookup(
+                value=entry.value,
+                hit=True,
+                expires_at_monotonic=entry.expires_at,
+            )
 
-        lock = self._locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[key] = lock
-        self._lock_users[key] = self._lock_users.get(key, 0) + 1
+        task = self._inflight.get(key)
+        is_loader = task is None
+        if task is None:
+            task = asyncio.create_task(
+                self._load_and_cache(key, ttl_seconds, loader, should_cache)
+            )
+            self._inflight[key] = task
+        lookup, cached = await asyncio.shield(task)
+
+        if is_loader or not cached:
+            return lookup
+        return CacheLookup(
+            value=lookup.value,
+            hit=True,
+            expires_at_monotonic=lookup.expires_at_monotonic,
+        )
+
+    async def _load_and_cache(
+        self,
+        key: object,
+        ttl_seconds: float,
+        loader: Callable[[], Awaitable[T]],
+        should_cache: Callable[[T], bool],
+    ) -> tuple[CacheLookup[T], bool]:
         try:
-            async with lock:
-                now = self._clock()
-                entry = self._entries.get(key)
-                if entry is not None:
-                    if now < entry.expires_at:
-                        return CacheLookup(
-                            value=entry.value,
-                            hit=True,
-                            expires_at_monotonic=entry.expires_at,
-                        )
-                    del self._entries[key]
-
-                value = await loader()
-                loaded_at = self._clock()
-                expires_at = loaded_at + ttl_seconds
-                if should_cache(value):
-                    self._remove_expired(loaded_at)
-                    self._entries[key] = _CacheEntry(
-                        value=value,
-                        expires_at=expires_at,
-                        inserted_at=loaded_at,
-                    )
-                    self._evict_if_needed()
-                return CacheLookup(
+            value = await loader()
+            loaded_at = self._clock()
+            expires_at = loaded_at + ttl_seconds
+            cached = should_cache(value)
+            if cached:
+                self._remove_expired(loaded_at)
+                self._entries[key] = _CacheEntry(
+                    value=value,
+                    expires_at=expires_at,
+                    inserted_at=loaded_at,
+                )
+                self._evict_if_needed()
+            return (
+                CacheLookup(
                     value=value,
                     hit=False,
                     expires_at_monotonic=expires_at,
-                )
+                ),
+                cached,
+            )
         finally:
-            users = self._lock_users[key] - 1
-            if users == 0:
-                del self._lock_users[key]
-                if self._locks.get(key) is lock:
-                    del self._locks[key]
-            else:
-                self._lock_users[key] = users
+            task = asyncio.current_task()
+            if self._inflight.get(key) is task:
+                del self._inflight[key]
+
+    def _get_live_entry(self, key: object) -> _CacheEntry[T] | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        if self._clock() < entry.expires_at:
+            return entry
+        del self._entries[key]
+        return None
 
     def _remove_expired(self, now: float | None = None) -> None:
         if now is None:
