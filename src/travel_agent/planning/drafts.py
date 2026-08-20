@@ -59,6 +59,14 @@ def _confidence(poi: PlanningPOI | POI) -> float:
     return poi.data_confidence
 
 
+def _is_must_visit(poi: PlanningPOI | POI, trip: TripSpec) -> bool:
+    name = _normalize(_facts(poi).name)
+    return any(
+        _normalize(required) in name or name in _normalize(required)
+        for required in trip.must_visit
+    )
+
+
 def _poi_preference_score(
     poi: PlanningPOI | POI,
     trip: TripSpec,
@@ -72,15 +80,10 @@ def _poi_preference_score(
         _normalize(value)
         for value in getattr(facts, "suitability_tags", [])
     }
-    name = _normalize(facts.name)
-
     score = 1.0
     score += 4.0 * len(interests & (categories | tags))
     score -= 5.0 * len(avoid & (categories | tags))
-    if any(
-        _normalize(required) in name or name in _normalize(required)
-        for required in trip.must_visit
-    ):
+    if _is_must_visit(poi, trip):
         score += 100.0
     if trip.mobility.needs_frequent_rest and "适老" in categories | tags:
         score += 2.0
@@ -114,21 +117,27 @@ def _select_pois(
 def _order_nearest(
     start: Coordinate,
     pois: list[PlanningPOI],
+    trip: TripSpec,
 ) -> list[PlanningPOI]:
-    remaining = list(pois)
     ordered: list[PlanningPOI] = []
     current = start
-    while remaining:
-        next_poi = min(
-            remaining,
-            key=lambda poi: (
-                haversine_distance_meters(current, poi.facts.coordinate),
-                poi.facts.id,
-            ),
-        )
-        ordered.append(next_poi)
-        remaining.remove(next_poi)
-        current = next_poi.facts.coordinate
+    for required_layer in (True, False):
+        remaining = [
+            poi
+            for poi in pois
+            if _is_must_visit(poi, trip) is required_layer
+        ]
+        while remaining:
+            next_poi = min(
+                remaining,
+                key=lambda poi: (
+                    haversine_distance_meters(current, poi.facts.coordinate),
+                    poi.facts.id,
+                ),
+            )
+            ordered.append(next_poi)
+            remaining.remove(next_poi)
+            current = next_poi.facts.coordinate
     return ordered
 
 
@@ -159,6 +168,7 @@ def prepare_candidate_drafts(
                     for poi in _order_nearest(
                         start_coordinate,
                         day_buckets[day_index],
+                        trip,
                     )
                 ),
             )

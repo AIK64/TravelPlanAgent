@@ -35,3 +35,23 @@
 - 测试覆盖三风格、必去优先、密度下界、draft 深层不可变结构、方向性/去重、Provider 路线值、禁止 materializer 调用估算器、全 segment 缺失路线、assumption 去重、按日窗口、未知费用、路线置信度与 warning risk。
 - 根据迁移裁决，`generate_candidates(POI)` 暂作为 v0.1 Graph 的 compatibility-only 桥保留，因此既有 workflow 回归无需改写。新 `materialize_candidates` 调用链完全不使用 `estimate_route`。
 - Task 11 切换 Graph 到两阶段 Planner 后，必须删除或彻底停用该 legacy 桥，并以轨迹/调用测试证明生产链路只消费 ToolGateway 的 `RouteResult`。
+
+## 第 1 轮评审修复：must-visit 优先的路线连续排序
+
+### 根因与修复
+
+- 原 Phase 1 虽在候选选择时提高 must-visit 分数，但分日后会对整日 POI 重新执行无优先级 Haversine 最近邻。更近但无法排入营业窗口的 optional POI 可能排在 must-visit 前；Phase 2 为保持预取相邻路线与实际 origin 一致会 `break`，导致后续可行 must-visit 永远不被评估。
+- 修复限定在 Phase 1：每日先分 must-visit 与 optional 两层，must-visit 层优先；每层内部继续使用 Haversine 最近邻与 POI ID 稳定 tie-break。Phase 2 不改为 `continue`，因此 draft、route query 和实际日程仍保持同一连续顺序。
+
+### TDD 证据
+
+1. RED：新增单日“几何上更近但营业时间不可行的 optional + 可行 must-visit”端到端测试。旧实现的 route query 顺序虽与 draft 一致，但 materialized candidate 活动为空，断言 `lingyin` 在日程中失败。
+2. GREEN：加入 must-visit 分层最近邻后，同一测试通过；must-visit 先物化，后续不可行 optional 才终止该日排程。
+3. 回归保护：新增无 must-visit 时普通 POI 仍按最近邻排序的测试；既有测试继续覆盖三风格、密度收缩下界、方向敏感去重和 route/materializer 顺序。
+
+### 第 1 轮验证与自审
+
+- `\.venv\Scripts\python.exe -m pytest tests\test_route_aware_planner.py tests\test_workflow.py -v`：17 passed。
+- `\.venv\Scripts\python.exe -m pytest`：110 passed，1 个既有 Starlette/httpx 弃用 warning。
+- `git diff --check`：通过；仅有工作区 LF 到 CRLF 的 Git 提示。
+- 自审确认本轮只改变 Phase 1 的每日排序优先层，不改变候选选择数量、三种风格、密度收缩、query 去重、Phase 2 缺失路线语义或 compatibility-only bridge。

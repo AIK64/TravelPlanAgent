@@ -140,6 +140,75 @@ def test_replan_density_is_bounded_and_keeps_must_visit(
     )
 
 
+def test_must_visit_precedes_nearer_infeasible_optional_and_route_order_matches(
+    hangzhou_trip, planning_pois
+):
+    trip = hangzhou_trip.model_copy(
+        update={
+            "end_date": hangzhou_trip.start_date,
+            "departure": hangzhou_trip.departure.model_copy(
+                update={
+                    "at": hangzhou_trip.arrival.at.replace(hour=19, minute=0)
+                }
+            ),
+        }
+    )
+    must_visit = planning_pois[0]
+    nearer_optional = planning_pois[1].model_copy(
+        update={
+            "opening_windows": {
+                trip.start_date: TimeWindow(start="09:00", end="11:00")
+            }
+        }
+    )
+    pois = [must_visit, nearer_optional]
+    draft = next(
+        item
+        for item in prepare_candidate_drafts(trip, pois, replan_round=0)
+        if item.style is PlanStyle.RELAXED
+    )
+    queries = collect_route_queries(trip, [draft], pois)
+
+    candidate = materialize_candidates(
+        trip,
+        [draft],
+        pois,
+        _route_results(trip, queries),
+    )[0]
+
+    assert [query.destination_poi_id for query in queries] == list(
+        draft.days[0].poi_ids
+    )
+    assert must_visit.facts.id in {
+        item.poi_id for item in candidate.days[0].items
+    }
+
+
+def test_non_required_pois_keep_nearest_neighbor_order(
+    hangzhou_trip, planning_pois
+):
+    trip = hangzhou_trip.model_copy(
+        update={
+            "end_date": hangzhou_trip.start_date,
+            "must_visit": [],
+        }
+    )
+    west_lake = planning_pois[1]
+    museum = planning_pois[3]
+    draft = next(
+        item
+        for item in prepare_candidate_drafts(
+            trip, [museum, west_lake], replan_round=0
+        )
+        if item.style is PlanStyle.RELAXED
+    )
+
+    assert draft.days[0].poi_ids == (
+        west_lake.facts.id,
+        museum.facts.id,
+    )
+
+
 def test_candidate_drafts_are_immutable(hangzhou_trip):
     day = DraftDay(date=hangzhou_trip.start_date, poi_ids=("lingyin",))
     draft = CandidateDraft(id="relaxed-r0", style=PlanStyle.RELAXED, days=(day,))
