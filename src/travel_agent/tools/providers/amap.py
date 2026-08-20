@@ -1,0 +1,342 @@
+"""高德地图 HTTP 契约到供应商无关事实的适配。"""
+
+from __future__ import annotations
+
+import math
+import re
+from datetime import date, datetime, time, timezone
+from decimal import Decimal, InvalidOperation
+
+import httpx
+
+from travel_agent.domain.models import Coordinate, TimeWindow
+from travel_agent.domain.tool_models import (
+    POIFacts,
+    POISearchQuery,
+    ToolErrorCategory,
+    ValueSource,
+)
+from travel_agent.tools.errors import ToolProviderError
+
+
+RETRYABLE_AMAP_CODES = {
+    "10004",
+    "10015",
+    "10016",
+    "10017",
+    "10019",
+    "10020",
+    "10021",
+}
+AUTH_CODES = {"10001"}
+PERMISSION_CODES = {"10002", "10005", "10009", "10012"}
+RATE_LIMIT_CODES = {"10003", "10004", "10014", "10019", "10020", "10021"}
+
+_WEEKDAY = {
+    "一": 0,
+    "二": 1,
+    "三": 2,
+    "四": 3,
+    "五": 4,
+    "六": 5,
+    "日": 6,
+}
+_WEEKLY_HOURS = re.compile(
+    r"^周(?P<start>[一二三四五六日])至周(?P<end>[一二三四五六日]):"
+    r"(?P<hours>\d{2}:\d{2}-\d{2}:\d{2})$"
+)
+
+
+class AMapClient:
+    """共享的安全高德 JSON client；不承担缓存、限流或重试。"""
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        api_key: str,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self._client = client
+        self.__api_key = api_key
+        self.timeout_seconds = timeout_seconds
+
+    async def request_json(
+        self,
+        operation: str,
+        path: str,
+        params: dict[str, object],
+    ) -> dict[str, object]:
+        try:
+            response = await self._client.get(
+                path,
+                params={**params, "key": self.__api_key},
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise ToolProviderError.timeout(operation) from exc
+        except httpx.ConnectError as exc:
+            raise ToolProviderError(
+                category=ToolErrorCategory.CONNECTION,
+                code="connection",
+                operation=operation,
+                retryable=True,
+                safe_message="The provider connection failed. Please try again.",
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise self._http_error(operation, exc.response.status_code) from exc
+        except httpx.RequestError as exc:
+            raise ToolProviderError(
+                category=ToolErrorCategory.CONNECTION,
+                code="request_error",
+                operation=operation,
+                retryable=True,
+                safe_message="The provider request failed. Please try again.",
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise self._invalid_response(operation) from exc
+
+        if not isinstance(payload, dict):
+            raise self._invalid_response(operation)
+        if not all(
+            isinstance(payload.get(field), str)
+            for field in ("status", "info", "infocode")
+        ):
+            raise self._invalid_response(operation)
+
+        status = payload["status"]
+        infocode = payload["infocode"]
+        if status == "1":
+            return payload
+        if status == "0":
+            raise self._amap_error(operation, infocode)
+        raise self._invalid_response(operation)
+
+    @staticmethod
+    def _http_error(operation: str, status_code: int) -> ToolProviderError:
+        if status_code == 429:
+            return ToolProviderError(
+                category=ToolErrorCategory.RATE_LIMIT,
+                code="http_429",
+                operation=operation,
+                retryable=True,
+                safe_message="The provider rate limit was reached. Please try again.",
+            )
+        if status_code in {502, 503, 504}:
+            return ToolProviderError(
+                category=ToolErrorCategory.UPSTREAM_UNAVAILABLE,
+                code=f"http_{status_code}",
+                operation=operation,
+                retryable=True,
+                safe_message="The provider is temporarily unavailable. Please try again.",
+            )
+        if status_code == 401:
+            return ToolProviderError.authentication(operation)
+        if status_code == 403:
+            return ToolProviderError(
+                category=ToolErrorCategory.PERMISSION,
+                code="http_403",
+                operation=operation,
+                retryable=False,
+                safe_message="The provider request is not permitted.",
+            )
+        return ToolProviderError(
+            category=ToolErrorCategory.INVALID_REQUEST,
+            code=f"http_{status_code}",
+            operation=operation,
+            retryable=False,
+            safe_message="The provider rejected the request.",
+        )
+
+    @staticmethod
+    def _invalid_response(operation: str) -> ToolProviderError:
+        return ToolProviderError(
+            category=ToolErrorCategory.INVALID_RESPONSE,
+            code="invalid_response",
+            operation=operation,
+            retryable=False,
+            safe_message="The provider returned an invalid response.",
+        )
+
+    @staticmethod
+    def _amap_error(operation: str, infocode: str) -> ToolProviderError:
+        if infocode in AUTH_CODES:
+            return ToolProviderError.authentication(operation)
+        if infocode in PERMISSION_CODES:
+            return ToolProviderError(
+                category=ToolErrorCategory.PERMISSION,
+                code=infocode,
+                operation=operation,
+                retryable=False,
+                safe_message="The provider request is not permitted.",
+            )
+        if infocode in RATE_LIMIT_CODES:
+            return ToolProviderError(
+                category=ToolErrorCategory.RATE_LIMIT,
+                code=infocode,
+                operation=operation,
+                retryable=infocode in RETRYABLE_AMAP_CODES,
+                safe_message="The provider rate limit was reached. Please try again.",
+            )
+        if infocode in RETRYABLE_AMAP_CODES:
+            return ToolProviderError(
+                category=ToolErrorCategory.UPSTREAM_UNAVAILABLE,
+                code=infocode,
+                operation=operation,
+                retryable=True,
+                safe_message="The provider is temporarily unavailable. Please try again.",
+            )
+        return ToolProviderError(
+            category=ToolErrorCategory.INVALID_REQUEST,
+            code=infocode,
+            operation=operation,
+            retryable=False,
+            safe_message="The provider rejected the request.",
+        )
+
+
+class AMapPOIProvider:
+    """将高德文字搜索结果归一化为 POI facts。"""
+
+    name = "amap"
+
+    def __init__(self, amap_client: AMapClient) -> None:
+        self._amap_client = amap_client
+
+    async def search_pois(self, query: POISearchQuery) -> list[POIFacts]:
+        payload = await self._amap_client.request_json(
+            "poi.search",
+            "/v5/place/text",
+            {
+                "keywords": query.keyword,
+                "city": query.city,
+                "city_limit": "true",
+                "show_fields": "business",
+                "page_size": query.limit,
+            },
+        )
+        raw_pois = payload.get("pois")
+        if not isinstance(raw_pois, list):
+            raise AMapClient._invalid_response("poi.search")
+
+        fetched_at = datetime.now(timezone.utc)
+        try:
+            return [self._normalize_poi(raw_poi, fetched_at) for raw_poi in raw_pois]
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise AMapClient._invalid_response("poi.search") from exc
+
+    def _normalize_poi(self, raw_poi: object, fetched_at: datetime) -> POIFacts:
+        if not isinstance(raw_poi, dict):
+            raise ValueError("poi must be an object")
+        poi_id = _required_text(raw_poi, "id")
+        name = _required_text(raw_poi, "name")
+        city = _required_text(raw_poi, "cityname")
+        coordinate = _parse_coordinate(_required_text(raw_poi, "location"))
+        categories = _split_categories(raw_poi.get("type"))
+        business = raw_poi.get("business", {})
+        if not isinstance(business, dict):
+            raise ValueError("business must be an object")
+
+        today_window = _parse_time_window(business.get("opentime_today"))
+        weekly_windows = _parse_weekly_windows(business.get("opentime_week"))
+        cost = _parse_cost(business.get("cost"))
+        sources = {
+            "id": ValueSource.PROVIDER,
+            "name": ValueSource.PROVIDER,
+            "city": ValueSource.PROVIDER,
+            "coordinate": ValueSource.PROVIDER,
+            "categories": ValueSource.PROVIDER,
+        }
+        if today_window is not None:
+            sources["today_opening_window"] = ValueSource.PROVIDER
+        if weekly_windows:
+            sources["opening_windows_by_weekday"] = ValueSource.PROVIDER
+        if cost is not None:
+            sources["average_cost_per_person"] = ValueSource.PROVIDER
+
+        return POIFacts(
+            id=poi_id,
+            name=name,
+            city=city,
+            coordinate=coordinate,
+            categories=categories,
+            opening_windows_by_weekday=weekly_windows,
+            today_opening_window=today_window,
+            today_opening_date=date.today() if today_window is not None else None,
+            average_cost_per_person=cost,
+            suggested_duration_minutes=None,
+            provider=self.name,
+            fetched_at=fetched_at,
+            field_sources=sources,
+        )
+
+
+def _required_text(payload: dict[str, object], field: str) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"missing {field}")
+    return value.strip()
+
+
+def _parse_coordinate(value: str) -> Coordinate:
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise ValueError("invalid location")
+    longitude, latitude = (float(part.strip()) for part in parts)
+    if not math.isfinite(longitude) or not math.isfinite(latitude):
+        raise ValueError("invalid location")
+    return Coordinate(longitude=longitude, latitude=latitude)
+
+
+def _split_categories(value: object) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    return [category.strip() for category in value.split(";") if category.strip()]
+
+
+def _parse_cost(value: object) -> Decimal | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        cost = Decimal(value)
+    except InvalidOperation:
+        return None
+    if not cost.is_finite() or cost < 0:
+        return None
+    return cost
+
+
+def _parse_time_window(value: object) -> TimeWindow | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        start_text, end_text = value.split("-", maxsplit=1)
+        return TimeWindow(
+            start=time.fromisoformat(start_text),
+            end=time.fromisoformat(end_text),
+        )
+    except ValueError:
+        return None
+
+
+def _parse_weekly_windows(value: object) -> dict[int, TimeWindow]:
+    if not isinstance(value, str):
+        return {}
+    match = _WEEKLY_HOURS.fullmatch(value)
+    if match is None:
+        return {}
+    window = _parse_time_window(match.group("hours"))
+    if window is None:
+        return {}
+    start = _WEEKDAY[match.group("start")]
+    end = _WEEKDAY[match.group("end")]
+    weekdays = (
+        range(start, end + 1)
+        if start <= end
+        else (*range(start, 7), *range(0, end + 1))
+    )
+    return {weekday: window for weekday in weekdays}
