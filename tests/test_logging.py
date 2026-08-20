@@ -105,7 +105,7 @@ async def test_info_logs_show_replan_to_infeasible_flow(
         message.startswith("routing.decision") and "next=replan" in message
         for message in messages
     )
-    assert any(message.startswith("replan.started") for message in messages)
+    assert any(message.startswith("replan.round_started") for message in messages)
     assert any(message.startswith("replan.completed") for message in messages)
     assert any(
         message.startswith("routing.decision") and "next=mark_infeasible" in message

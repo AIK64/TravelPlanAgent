@@ -14,6 +14,7 @@ from travel_agent.domain.tool_models import (
     RouteResult,
     ToolStatus,
     UnknownFactPolicy,
+    route_key,
 )
 from travel_agent.graph.workflow import build_workflow, run_planning
 from travel_agent.planning.defaults import POIDefaultPolicy
@@ -158,6 +159,20 @@ class TimeoutRouteProvider(MockRouteProvider):
         raise ToolProviderError.timeout("route.get_driving")
 
 
+class FailRepeatedRouteProvider(MockRouteProvider):
+    """首轮每条路线成功；后续 round 重复路线时模拟供应商超时。"""
+
+    def __init__(self) -> None:
+        self.seen_keys: set[str] = set()
+
+    async def get_driving_route(self, query: RouteQuery) -> RouteResult:
+        key = route_key(query)
+        if key in self.seen_keys:
+            raise ToolProviderError.timeout("route.get_driving")
+        self.seen_keys.add(key)
+        return await super().get_driving_route(query)
+
+
 class PriorityPOIProvider:
     name = "priority-fixture"
 
@@ -246,7 +261,7 @@ async def test_poi_tool_failure_raises_without_validation_or_replan(
     assert not {
         "candidate.validated",
         "routing.decision",
-        "replan.started",
+        "replan.round_started",
         "planning.infeasible",
     } & set(events)
     snapshot = await workflow.aget_state(
@@ -291,7 +306,7 @@ async def test_route_tool_failure_raises_after_retry_without_business_replan(
     assert not {
         "candidate.validated",
         "routing.decision",
-        "replan.started",
+        "replan.round_started",
         "planning.infeasible",
     } & set(events)
     snapshot = await workflow.aget_state(
@@ -300,6 +315,87 @@ async def test_route_tool_failure_raises_after_retry_without_business_replan(
     assert snapshot.values["status"] == "candidate_drafts_prepared"
     assert snapshot.values["iterations"] == 0
     assert snapshot.values["candidates"] == []
+
+
+@pytest.mark.asyncio
+async def test_replan_route_failure_does_not_commit_iteration_or_stale_round_state(
+    hangzhou_trip,
+    gateway_factory,
+    caplog,
+):
+    caplog.set_level(logging.INFO)
+    thread_id = "trajectory-replan-route-failure"
+    workflow = build_workflow(
+        gateway_factory(
+            route_provider=FailRepeatedRouteProvider(),
+            max_attempts=2,
+            route_cache_ttl_seconds=0,
+        ),
+        POIDefaultPolicy(UnknownFactPolicy.ASSUME_WITH_WARNING),
+    )
+    low_budget_trip = hangzhou_trip.model_copy(
+        update={"total_budget": Decimal("10")}
+    )
+
+    with pytest.raises(ToolUnavailableError) as error:
+        await run_planning(
+            workflow,
+            PlanningRequest(trip=low_budget_trip, max_replan_rounds=2),
+            thread_id=thread_id,
+        )
+
+    assert error.value.result.status is ToolStatus.FAILED
+    assert error.value.result.attempt_count == 2
+    assert error.value.safe_detail()["operation"] == "route.get_driving"
+    snapshot = await workflow.aget_state(
+        {"configurable": {"thread_id": thread_id}}
+    )
+    state = snapshot.values
+    assert state["iterations"] == 0
+    assert state["pending_replan_round"] == 1
+    assert {draft.id.rsplit("-", 1)[-1] for draft in state["candidate_drafts"]} == {
+        "r1"
+    }
+    assert state["route_queries"] == []
+    assert state["route_results"] == {}
+    assert state["candidates"] == []
+    assert state["selected_plan"] is None
+    assert any(
+        summary.operation == "route.get_driving"
+        and summary.status is ToolStatus.SUCCESS
+        for summary in state["tool_summaries"]
+    )
+    history = [
+        item
+        async for item in workflow.aget_state_history(
+            {"configurable": {"thread_id": thread_id}}
+        )
+    ]
+    assert any(item.values["route_results"] for item in history)
+    assert any(
+        candidate.validation is not None
+        for item in history
+        for candidate in item.values["candidates"]
+    )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if f"thread_id={thread_id}" in record.getMessage()
+    ]
+    decisions = [
+        message.split("next=", 1)[1].split(maxsplit=1)[0]
+        for message in messages
+        if message.startswith("routing.decision")
+    ]
+    events = _event_names(caplog.records, thread_id)
+    assert decisions == ["replan"]
+    assert events.count("candidate.validated") == 3
+    assert "replan.round_started" in events
+    assert "replan.completed" not in events
+    assert "planning.infeasible" not in events
+    assert "tool.retry_scheduled" in events
+    assert "planning.failed" in events
 
 
 @pytest.mark.asyncio
@@ -339,12 +435,13 @@ async def test_validation_feedback_drives_one_bounded_replan(
         events,
         [
             "routing.decision",
-            "replan.started",
+            "replan.round_started",
             "candidate_drafts.prepared",
             "tool.started",
             "routes.loaded",
             "candidate.generated",
             "candidate.validated",
+            "replan.completed",
             "routing.decision",
             "planning.infeasible",
         ],
@@ -359,6 +456,12 @@ async def test_validation_feedback_drives_one_bounded_replan(
     ]
     assert any(not summary.cache_hit for summary in route_summaries)
     assert any(summary.cache_hit for summary in route_summaries)
+    assert any(
+        message.startswith("replan.completed")
+        and "round=1" in message
+        and "status=validated" in message
+        for message in messages
+    )
 
 
 @pytest.mark.asyncio
@@ -423,3 +526,10 @@ async def test_maximum_business_replan_budget_stops_before_recursion_guard(
     assert response.status == "infeasible"
     assert response.iterations == 5
     assert decisions == ["replan"] * 5 + ["mark_infeasible"]
+    events = _event_names(caplog.records, thread_id)
+    assert events.count("replan.round_started") == 5
+    assert events.count("replan.completed") == 5
+    snapshot = await workflow_harness.workflow.aget_state(
+        {"configurable": {"thread_id": thread_id}}
+    )
+    assert snapshot.values["pending_replan_round"] is None

@@ -59,6 +59,7 @@ def make_gateway(
     poi_provider=None,
     route_provider=None,
     max_attempts: int = 1,
+    route_cache_ttl_seconds: int = 60,
 ) -> ToolGateway:
     return ToolGateway(
         poi_provider=poi_provider or RecordingMockPOIProvider(),
@@ -72,7 +73,7 @@ def make_gateway(
         ),
         semaphore=asyncio.Semaphore(5),
         poi_cache_ttl_seconds=60,
-        route_cache_ttl_seconds=60,
+        route_cache_ttl_seconds=route_cache_ttl_seconds,
     )
 
 

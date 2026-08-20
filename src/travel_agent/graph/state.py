@@ -32,6 +32,7 @@ class TravelState(TypedDict):
     candidates: list[PlanCandidate]
     selected_plan: PlanCandidate | None
     iterations: int
+    pending_replan_round: int | None
     max_replan_rounds: int
     status: str
     message: str | None

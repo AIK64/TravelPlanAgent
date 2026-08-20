@@ -65,6 +65,11 @@ _CHECKPOINT_ALLOWED_TYPES = (
 )
 
 
+def _planning_round(state: TravelState) -> int:
+    pending_round = state["pending_replan_round"]
+    return pending_round if pending_round is not None else state["iterations"]
+
+
 def _log_node_started(state: TravelState, node: str) -> None:
     logger.info(
         "node.started | thread_id=%s node=%s iteration=%s status=%s",
@@ -93,7 +98,7 @@ def _log_node_completed(
 
 
 def _log_candidates(state: TravelState, candidates: list[PlanCandidate]) -> None:
-    phase = "initial" if state["iterations"] == 0 else "replan"
+    phase = "initial" if _planning_round(state) == 0 else "replan"
     for candidate in candidates:
         activity_count = sum(len(day.items) for day in candidate.days)
         logger.info(
@@ -317,15 +322,16 @@ def build_workflow(
 
     def prepare_drafts(state: TravelState) -> dict:
         _log_node_started(state, "prepare_candidate_drafts")
+        planning_round = _planning_round(state)
         drafts = prepare_candidate_drafts(
             state["trip"],
             state["planning_pois"],
-            replan_round=state["iterations"],
+            replan_round=planning_round,
         )
         logger.info(
-            "candidate_drafts.prepared | thread_id=%s iteration=%s draft_count=%s",
+            "candidate_drafts.prepared | thread_id=%s round=%s draft_count=%s",
             state["thread_id"],
-            state["iterations"],
+            planning_round,
             len(drafts),
         )
         _log_node_completed(
@@ -362,9 +368,9 @@ def build_workflow(
             for result in results.values()
         ]
         logger.info(
-            "routes.loaded | thread_id=%s iteration=%s query_count=%s route_count=%s",
+            "routes.loaded | thread_id=%s round=%s query_count=%s route_count=%s",
             state["thread_id"],
-            state["iterations"],
+            _planning_round(state),
             len(queries),
             len(routes),
         )
@@ -447,26 +453,47 @@ def build_workflow(
             candidate_count=len(validated),
             deliverable_count=deliverable_count,
         )
-        return {"candidates": validated, "status": "validated"}
+        update: dict[str, object] = {
+            "candidates": validated,
+            "status": "validated",
+        }
+        pending_round = state["pending_replan_round"]
+        if pending_round is not None:
+            update.update(
+                {
+                    "iterations": pending_round,
+                    "pending_replan_round": None,
+                }
+            )
+            logger.info(
+                "replan.completed | thread_id=%s round=%s status=validated "
+                "candidate_count=%s deliverable_count=%s",
+                state["thread_id"],
+                pending_round,
+                len(validated),
+                deliverable_count,
+            )
+        return update
 
     def replan(state: TravelState) -> dict:
         _log_node_started(state, "replan")
-        next_iteration = state["iterations"] + 1
+        next_round = state["iterations"] + 1
         logger.info(
-            "replan.started | thread_id=%s iteration=%s strategy=reduce_density_low_cost",
+            "replan.round_started | thread_id=%s round=%s status=pending "
+            "strategy=reduce_density_low_cost",
             state["thread_id"],
-            next_iteration,
-        )
-        logger.info(
-            "replan.completed | thread_id=%s iteration=%s",
-            state["thread_id"],
-            next_iteration,
+            next_round,
         )
         return {
-            "iterations": next_iteration,
-            "status": "replanning",
+            "pending_replan_round": next_round,
+            "candidate_drafts": [],
+            "route_queries": [],
+            "route_results": {},
+            "candidates": [],
+            "selected_plan": None,
+            "status": "replan_pending",
             "message": (
-                f"第 {next_iteration} 轮重规划：降低活动密度并优先低成本地点"
+                f"第 {next_round} 轮重规划：降低活动密度并优先低成本地点"
             ),
         }
 
@@ -551,6 +578,7 @@ def initial_state(request: PlanningRequest, thread_id: str) -> TravelState:
         "candidates": [],
         "selected_plan": None,
         "iterations": 0,
+        "pending_replan_round": None,
         "max_replan_rounds": request.max_replan_rounds,
         "status": "started",
         "message": None,
