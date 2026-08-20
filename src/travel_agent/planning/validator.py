@@ -12,10 +12,56 @@ from travel_agent.domain.models import (
     Violation,
     ViolationSeverity,
 )
+from travel_agent.domain.tool_models import ValueSource
+
+
+_ASSUMPTION_WARNINGS = {
+    "opening_window": (
+        "opening_hours_unverified",
+        "营业时间来自默认假设，尚未由 Provider 验证",
+    ),
+    "duration_minutes": (
+        "duration_unverified",
+        "游览时长来自默认假设，尚未由 Provider 验证",
+    ),
+    "walking_distance": (
+        "walking_distance_estimated",
+        "步行距离包含估算路线，尚未由 Provider 验证",
+    ),
+    "walking_distance_meters": (
+        "walking_distance_estimated",
+        "步行距离包含估算路线，尚未由 Provider 验证",
+    ),
+    "party_cost": (
+        "cost_unverified",
+        "部分地点费用未知，尚未由 Provider 验证",
+    ),
+}
 
 
 def _normalize(value: str) -> str:
     return value.strip().casefold()
+
+
+def _assumption_warnings(candidate: PlanCandidate) -> list[Violation]:
+    """把默认事实收敛为候选计划级告警，避免每条日程重复报告。"""
+    warnings_by_type: dict[str, Violation] = {}
+    for assumption in candidate.assumptions:
+        if assumption.source is not ValueSource.DEFAULT:
+            continue
+        violation_type, message = _ASSUMPTION_WARNINGS.get(
+            assumption.field,
+            (f"{assumption.field}_unverified", f"{assumption.field} 来自默认假设，尚未验证"),
+        )
+        warnings_by_type.setdefault(
+            violation_type,
+            Violation(
+                type=violation_type,
+                severity=ViolationSeverity.WARNING,
+                message=message,
+            ),
+        )
+    return [warnings_by_type[key] for key in sorted(warnings_by_type)]
 
 
 def validate_candidate(
@@ -142,20 +188,35 @@ def validate_candidate(
                 )
             )
 
-    actual_cost = sum(
-        (item.estimated_cost for item in activities), start=Decimal("0")
+    known_cost = sum(
+        (item.estimated_cost for item in all_items if item.estimated_cost is not None),
+        start=Decimal("0"),
     )
-    if trip.total_budget is not None and actual_cost > trip.total_budget:
-        violations.append(
-            Violation(
-                type="budget_exceeded",
-                severity=ViolationSeverity.ERROR,
-                message=f"预计费用 {actual_cost} 元，超过预算 {trip.total_budget} 元",
-                repair_hint="减少收费活动或提高预算",
+    unknown_cost_item_count = sum(
+        item.estimated_cost is None for item in all_items
+    )
+    if trip.total_budget is not None:
+        if unknown_cost_item_count:
+            violations.append(
+                Violation(
+                    type="budget_unverified",
+                    severity=ViolationSeverity.WARNING,
+                    message=(
+                        f"有 {unknown_cost_item_count} 个日程费用未知；已知费用 "
+                        f"{known_cost} 元，无法验证总预算 {trip.total_budget} 元"
+                    ),
+                    repair_hint="补充地点、交通或餐饮费用后重新验证预算",
+                )
             )
-        )
+        if known_cost > trip.total_budget:
+            violations.append(
+                Violation(
+                    type="budget_exceeded",
+                    severity=ViolationSeverity.ERROR,
+                    message=f"已知预计费用 {known_cost} 元，超过预算 {trip.total_budget} 元",
+                    repair_hint="减少收费活动或提高预算",
+                )
+            )
 
-    return ValidationResult(
-        valid=not any(item.severity == ViolationSeverity.ERROR for item in violations),
-        violations=violations,
-    )
+    violations.extend(_assumption_warnings(candidate))
+    return ValidationResult.from_violations(violations)

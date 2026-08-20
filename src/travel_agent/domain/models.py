@@ -5,7 +5,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AliasChoices, BaseModel, Field, computed_field, model_validator
 
 
 class Pace(StrEnum):
@@ -30,6 +30,12 @@ class ItemType(StrEnum):
 class ViolationSeverity(StrEnum):
     ERROR = "error"
     WARNING = "warning"
+
+
+class ValidationStatus(StrEnum):
+    VALID = "valid"
+    VALID_WITH_WARNINGS = "valid_with_warnings"
+    INVALID = "invalid"
 
 
 class Coordinate(BaseModel):
@@ -163,7 +169,8 @@ class PlanItem(BaseModel):
     poi_id: str | None = None
     travel_from_previous_minutes: int = Field(default=0, ge=0)
     distance_from_previous_meters: int = Field(default=0, ge=0)
-    estimated_cost: Decimal = Field(default=Decimal("0"), ge=0)
+    estimated_cost: Decimal | None = Field(default=None, ge=0)
+    walking_distance_estimated: bool = False
     locked: bool = False
 
     @model_validator(mode="after")
@@ -180,10 +187,20 @@ class DayPlan(BaseModel):
     theme: str
     primary_area: str
     items: list[PlanItem]
-    estimated_cost: Decimal = Decimal("0")
+    known_estimated_cost: Decimal = Field(
+        default=Decimal("0"),
+        validation_alias=AliasChoices("known_estimated_cost", "estimated_cost"),
+    )
+    unknown_cost_item_count: int = Field(default=0, ge=0)
     total_travel_minutes: int = 0
     walking_distance_meters: int = 0
     fatigue_score: float = Field(default=0, ge=0, le=1)
+
+    @computed_field
+    @property
+    def estimated_cost(self) -> Decimal:
+        """保留 v0.1 响应字段，明确其仅表示已知费用。"""
+        return self.known_estimated_cost
 
 
 class PlanMetrics(BaseModel):
@@ -192,8 +209,17 @@ class PlanMetrics(BaseModel):
     data_confidence: float = Field(ge=0, le=1)
     total_travel_minutes: int = Field(ge=0)
     walking_distance_meters: int = Field(ge=0)
-    estimated_cost: Decimal = Field(ge=0)
+    known_estimated_cost: Decimal = Field(
+        validation_alias=AliasChoices("known_estimated_cost", "estimated_cost")
+    )
+    unknown_cost_item_count: int = Field(default=0, ge=0)
     fatigue_score: float = Field(ge=0, le=1)
+
+    @computed_field
+    @property
+    def estimated_cost(self) -> Decimal:
+        """保留 v0.1 响应字段，明确其仅表示已知费用。"""
+        return self.known_estimated_cost
 
 
 class Violation(BaseModel):
@@ -206,8 +232,24 @@ class Violation(BaseModel):
 
 
 class ValidationResult(BaseModel):
-    valid: bool
+    status: ValidationStatus
     violations: list[Violation] = Field(default_factory=list)
+
+    @computed_field
+    @property
+    def valid(self) -> bool:
+        """兼容旧响应，并让条件路由以 status 为准。"""
+        return self.status is not ValidationStatus.INVALID
+
+    @classmethod
+    def from_violations(cls, violations: list[Violation]) -> "ValidationResult":
+        if any(item.severity is ViolationSeverity.ERROR for item in violations):
+            status = ValidationStatus.INVALID
+        elif violations:
+            status = ValidationStatus.VALID_WITH_WARNINGS
+        else:
+            status = ValidationStatus.VALID
+        return cls(status=status, violations=violations)
 
 
 class PlanCandidate(BaseModel):
@@ -218,6 +260,7 @@ class PlanCandidate(BaseModel):
     validation: ValidationResult | None = None
     score: float | None = None
     reason_facts: list[str] = Field(default_factory=list)
+    assumptions: list[PlanningAssumption] = Field(default_factory=list)
 
 
 class PlanningRequest(BaseModel):
@@ -231,3 +274,21 @@ class PlanningResponse(BaseModel):
     candidates: list[PlanCandidate]
     iterations: int
     message: str | None = None
+
+
+def rebuild_provenance_models(
+    *, poi_facts: type[BaseModel], value_source: type[StrEnum]
+) -> None:
+    """在 domain 层显式完成跨模块 provenance 类型的解析。"""
+    types_namespace = {"POIFacts": poi_facts, "ValueSource": value_source}
+    for model in (PlanningAssumption, PlanningPOI, POIResolution, PlanCandidate):
+        model.model_rebuild(force=True, _types_namespace=types_namespace)
+
+
+try:
+    from travel_agent.domain.tool_models import POIFacts, ValueSource
+except ImportError:
+    # tool_models 先导入时会在其定义完成后调用 rebuild_provenance_models。
+    pass
+else:
+    rebuild_provenance_models(poi_facts=POIFacts, value_source=ValueSource)

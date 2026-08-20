@@ -199,3 +199,9 @@ def route_key(query: RouteQuery) -> str:
         f"->{query.destination.longitude:.6f},{query.destination.latitude:.6f}"
         f"|{query.mode.value}|{query.strategy}"
     )
+
+
+# 支持先导入 tool_models 的调用方，避免 provenance schema 受导入顺序影响。
+from travel_agent.domain.models import rebuild_provenance_models
+
+rebuild_provenance_models(poi_facts=POIFacts, value_source=ValueSource)
