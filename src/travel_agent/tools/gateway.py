@@ -207,6 +207,9 @@ class ToolGateway:
             attempt=event.attempt,
             next_attempt=event.next_attempt,
             delay_seconds=round(event.delay_seconds, 3),
+            category=event.error.category.value,
+            code=event.error.code,
+            retryable=event.error.retryable,
         )
 
     def _log_result(

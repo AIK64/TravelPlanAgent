@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 
+from travel_agent.config import Settings
 from travel_agent.domain.models import Coordinate, PlanningRequest
 from travel_agent.domain.tool_models import (
     POIFacts,
@@ -182,6 +183,23 @@ class ExplodingUnselectedMockProvider(MockPOIProvider):
         raise AssertionError("unselected Mock provider must never be called")
 
 
+class ExplodingUnselectedMockRouteProvider(MockRouteProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def get_driving_route(self, query: RouteQuery) -> RouteResult:
+        self.calls += 1
+        raise AssertionError("unselected Mock route provider must never be called")
+
+
+class RuntimeClientProbe:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 class TimeoutRouteProvider(MockRouteProvider):
     async def get_driving_route(self, query: RouteQuery) -> RouteResult:
         raise ToolProviderError.timeout("route.get_driving")
@@ -303,28 +321,46 @@ async def test_poi_tool_failure_raises_without_validation_or_replan(
 @pytest.mark.asyncio
 async def test_amap_failure_retries_selected_provider_without_mock_fallback(
     hangzhou_trip,
-    gateway_factory,
+    monkeypatch,
     caplog,
 ):
     """AMap 失败只能耗尽选中 Provider 的公开重试预算，不能静默回退 Mock。"""
     selected_amap = AlwaysTimeoutAMapPOIProvider()
     selected_route = UnusedAMapRouteProvider()
-    unselected_mock = ExplodingUnselectedMockProvider()
-    gateway = gateway_factory(
-        poi_provider=selected_amap,
-        route_provider=selected_route,
-        max_attempts=3,
+    unselected_mock_poi = ExplodingUnselectedMockProvider()
+    unselected_mock_route = ExplodingUnselectedMockRouteProvider()
+    mock_constructor_calls = {"poi": 0, "route": 0}
+    client = RuntimeClientProbe()
+
+    def construct_mock_poi():
+        mock_constructor_calls["poi"] += 1
+        return unselected_mock_poi
+
+    def construct_mock_route():
+        mock_constructor_calls["route"] += 1
+        return unselected_mock_route
+
+    monkeypatch.setattr(
+        "travel_agent.runtime.httpx.AsyncClient", lambda **_kwargs: client
     )
-    runtime = PlanningRuntime(
-        poi_provider=selected_amap,
-        route_provider=selected_route,
-        gateway=gateway,
-        workflow=build_workflow(
-            gateway,
-            POIDefaultPolicy(UnknownFactPolicy.ASSUME_WITH_WARNING),
-        ),
-        client=None,
+    monkeypatch.setattr(
+        "travel_agent.runtime.AMapPOIProvider", lambda _client: selected_amap
     )
+    monkeypatch.setattr(
+        "travel_agent.runtime.AMapRouteProvider", lambda _client: selected_route
+    )
+    monkeypatch.setattr("travel_agent.runtime.MockPOIProvider", construct_mock_poi)
+    monkeypatch.setattr("travel_agent.runtime.MockRouteProvider", construct_mock_route)
+    settings = Settings.from_env(
+        {
+            "TRAVEL_PROVIDER": "amap",
+            "AMAP_API_KEY": "assembly-only-test-key",
+            "TOOL_MAX_ATTEMPTS": "3",
+            "TOOL_BACKOFF_BASE_SECONDS": "0.001",
+            "TOOL_MAX_BACKOFF_SECONDS": "0.001",
+        }
+    )
+    runtime = await PlanningRuntime.create(settings)
     request = PlanningRequest(
         trip=hangzhou_trip.model_copy(
             update={"must_visit": ["灵隐寺"], "interests": []}
@@ -334,14 +370,21 @@ async def test_amap_failure_retries_selected_provider_without_mock_fallback(
     thread_id = "amap-no-fallback"
     caplog.set_level(logging.INFO)
 
-    with pytest.raises(ToolUnavailableError) as raised:
-        await runtime.plan(request, thread_id=thread_id)
+    try:
+        with pytest.raises(ToolUnavailableError) as raised:
+            await runtime.plan(request, thread_id=thread_id)
+    finally:
+        await runtime.close()
 
     assert raised.value.result.attempt_count == 3
     assert selected_amap.calls == 3
-    assert unselected_mock.calls == 0
+    assert mock_constructor_calls == {"poi": 0, "route": 0}
+    assert unselected_mock_poi.calls == 0
+    assert unselected_mock_route.calls == 0
+    assert runtime.poi_provider is selected_amap
+    assert runtime.route_provider is selected_route
     assert all(
-        unselected_mock is not owned
+        unselected_mock_poi is not owned and unselected_mock_route is not owned
         for owned in (
             runtime.poi_provider,
             runtime.route_provider,
@@ -351,6 +394,7 @@ async def test_amap_failure_retries_selected_provider_without_mock_fallback(
         )
     )
     assert not hasattr(runtime, "fallback_provider")
+    assert client.closed
     events = _event_names(caplog.records, thread_id)
     assert events.count("tool.retry_scheduled") == 2
     assert "tool.failed" in events

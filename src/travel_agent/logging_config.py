@@ -6,6 +6,7 @@ import os
 
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+_SENSITIVE_HTTP_LOGGERS = ("httpx", "httpcore")
 
 
 def configure_logging() -> None:
@@ -18,4 +19,6 @@ def configure_logging() -> None:
         datefmt=DATE_FORMAT,
     )
     logging.getLogger("travel_agent").setLevel(log_level)
+    for logger_name in _SENSITIVE_HTTP_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 

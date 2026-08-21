@@ -304,7 +304,12 @@ async def test_gateway_emits_safe_lifecycle_logs(caplog):
     for event in expected_events:
         assert any(message.startswith(event) for message in messages), event
     required_fields = {
-        "tool.started": {"thread_id=gateway-test", "provider=", "operation="},
+        "tool.started": {
+            "thread_id=gateway-test",
+            "provider=",
+            "operation=",
+            "attempt=1",
+        },
         "tool.retry_scheduled": {
             "thread_id=gateway-test",
             "provider=",
@@ -312,12 +317,16 @@ async def test_gateway_emits_safe_lifecycle_logs(caplog):
             "attempt=",
             "next_attempt=",
             "delay_seconds=",
+            "category=timeout",
+            "code=timeout",
+            "retryable=True",
         },
         "tool.completed": {
             "thread_id=gateway-test",
             "provider=",
             "operation=",
             "attempt_count=",
+            "cache_hit=false",
             "elapsed_ms=",
         },
         "tool.cache_hit": {
@@ -325,6 +334,7 @@ async def test_gateway_emits_safe_lifecycle_logs(caplog):
             "provider=",
             "operation=",
             "attempt_count=",
+            "cache_hit=true",
             "elapsed_ms=",
         },
         "tool.failed": {
@@ -332,6 +342,7 @@ async def test_gateway_emits_safe_lifecycle_logs(caplog):
             "provider=",
             "operation=",
             "attempt_count=3",
+            "cache_hit=false",
             "elapsed_ms=",
             "category=timeout",
             "code=timeout",
