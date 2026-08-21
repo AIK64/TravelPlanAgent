@@ -7,6 +7,7 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
+from travel_agent import __version__
 from travel_agent.app import create_app
 from travel_agent.config import Settings
 from travel_agent.domain.models import PlanningResponse
@@ -47,6 +48,14 @@ def test_health(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_openapi_version_matches_package_version(client):
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    assert __version__ == "0.2.0"
+    assert response.json()["info"]["version"] == __version__
 
 
 def test_create_plan(client, hangzhou_trip):

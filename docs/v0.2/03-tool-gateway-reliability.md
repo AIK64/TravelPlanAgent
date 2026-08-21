@@ -1,6 +1,6 @@
 # 03. Tool Gateway：可靠性是 Tool Use 的一部分
 
-Gateway 对每次 POI/路线调用记录相同 `thread_id` 的 `tool.started`、`tool.retry_scheduled`、`tool.succeeded` 或 `tool.failed` 事件，并返回 `ToolResult`。成功结果包含 Provider、缓存命中、尝试次数和耗时；失败结果包含安全 `ToolErrorInfo`。
+Gateway 对每次 POI/路线调用记录相同 `thread_id` 的 `tool.started`、`tool.retry_scheduled`、`tool.completed`、`tool.cache_hit` 或 `tool.failed` 事件，并返回 `ToolResult`。未命中缓存且成功时发出 `tool.completed`（`cache_hit=false`）；缓存命中时发出 `tool.cache_hit`（`cache_hit=true`），不会再额外发出 `tool.completed`。成功结果包含 Provider、缓存命中、尝试次数和耗时；失败结果包含安全 `ToolErrorInfo`。
 
 | 情形 | Gateway 行为 | Graph / HTTP 语义 |
 |---|---|---|

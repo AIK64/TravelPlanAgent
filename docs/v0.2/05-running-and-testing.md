@@ -61,3 +61,13 @@ $env:AMAP_API_KEY = "replace-with-your-own-key"
 ```
 
 未同时设置两个变量时该文件会被 skip，普通 `pytest` 不会发出网络请求。
+
+如果本机的既有虚拟环境启用了系统 site-packages，`pip check` 可能报告与本项目无关的全局包冲突。发布前应在不继承系统包的干净项目环境复验（此目录位于已忽略的 `.venv/` 下）：
+
+```powershell
+.\.venv\Scripts\python.exe -m venv .\.venv\pip-check
+.\.venv\pip-check\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\pip-check\Scripts\python.exe -m pip check
+```
+
+检查 `.\.venv\pip-check\pyvenv.cfg` 中的 `include-system-site-packages = false`；预期输出是 `No broken requirements found`。该环境仅用于验证，不应提交。

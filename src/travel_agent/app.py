@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from travel_agent import __version__
 from travel_agent.api.errors import (
     UTF8JSONResponse,
     tool_unavailable_exception_handler,
@@ -38,7 +39,7 @@ def create_app(
 
     app = FastAPI(
         title="Constraint-Aware Travel Agent",
-        version="0.1.0",
+        version=__version__,
         default_response_class=UTF8JSONResponse,
         description=(
             "A deterministic first slice of a stateful "

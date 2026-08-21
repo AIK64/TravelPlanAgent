@@ -6,7 +6,7 @@
 
 - `POIFacts`：ID、坐标、类别、可用营业时间、均价、建议时长、`provider`、`fetched_at`、置信度和 `field_sources`。
 - `RouteResult`：正距离、正分钟数、驾车模式、Provider、置信度、抓取时间。
-- `ValueSource` 可为 `provider`、`derived`、`default`、`user_confirmed`。`unknown` 不是伪造数值：费用、时长或营业信息不可可靠解析时保留 `None`；默认补齐的值标为 `default`，Validator 会转成 warning。`derived` 的步行接驳明确说明其公式和限制。
+- `ValueSource` 可为 `provider`、`derived`、`default`、`user_confirmed`。`unknown` 不是伪造数值：费用、时长或营业信息不可可靠解析时保留 `None`；默认补齐的值标为 `default`，Validator 会转成 warning。当前步行接驳距离按 `min(round(driving_distance_meters * 0.12), 2000)` 从驾车距离估算，但它的 provenance **实际标为 `default`，不是 `derived`**，因此同样会产生“步行距离为估算”的 warning；这避免把尚未调用真实步行路线的值误称为 Provider 事实。
 
 `UNKNOWN_FACT_POLICY=assume_with_warning` 允许默认值进入候选并留下假设；`strict` 不把未知事实伪装为已验证数据。`ValidationStatus` 区分 `valid`、`valid_with_warnings`、`invalid`：前两种可交付，选择时完全 `valid` 优先于分数更高的 warning 方案。
 

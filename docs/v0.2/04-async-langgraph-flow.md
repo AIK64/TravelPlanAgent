@@ -2,7 +2,27 @@
 
 ## State
 
-`TravelState` 的字段依次表达输入、工具事实、候选和控制信息：`thread_id`、`trip`、`search_queries`、`poi_facts`、`planning_pois`、`poi_resolution_issues`、`candidate_drafts`、`route_queries`、`route_results`、`tool_summaries`、`candidates`、`selected_plan`、`iterations`、`pending_replan_round`、`max_replan_rounds`、`status`、`message`。其中工具字段全是标准化模型或摘要，不含 Provider 原始 payload。
+`initial_state()` 为每次运行建立下面的完整 `TravelState`。节点只返回自己更新的字段，LangGraph 将更新合并进 Checkpoint；工具字段全是标准化模型或摘要，不含 Provider 原始 payload。
+
+| 字段 | 初始值 / 来源 | 写入节点 | 消费、清理或输出时机 |
+|---|---|---|---|
+| `thread_id` | API 生成或调用方传入 | 初始值不再改写 | Gateway、日志和 Checkpoint 全程关联 |
+| `trip` | `request.trip` | 初始值不再改写 | 检索、默认补全、草案、路线、物化与 Validator 读取 |
+| `search_queries` | `[]` | `build_search_plan` | `load_pois` 调用 POI 工具；本轮结束保留于 Checkpoint |
+| `poi_facts` | `[]` | `load_pois` | `resolve_poi_facts` 读取；保存标准化 `POIFacts` |
+| `planning_pois` | `[]` | `resolve_poi_facts` | 草案、路线收集、物化、校验读取；跨 replan 保留 |
+| `poi_resolution_issues` | `[]` | `resolve_poi_facts` | 诊断事实缺失；跨 replan 保留于 Checkpoint |
+| `candidate_drafts` | `[]` | `prepare_candidate_drafts` | `load_routes`、`materialize_candidates` 读取；`replan` 清空，再由下一轮重建 |
+| `route_queries` | `[]` | `load_routes` | 与结果对应供诊断；`replan` 清空 |
+| `route_results` | `{}` | `load_routes` | `materialize_candidates` 读取；`replan` 清空，防止沿用旧草案的路线 |
+| `tool_summaries` | `[]` | `load_pois`、`load_routes` 追加 | 记录 Provider、操作、缓存命中和尝试次数；全程保留 |
+| `candidates` | `[]` | `materialize_candidates`，`validate_candidates` 覆盖为带校验结果的候选 | 条件路由和最终响应读取；`replan` 清空 |
+| `selected_plan` | `None` | `select_best`，`mark_infeasible` | 最终响应读取；`replan` 清空旧选择 |
+| `iterations` | `0` | `validate_candidates` 在 pending 轮成功校验后提交 | 条件路由比较业务上限，并进入响应 |
+| `pending_replan_round` | `None` | `replan` 写入下一轮；`validate_candidates` 成功后清回 `None` | 让失败时的 Checkpoint 表示未提交事务 |
+| `max_replan_rounds` | `request.max_replan_rounds`（0–5） | 初始值不再改写 | `route_after_validation` 读取，限制业务回环 |
+| `status` | `"started"` | 各节点更新当前阶段 | 日志、终态和 API 响应读取 |
+| `message` | `None` | `replan`、`select_best`、`mark_infeasible` | 最终响应展示可读说明 |
 
 `pending_replan_round` 解决“下一轮尚未完整验证”的中间态：`replan` 先写 pending round、清空过期草案/路线/候选；只有新一轮 `validate_candidates` 成功完成后才把 `iterations` 提交并清空 pending。若该轮工具失败，Checkpoint 仍能准确展示未提交的 pending 状态。
 
