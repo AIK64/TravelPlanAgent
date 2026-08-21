@@ -1,146 +1,74 @@
 # Constraint-Aware Travel Agent
 
-一个面向中国城市旅行场景的约束感知自适应规划 Agent。项目采用 LangGraph 构建有状态的 `Plan → Execute → Validate → Replan` 工作流，并将 LLM 语义职责、确定性约束验证和路线优化解耦。
+面向中国城市旅行场景的约束感知规划 Agent。v0.2 的重点是 **Agent Tool Use**：LangGraph 中的检索意图、POI/路线工具节点、typed State、确定性校验和条件 Replan Loop 都可从日志、Checkpoint 与轨迹测试观察；地图 API、缓存和 FastAPI 只是让工具调用可靠的支撑层。
 
-## 项目定位与开发优先级
-
-本项目首先是一个用于简历和面试展示的 **Agent Engineering 项目**。开发优先级是 Agent 的显式状态、Tool Use、条件路由、验证与 Replan Loop、上下文管理、Human-in-the-loop、执行轨迹和评测；地图 Provider、缓存、重试、API 与存储是支撑这些 Agent 能力可靠运行的工程层，不追求脱离 Agent 目标的全面业务覆盖。
-
-每个版本都必须说明新增了什么 Agent 能力、它如何改变 Graph 轨迹，以及怎样通过日志、测试或 Benchmark 证明。长期约束见 [项目记忆与开发原则](AGENTS.md)。
-
-完整设计见 [项目架构文档](docs/travel-agent-architecture.md)。
-
-如果你正在跟随项目学习，请从 [v0.1 学习与实现文档](docs/v0.1/README.md) 开始。该目录只描述当前已经落地的代码，并包含请求生命周期、代码导读、LangGraph 原理、约束验证、运行测试和练习。
-
-## 当前进度
-
-当前完成的是第一条可运行主线：
-
-- Pydantic 强类型旅行、POI、计划和违规模型
-- 杭州 Mock POI 数据集
-- 可替换的确定性路线估算器
-- Relaxed、Balanced、Exploration 三种候选计划
-- 时间、预算、营业时间、到离站缓冲、步行与必去地点校验
-- LangGraph `Plan → Validate → Replan` 有界循环
-- 基于 `InMemorySaver` 的开发期 Checkpoint
-- 带 `thread_id` 关联的结构化链路日志（INFO / DEBUG）
-- FastAPI 健康检查和同步规划接口
-- 单元、工作流和 API 测试
-
-尚未实现：
-
-- LLM 需求解析与高层 Planner
-- 高德地图和和风天气真实适配器
-- OR-Tools 时间窗优化
-- PostgreSQL Checkpointer 与计划版本管理
-- Interrupt/Resume 和 Human-in-the-loop
-- 用户长期偏好 Store
-- Benchmark 与 LangSmith 评测
-
-## 架构
+## 当前进度：v0.2.0
 
 ```text
-PlanningRequest
-  ↓
-load_context
-  ↓
-create_initial_candidates
-  ↓
-validate_candidates
-  ├── 有合法方案 → select_best → END
-  ├── 无合法方案且有预算 → replan ─┐
-  │                                 └→ validate_candidates
-  └── 重规划预算耗尽 → mark_infeasible → END
+Search Intent → POI Tool Use → 标准化 State → Route Tool Use
+→ 候选物化 → Validate → Select / Replan / Infeasible
 ```
 
-当前节点使用确定性实现，后续会将 Requirement Parser、High-level Planner、Critic 和 Explanation Generator 替换为有严格结构化输出的 LLM 适配器。Validator、路线算法和预算计算继续保持确定性。
+已完成：
 
-## 本地运行
+- 显式 LangGraph State、Node、Edge 与有界 `Plan → Tool Use → Validate → Replan` Loop。
+- Mock/AMap Provider Protocol，`POIFacts` 与 `RouteResult` 的标准化及数据来源标记。
+- 异步 Gateway 的 TTL cache、并发限制、重试、工具事件与安全错误语义。
+- `thread_id` 关联 API、工具日志、Graph State 与开发期 `InMemorySaver` Checkpoint。
+- 离线契约、Gateway、轨迹和 API 测试；AMap 可选 live smoke 默认跳过。
 
-要求 Python 3.11 或更高版本。
+尚未实现：LLM 自然语言需求解析、真实步行路线、天气、OTA 交易/下单、长期记忆、持久化 Checkpoint、Human-in-the-loop 与生产评测平台。不要将当前项目表述为已经具备这些能力。
+
+## 学习入口
+
+- 从 [v0.2 Tool Use 学习文档](docs/v0.2/README.md) 开始，按其中推荐顺序阅读。
+- [v0.1 文档](docs/v0.1/README.md) 是历史基线，描述的是尚未接入 Provider/Gateway 的版本。
+- 完整长期设计见 [项目架构文档](docs/travel-agent-architecture.md)；实际行为以 v0.2 文档和代码为准。
+
+## 本地运行：默认 Mock（离线、确定性）
+
+需要 Python 3.11+：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+$env:TRAVEL_PROVIDER = "mock"
 $env:APP_LOG_LEVEL = "INFO"
 .\.venv\Scripts\python.exe -m uvicorn travel_agent.app:app --reload
 ```
 
-启动后访问：
-
-- OpenAPI：<http://127.0.0.1:8000/docs>
-- 健康检查：<http://127.0.0.1:8000/health>
-
-规划链路日志会输出到运行 Uvicorn 的终端。需要查看每天的候选行程和具体违规时，将 `APP_LOG_LEVEL` 改为 `DEBUG`。详细事件说明见 [v0.1 可观测性与链路日志](docs/v0.1/09-observability-and-logging.md)。
-
-## 调用示例
-
-请求体位于 [`examples/hangzhou_request.json`](examples/hangzhou_request.json)。
-
-```powershell
-$body = Get-Content `
-  -LiteralPath .\examples\hangzhou_request.json `
-  -Raw `
-  -Encoding UTF8
-
-$null = $body | ConvertFrom-Json
-
-Invoke-RestMethod `
-  -Method Post `
-  -Uri http://127.0.0.1:8000/api/v1/plans `
-  -ContentType "application/json; charset=utf-8" `
-  -Body $body
-```
-
-也可以直接运行兼容 Windows PowerShell 5.1 和 PowerShell 7 的脚本：
+启动后访问 <http://127.0.0.1:8000/docs>，另开 PowerShell 调用：
 
 ```powershell
 .\scripts\invoke-hangzhou-example.ps1
 ```
 
-接口返回：
+该脚本使用 [`examples/hangzhou_request.json`](examples/hangzhou_request.json)；该 JSON 为 UTF-8，可通过 `Get-Content -Raw -Encoding UTF8 | Invoke-RestMethod` 使用。服务终端会出现 `search_plan.created`、`tool.started`、`candidate.validated`、`routing.decision` 与 `plan.selected` 等关联事件。
 
-- `status`：`completed` 或 `infeasible`
-- `selected_plan`：得分最高的合法方案
-- `candidates`：当前重规划轮次的三个候选方案
-- `iterations`：实际重规划次数
-- `message`：执行结果说明
+## AMap 模式：显式启用，绝不 fallback
 
-## 测试
+仅在本机终端临时设置自己的 key，绝不写入 `.env.example`、JSON、日志或提交：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest
+$env:TRAVEL_PROVIDER = "amap"
+$env:AMAP_API_KEY = "replace-with-your-own-key"
+$env:APP_LOG_LEVEL = "INFO"
+.\.venv\Scripts\python.exe -m uvicorn travel_agent.app:app --reload
 ```
 
-查看覆盖率：
+AMap 模式缺少 key 会在配置阶段失败；选中 AMap 后，真实错误在有限重试后返回 HTTP 503，**不会**静默回退 Mock，也不会伪装成业务 `infeasible`。详见 [运行与测试](docs/v0.2/05-running-and-testing.md)。
+
+## 验证
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest `
-  --cov=travel_agent `
-  --cov-report=term-missing
+.\.venv\Scripts\python.exe -m pytest --cov=travel_agent --cov-report=term-missing
+.\.venv\Scripts\python.exe -m compileall -q src tests
+.\.venv\Scripts\python.exe -m pip check
 ```
 
-## 代码结构
+可选的真实 AMap smoke 需要同时显式设置 `RUN_AMAP_LIVE=1` 和 `AMAP_API_KEY`：
 
-```text
-src/travel_agent/
-├── api/                 # FastAPI 路由
-├── domain/              # 强类型领域模型
-├── graph/               # LangGraph State 与工作流
-├── planning/            # Mock 数据、规划、路线和 Validator
-└── app.py               # FastAPI 应用入口
-
-tests/                   # 领域、工作流和 API 测试
-examples/                # 可执行请求示例
-docs/                    # 完整架构文档
+```powershell
+$env:RUN_AMAP_LIVE = "1"
+.\.venv\Scripts\python.exe -m pytest tests/test_amap_live_smoke.py
 ```
-
-## 下一步
-
-下一阶段优先完成：
-
-1. 抽象 `POIProvider`、`RouteProvider` 和 `WeatherProvider` 协议。
-2. 将 Mock Provider 与规划领域解耦。
-3. 接入高德 POI/路线 API，并增加缓存、超时和重试。
-4. 增加自然语言 Requirement Parser，同时保留结构化 API 输入。
-5. 将开发期内存 Checkpoint 替换为 PostgreSQL Checkpoint。
