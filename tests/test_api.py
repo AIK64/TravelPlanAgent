@@ -16,6 +16,15 @@ from travel_agent.tools.providers.amap import AMapPOIProvider, AMapRouteProvider
 from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
 
 
+RUNTIME_OWNED_FIELDS = {
+    "poi_provider",
+    "route_provider",
+    "gateway",
+    "workflow",
+    "client",
+}
+
+
 @dataclass
 class RuntimeProbe:
     plan_calls: list[tuple[object, str]]
@@ -73,6 +82,8 @@ def test_json_response_declares_utf8_for_legacy_windows_clients(
 async def test_mock_runtime_contains_only_mock_providers():
     runtime = await PlanningRuntime.create(Settings.from_env({}))
     try:
+        assert set(runtime.__slots__) == RUNTIME_OWNED_FIELDS
+        assert not hasattr(runtime, "settings")
         assert isinstance(runtime.poi_provider, MockPOIProvider)
         assert isinstance(runtime.route_provider, MockRouteProvider)
         assert runtime.client is None
@@ -90,6 +101,8 @@ async def test_amap_runtime_contains_only_amap_providers_and_closes_client():
     client = runtime.client
 
     assert settings.provider is ProviderMode.AMAP
+    assert set(runtime.__slots__) == RUNTIME_OWNED_FIELDS
+    assert not hasattr(runtime, "settings")
     assert isinstance(runtime.poi_provider, AMapPOIProvider)
     assert isinstance(runtime.route_provider, AMapRouteProvider)
     assert client is not None

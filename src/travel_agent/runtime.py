@@ -24,7 +24,6 @@ from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
 class PlanningRuntime:
     """持有一套显式选定、由应用生命周期共享的规划依赖。"""
 
-    settings: Settings
     poi_provider: POIProvider
     route_provider: RouteProvider
     gateway: ToolGateway
@@ -53,7 +52,6 @@ class PlanningRuntime:
             gateway = build_gateway(settings, poi_provider, route_provider)
             defaults = POIDefaultPolicy(settings.unknown_fact_policy)
             return cls(
-                settings=settings,
                 poi_provider=poi_provider,
                 route_provider=route_provider,
                 gateway=gateway,
