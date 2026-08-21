@@ -6,7 +6,10 @@ from datetime import date, datetime, time, timezone, timedelta
 from decimal import Decimal
 
 import pytest
+from fastapi.testclient import TestClient
 
+from travel_agent.app import create_app
+from travel_agent.config import Settings
 from travel_agent.domain.models import (
     Coordinate,
     LocationAnchor,
@@ -15,17 +18,60 @@ from travel_agent.domain.models import (
     TransportAnchor,
     TripSpec,
 )
-from travel_agent.domain.tool_models import POIFacts, POISearchQuery, RouteQuery, RouteResult
+from travel_agent.domain.tool_models import (
+    POIFacts,
+    POISearchQuery,
+    RouteQuery,
+    RouteResult,
+    ToolErrorCategory,
+    ToolErrorInfo,
+    ToolResult,
+)
 from travel_agent.graph.workflow import build_workflow
 from travel_agent.planning.defaults import POIDefaultPolicy
 from travel_agent.domain.tool_models import UnknownFactPolicy
 from travel_agent.tools.cache import AsyncTTLCache
+from travel_agent.tools.errors import ToolUnavailableError
 from travel_agent.tools.gateway import ToolGateway
 from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
 from travel_agent.tools.retry import RetryPolicy
 
 
 CHINA_TZ = timezone(timedelta(hours=8))
+
+
+@pytest.fixture
+def client():
+    with TestClient(create_app(Settings.from_env({}))) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def tool_failure_client(monkeypatch):
+    class ToolFailureRuntime:
+        async def plan(self, _request, thread_id):
+            error = ToolErrorInfo(
+                category=ToolErrorCategory.TIMEOUT,
+                code="tool_unavailable",
+                operation="search_pois",
+                retryable=True,
+                safe_message="地图服务暂时不可用，请稍后重试",
+            )
+            result = ToolResult[object].failed(provider="amap", error=error)
+            raise ToolUnavailableError.from_result(result, thread_id=thread_id)
+
+        async def close(self):
+            return None
+
+    async def runtime_factory(_settings):
+        return ToolFailureRuntime()
+
+    monkeypatch.setattr("travel_agent.api.routes.uuid4", lambda: "api-tool-failure")
+    application = create_app(
+        Settings.from_env({}), runtime_factory=runtime_factory
+    )
+    with TestClient(application) as test_client:
+        yield test_client
 
 
 class RecordingMockPOIProvider(MockPOIProvider):
