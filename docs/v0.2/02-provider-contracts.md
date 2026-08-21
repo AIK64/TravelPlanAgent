@@ -5,10 +5,12 @@
 ## 标准化输出与 provenance
 
 - `POIFacts`：ID、坐标、类别、可用营业时间、均价、建议时长、`provider`、`fetched_at`、置信度和 `field_sources`。
-- `RouteResult`：正距离、正分钟数、驾车模式、Provider、置信度、抓取时间。
+- `RouteResult`：正距离、正分钟数、驾车模式、Provider、置信度、抓取时间。AMap 只表述为 Provider 标准化结果；Mock 明确表述为低置信度本地估算，不能称为“真实驾车路线”。
 - `ValueSource` 可为 `provider`、`derived`、`default`、`user_confirmed`。`unknown` 不是伪造数值：费用、时长或营业信息不可可靠解析时保留 `None`；默认补齐的值标为 `default`，Validator 会转成 warning。当前步行接驳距离按 `min(round(driving_distance_meters * 0.12), 2000)` 从驾车距离估算，但它的 provenance **实际标为 `default`，不是 `derived`**，因此同样会产生“步行距离为估算”的 warning；这避免把尚未调用真实步行路线的值误称为 Provider 事实。
 
 `UNKNOWN_FACT_POLICY=assume_with_warning` 允许默认值进入候选并留下假设；`strict` 不把未知事实伪装为已验证数据。`ValidationStatus` 区分 `valid`、`valid_with_warnings`、`invalid`：前两种可交付，选择时完全 `valid` 优先于分数更高的 warning 方案。
+
+候选/API 复用 `reason_facts` 暴露路线 provenance，例如默认模式输出“路线来源 mock（本地估算）”、路线置信度和交通分钟数；非 Mock 则输出具体 provider 与“Provider 标准化结果”。这里不额外扩展领域 schema，也不宣称适配器未能证明的“真实”强度。
 
 ## Mock 与 AMap 的严格隔离
 

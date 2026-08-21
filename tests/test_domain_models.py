@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
-from travel_agent.domain.models import DayPlan, PlanMetrics
+from travel_agent.domain.models import DayPlan, PlanMetrics, TripSpec
 
 
 def test_trip_day_count(hangzhou_trip):
@@ -18,6 +18,34 @@ def test_transport_anchor_requires_timezone(hangzhou_trip):
     payload["arrival"]["at"] = datetime(2026, 10, 2, 10, 30)
     with pytest.raises(ValidationError, match="timezone-aware"):
         type(hangzhou_trip).model_validate(payload)
+
+
+def test_trip_spec_strips_and_drops_blank_preference_terms(hangzhou_trip):
+    """防止空白偏好进入子串匹配后把任意 POI 误判为必去地点。"""
+    payload = hangzhou_trip.model_dump()
+    payload.update(
+        {
+            "interests": [" 自然 ", "", "  ", "人文"],
+            "avoid": [" 高强度 ", "\t"],
+            "must_visit": [" 灵隐寺 ", "\n"],
+        }
+    )
+
+    trip = TripSpec.model_validate(payload)
+
+    assert trip.interests == ["自然", "人文"]
+    assert trip.avoid == ["高强度"]
+    assert trip.must_visit == ["灵隐寺"]
+
+
+@pytest.mark.parametrize("field", ["interests", "avoid", "must_visit"])
+def test_trip_spec_bounds_preference_list_size(hangzhou_trip, field):
+    """防止单个请求用超大偏好列表无界占用内存并放大后续 Tool Use。"""
+    payload = hangzhou_trip.model_dump()
+    payload[field] = [f"term-{index}" for index in range(101)]
+
+    with pytest.raises(ValidationError):
+        TripSpec.model_validate(payload)
 
 
 def test_cost_compatibility_fields_serialize_known_cost():

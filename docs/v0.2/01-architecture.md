@@ -34,3 +34,7 @@ api/app → runtime → graph/workflow → tools/gateway → providers
 - `api/`：生成 `thread_id`、映射安全错误至 HTTP；不是规划决策层。
 
 这个方向防止 Provider 原始 JSON 进入 Prompt 或 Graph State：State 中保存的是可序列化的标准模型和摘要，Provider 原始响应停留在适配层。
+
+Runtime 只在 `PlanningRuntime.create()` 中把公开配置转换成 frozen `PlanningPolicy` 并注入 compiled workflow。Policy 不含 API key，统一控制单次 POI 返回上限、候选合并上限、POI 总查询预算和驾车 strategy；Runtime 自身不保存 `Settings`、key 或 policy。Graph 因而不会再用 `10/12/32` 之类的散落硬编码覆盖部署配置。
+
+Validator 把 `daily_start/daily_end` 当作确定性硬约束：按行程时区逐项检查 activity，越界产生 `outside_daily_window` ERROR。Planner 不为 must-visit 绕过每日窗口或 Provider 营业窗口；无法物化的必去地点由 `missing_must_visit` 驱动 Replan，预算耗尽后进入 `mark_infeasible`。

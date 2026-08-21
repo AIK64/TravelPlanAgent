@@ -55,13 +55,15 @@ class RetryPolicy:
                 if not error.retryable or attempt == self.max_attempts:
                     raise ToolRetryExhausted(error, attempt) from error
 
-                exponential = min(
-                    self.max_delay_seconds,
-                    self.base_delay_seconds * (2 ** (attempt - 1)),
+                exponential = self.base_delay_seconds * (2 ** (attempt - 1))
+                jittered = exponential + (
+                    min(1.0, max(0.0, self.jitter())) * exponential
                 )
                 requested = error.retry_after_seconds or 0.0
-                delay = min(self.max_delay_seconds, max(exponential, requested))
-                delay += min(1.0, max(0.0, self.jitter())) * exponential
+                delay = min(
+                    self.max_delay_seconds,
+                    max(jittered, requested),
+                )
 
                 if on_retry is not None:
                     await on_retry(

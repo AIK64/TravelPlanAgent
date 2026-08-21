@@ -32,6 +32,7 @@ from travel_agent.planning.drafts import (
     prepare_candidate_drafts,
 )
 from travel_agent.planning.planner import materialize_candidates
+from travel_agent.planning.policy import PlanningPolicy
 from travel_agent.planning.search_plan import build_search_plan as create_search_plan
 from travel_agent.planning.validator import validate_candidate
 from travel_agent.tools.errors import ToolUnavailableError
@@ -217,12 +218,17 @@ def route_after_validation(
 def build_workflow(
     gateway: ToolGateway,
     defaults: POIDefaultPolicy,
+    policy: PlanningPolicy = PlanningPolicy(),
 ) -> CompiledStateGraph:
     """构建只通过注入 ToolGateway 获取外部事实的异步规划图。"""
 
     def build_search_plan(state: TravelState) -> dict:
         _log_node_started(state, "build_search_plan")
-        queries = create_search_plan(state["trip"])
+        queries = create_search_plan(
+            state["trip"],
+            per_query_limit=policy.poi_query_limit,
+            max_queries=policy.poi_max_queries,
+        )
         logger.info(
             "search_plan.created | thread_id=%s query_count=%s priorities=%s",
             state["thread_id"],
@@ -256,9 +262,9 @@ def build_workflow(
             assert result.data is not None
             for facts in result.data:
                 facts_by_id.setdefault(facts.id, facts)
-                if len(facts_by_id) == 12:
+                if len(facts_by_id) == policy.poi_candidate_limit:
                     break
-            if len(facts_by_id) == 12:
+            if len(facts_by_id) == policy.poi_candidate_limit:
                 break
 
         poi_facts = list(facts_by_id.values())
@@ -351,6 +357,7 @@ def build_workflow(
             state["trip"],
             state["candidate_drafts"],
             state["planning_pois"],
+            route_strategy=policy.route_strategy,
         )
         results = await gateway.get_routes(
             queries,
@@ -394,6 +401,7 @@ def build_workflow(
             state["candidate_drafts"],
             state["planning_pois"],
             state["route_results"],
+            route_strategy=policy.route_strategy,
         )
         _log_candidates(state, candidates)
         _log_node_completed(

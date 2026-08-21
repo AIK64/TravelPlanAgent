@@ -90,7 +90,13 @@ class AMapClient:
                 safe_message="The provider connection failed. Please try again.",
             )
         except httpx.HTTPStatusError as exc:
-            error = self._http_error(operation, exc.response.status_code)
+            error = self._http_error(
+                operation,
+                exc.response.status_code,
+                retry_after_seconds=_parse_retry_after_seconds(
+                    exc.response.headers.get("Retry-After")
+                ),
+            )
         except httpx.RequestError:
             error = ToolProviderError(
                 category=ToolErrorCategory.CONNECTION,
@@ -127,7 +133,11 @@ class AMapClient:
         raise self._invalid_response(operation)
 
     @staticmethod
-    def _http_error(operation: str, status_code: int) -> ToolProviderError:
+    def _http_error(
+        operation: str,
+        status_code: int,
+        retry_after_seconds: float | None = None,
+    ) -> ToolProviderError:
         if status_code == 429:
             return ToolProviderError(
                 category=ToolErrorCategory.RATE_LIMIT,
@@ -135,6 +145,7 @@ class AMapClient:
                 operation=operation,
                 retryable=True,
                 safe_message="The provider rate limit was reached. Please try again.",
+                retry_after_seconds=retry_after_seconds,
             )
         if status_code in {502, 503, 504}:
             return ToolProviderError(
@@ -143,6 +154,7 @@ class AMapClient:
                 operation=operation,
                 retryable=True,
                 safe_message="The provider is temporarily unavailable. Please try again.",
+                retry_after_seconds=retry_after_seconds,
             )
         if status_code == 401:
             return ToolProviderError.authentication(operation)
@@ -349,6 +361,18 @@ def _required_text(payload: dict[str, object], field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"missing {field}")
     return value.strip()
+
+
+def _parse_retry_after_seconds(value: str | None) -> float | None:
+    if value is None or not value.strip():
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
 
 
 def _parse_coordinate(value: str) -> Coordinate:

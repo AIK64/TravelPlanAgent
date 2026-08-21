@@ -119,6 +119,33 @@ async def test_retry_after_delay_overrides_lower_exponential_delay():
 
 
 @pytest.mark.asyncio
+async def test_jittered_retry_delay_is_finally_clamped_to_maximum():
+    """防止 jitter 在首次 clamp 后再次突破公开最大退避上界。"""
+    sleeps: list[float] = []
+    attempts = 0
+
+    async def call():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ToolProviderError.timeout("poi")
+        return "ok"
+
+    policy = RetryPolicy(
+        max_attempts=2,
+        base_delay_seconds=2,
+        max_delay_seconds=2,
+        sleeper=lambda delay: record_sleep(sleeps, delay),
+        jitter=lambda: 1.0,
+    )
+
+    outcome = await policy.execute(call)
+
+    assert outcome.value == "ok"
+    assert sleeps == [2]
+
+
+@pytest.mark.asyncio
 async def test_on_retry_receives_typed_event_before_sleep():
     sleeps: list[float] = []
     events: list[RetryEvent] = []

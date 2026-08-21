@@ -5,7 +5,14 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import AliasChoices, BaseModel, Field, computed_field, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 
 class Pace(StrEnum):
@@ -86,13 +93,18 @@ class TripSpec(BaseModel):
     departure: TransportAnchor
     accommodation: LocationAnchor | None = None
     total_budget: Decimal | None = Field(default=None, gt=0)
-    interests: list[str] = Field(default_factory=list)
-    avoid: list[str] = Field(default_factory=list)
-    must_visit: list[str] = Field(default_factory=list)
+    interests: list[str] = Field(default_factory=list, max_length=100)
+    avoid: list[str] = Field(default_factory=list, max_length=100)
+    must_visit: list[str] = Field(default_factory=list, max_length=100)
     pace: Pace = Pace.BALANCED
     mobility: MobilityConstraints = Field(default_factory=MobilityConstraints)
     daily_start: time = time(9, 0)
     daily_end: time = time(20, 0)
+
+    @field_validator("interests", "avoid", "must_visit")
+    @classmethod
+    def normalize_preference_terms(cls, values: list[str]) -> list[str]:
+        return [value.strip() for value in values if value.strip()]
 
     @model_validator(mode="after")
     def validate_trip_dates(self) -> "TripSpec":

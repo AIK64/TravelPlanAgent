@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import time, timedelta
 from decimal import Decimal
 
 import pytest
@@ -84,12 +84,18 @@ def single_draft(hangzhou_trip, planning_pois) -> CandidateDraft:
     )
 
 
-def _route_results(hangzhou_trip, queries, *, confidence=0.9):
+def _route_results(
+    hangzhou_trip,
+    queries,
+    *,
+    confidence=0.9,
+    provider="fixture",
+):
     return {
         route_key(query): RouteResult(
             distance_meters=4200 + index * 100,
             duration_minutes=18 + index,
-            provider="fixture",
+            provider=provider,
             data_confidence=confidence,
             fetched_at=hangzhou_trip.arrival.at,
         )
@@ -379,7 +385,7 @@ def test_materialization_preserves_assumptions_and_marks_derived_walking_once(
     ]
     assert len(walking_assumptions) == 1
     assert walking_assumptions[0].source is ValueSource.DEFAULT
-    assert "驾车距离" in walking_assumptions[0].reason
+    assert "路线 Provider 标准化距离" in walking_assumptions[0].reason
 
 
 def test_materialization_uses_daily_window_and_tracks_unknown_party_cost(
@@ -418,6 +424,24 @@ def test_materialization_uses_daily_window_and_tracks_unknown_party_cost(
     assert candidate.metrics.unknown_cost_item_count == 1
 
 
+def test_materialization_does_not_schedule_must_visit_outside_daily_window(
+    hangzhou_trip, single_draft, planning_pois
+):
+    """防止必去地点绕过每日结束时间或 Provider 营业结束时间。"""
+    trip = hangzhou_trip.model_copy(update={"daily_end": time(12, 0)})
+    queries = collect_route_queries(trip, [single_draft], planning_pois)
+
+    candidate = materialize_candidates(
+        trip,
+        [single_draft],
+        planning_pois,
+        _route_results(trip, queries),
+    )[0]
+
+    assert candidate.days[0].items == []
+    assert candidate.metrics.total_travel_minutes == 0
+
+
 def test_route_confidence_changes_candidate_confidence_and_score(
     hangzhou_trip, single_draft, planning_pois
 ):
@@ -440,6 +464,59 @@ def test_route_confidence_changes_candidate_confidence_and_score(
     assert high.metrics.data_confidence == 0.9
     assert low.metrics.data_confidence == 0.5
     assert high.score > low.score
+
+
+def test_mock_route_provenance_is_explicitly_a_local_estimate(
+    hangzhou_trip, single_draft, planning_pois
+):
+    """防止默认 Mock 的本地估算在候选解释中被表述成真实路线事实。"""
+    queries = collect_route_queries(hangzhou_trip, [single_draft], planning_pois)
+    candidate = materialize_candidates(
+        hangzhou_trip,
+        [single_draft],
+        planning_pois,
+        _route_results(
+            hangzhou_trip,
+            queries,
+            confidence=0.65,
+            provider="mock",
+        ),
+    )[0]
+    public_text = "\n".join(
+        [
+            *candidate.reason_facts,
+            *(assumption.reason for assumption in candidate.assumptions),
+        ]
+    )
+
+    assert "路线来源 mock（本地估算）" in public_text
+    assert "路线置信度 65%" in public_text
+    assert "真实驾车路线" not in public_text
+    assert "真实驾车距离" not in public_text
+
+
+def test_amap_route_provenance_is_provider_normalized_without_overclaiming(
+    hangzhou_trip, single_draft, planning_pois
+):
+    """防止真实 Provider 标准化结果被描述为超出适配器证据强度的事实。"""
+    queries = collect_route_queries(hangzhou_trip, [single_draft], planning_pois)
+    candidate = materialize_candidates(
+        hangzhou_trip,
+        [single_draft],
+        planning_pois,
+        _route_results(
+            hangzhou_trip,
+            queries,
+            confidence=0.95,
+            provider="amap",
+        ),
+    )[0]
+    public_text = "\n".join(candidate.reason_facts)
+
+    assert "路线来源 amap（Provider 标准化结果）" in public_text
+    assert "路线置信度 95%" in public_text
+    assert "本地估算" not in public_text
+    assert "真实驾车路线" not in public_text
 
 
 def test_default_assumption_increases_warning_risk(

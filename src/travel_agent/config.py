@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from travel_agent.domain.tool_models import ProviderMode, UnknownFactPolicy
+from travel_agent.planning.policy import PlanningPolicy
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +22,7 @@ class Settings:
     route_cache_ttl_seconds: int = 300
     poi_query_limit: int = 10
     poi_candidate_limit: int = 12
+    poi_max_queries: int = 12
     unknown_fact_policy: UnknownFactPolicy = UnknownFactPolicy.ASSUME_WITH_WARNING
     amap_driving_strategy: int = 32
 
@@ -44,6 +46,7 @@ class Settings:
             route_cache_ttl_seconds=int(source.get("ROUTE_CACHE_TTL_SECONDS", "300")),
             poi_query_limit=int(source.get("POI_QUERY_LIMIT", "10")),
             poi_candidate_limit=int(source.get("POI_CANDIDATE_LIMIT", "12")),
+            poi_max_queries=int(source.get("POI_MAX_QUERIES", "12")),
             unknown_fact_policy=UnknownFactPolicy(
                 source.get("UNKNOWN_FACT_POLICY", "assume_with_warning").strip().lower()
             ),
@@ -69,3 +72,9 @@ class Settings:
             raise ValueError("POI_CACHE_TTL_SECONDS must be positive")
         if self.route_cache_ttl_seconds <= 0:
             raise ValueError("ROUTE_CACHE_TTL_SECONDS must be positive")
+        PlanningPolicy(
+            poi_query_limit=self.poi_query_limit,
+            poi_candidate_limit=self.poi_candidate_limit,
+            route_strategy=self.amap_driving_strategy,
+            poi_max_queries=self.poi_max_queries,
+        )

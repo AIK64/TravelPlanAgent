@@ -4,8 +4,14 @@ from travel_agent.domain.models import TripSpec
 from travel_agent.domain.tool_models import POISearchQuery
 
 
-def build_search_plan(trip: TripSpec, per_query_limit: int = 10) -> list[POISearchQuery]:
+def build_search_plan(
+    trip: TripSpec,
+    per_query_limit: int = 10,
+    max_queries: int = 12,
+) -> list[POISearchQuery]:
     """按必去地点、兴趣和兜底景点的顺序构造去重检索计划。"""
+    if not 1 <= max_queries <= 100:
+        raise ValueError("max_queries must be between 1 and 100")
     seen: set[str] = set()
     queries: list[POISearchQuery] = []
     candidates = [
@@ -27,6 +33,8 @@ def build_search_plan(trip: TripSpec, per_query_limit: int = 10) -> list[POISear
                 priority=priority,
             )
         )
+        if len(queries) == max_queries:
+            break
 
     if not queries:
         queries.append(

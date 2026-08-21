@@ -131,6 +131,7 @@ def validate_candidate(
 
     arrival_buffer = trip.arrival.at + timedelta(minutes=60)
     departure_buffer = trip.departure.at - timedelta(minutes=90)
+    trip_timezone = trip.arrival.at.tzinfo
 
     for day in candidate.days:
         ordered = sorted(day.items, key=lambda item: item.start_at)
@@ -148,6 +149,31 @@ def validate_candidate(
                     )
                 )
             previous = item
+
+            if item.type is ItemType.ACTIVITY:
+                daily_start = datetime.combine(
+                    day.date,
+                    trip.daily_start,
+                    tzinfo=trip_timezone,
+                )
+                daily_end = datetime.combine(
+                    day.date,
+                    trip.daily_end,
+                    tzinfo=trip_timezone,
+                )
+                start_at = item.start_at.astimezone(trip_timezone)
+                end_at = item.end_at.astimezone(trip_timezone)
+                if start_at < daily_start or end_at > daily_end:
+                    violations.append(
+                        Violation(
+                            type="outside_daily_window",
+                            severity=ViolationSeverity.ERROR,
+                            day=day.date,
+                            entity_ids=[item.poi_id] if item.poi_id else [],
+                            message=f"{item.name} 的访问时间不在每日时间窗内",
+                            repair_hint="调整访问时间或移动到其他日期",
+                        )
+                    )
 
             if day.date == trip.arrival.at.date() and item.start_at < arrival_buffer:
                 violations.append(

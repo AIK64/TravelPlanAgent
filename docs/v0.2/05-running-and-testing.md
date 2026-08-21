@@ -29,7 +29,16 @@ $null = $body | ConvertFrom-Json
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/plans -ContentType "application/json; charset=utf-8" -Body $body
 ```
 
-服务终端应依次出现 `search_plan.created`、POI `tool.started`、路线 `tool.started`、`candidate.validated`、`routing.decision` 和 `plan.selected`；响应中的 `metrics.total_travel_minutes` 来自 `RouteResult`，而 `assumptions` 会显式说明数据假设。
+服务终端应依次出现 `search_plan.created`、POI `tool.started`、路线 `tool.started`、`candidate.validated`、`routing.decision` 和 `plan.selected`；响应中的 `metrics.total_travel_minutes` 来自 `RouteResult`，`reason_facts` 会显示路线 provider、路线置信度和 Mock 本地估算/Provider 标准化结果，`assumptions` 则显式说明数据假设。
+
+与 Graph 行为直接相关的公开设置如下；非法值会在启动期失败，而不是运行后静默忽略：
+
+| 环境变量 | 默认值 | 有效范围 / 作用 |
+|---|---:|---|
+| `POI_QUERY_LIMIT` | 10 | 1–25；每条 POI query 的返回上限 |
+| `POI_CANDIDATE_LIMIT` | 12 | 1–100；按优先级合并后的候选事实上限 |
+| `POI_MAX_QUERIES` | 12 | 1–100；单请求 POI query/coroutine/首次 Provider 调用总预算 |
+| `AMAP_DRIVING_STRATEGY` | 32 | 非负整数；路线收集与物化共用的 strategy |
 
 ## AMap 显式模式与安全
 

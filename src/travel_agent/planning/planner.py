@@ -48,6 +48,7 @@ def _route_query(
     destination: Coordinate,
     origin_poi_id: str | None,
     destination_poi_id: str,
+    route_strategy: int,
 ) -> RouteQuery:
     return RouteQuery(
         origin=origin,
@@ -55,7 +56,7 @@ def _route_query(
         origin_poi_id=origin_poi_id,
         destination_poi_id=destination_poi_id,
         mode=RouteMode.DRIVING,
-        strategy=32,
+        strategy=route_strategy,
     )
 
 
@@ -68,11 +69,33 @@ def _append_unique_assumptions(
             target.append(assumption)
 
 
+def _route_provenance_fact(
+    routes: list[RouteResult],
+    total_travel_minutes: int,
+) -> str:
+    if not routes:
+        return f"路线来源 无（未调用路线工具），交通 {total_travel_minutes} 分钟"
+    providers = sorted({route.provider for route in routes})
+    provider_text = "/".join(providers)
+    if providers == ["mock"]:
+        result_kind = "本地估算"
+    elif "mock" in providers:
+        result_kind = "含 mock 本地估算的 Provider 标准化结果"
+    else:
+        result_kind = "Provider 标准化结果"
+    confidence = mean(route.data_confidence for route in routes)
+    return (
+        f"路线来源 {provider_text}（{result_kind}），"
+        f"路线置信度 {confidence:.0%}，交通 {total_travel_minutes} 分钟"
+    )
+
+
 def _materialize_day(
     trip: TripSpec,
     draft_day: DraftDay,
     poi_by_id: dict[str, PlanningPOI],
     routes: dict[str, RouteResult],
+    route_strategy: int,
 ) -> tuple[DayPlan, list[PlanningPOI], list[RouteResult]]:
     current_date = draft_day.date
     timezone = trip.arrival.at.tzinfo
@@ -97,8 +120,6 @@ def _materialize_day(
     unknown_cost_count = 0
     travel_minutes_total = 0
     walking_total = 0
-    must_visit = {_normalize(name) for name in trip.must_visit}
-
     for poi_id in draft_day.poi_ids:
         poi = poi_by_id.get(poi_id)
         if poi is None:
@@ -108,6 +129,7 @@ def _materialize_day(
             poi.facts.coordinate,
             current_poi_id,
             poi_id,
+            route_strategy,
         )
         key = route_key(query)
         route = routes.get(key)
@@ -124,12 +146,7 @@ def _materialize_day(
         )
         start_at = max(arrival_time, opening)
         end_at = start_at + timedelta(minutes=poi.duration_minutes)
-        normalized_name = _normalize(poi.facts.name)
-        required = any(
-            value in normalized_name or normalized_name in value
-            for value in must_visit
-        )
-        if (end_at > day_end or end_at > closing) and not required:
+        if end_at > day_end or end_at > closing:
             break
 
         walking_meters = min(round(route.distance_meters * 0.12), 2_000)
@@ -198,6 +215,7 @@ def _materialize_candidate(
     draft: CandidateDraft,
     poi_by_id: dict[str, PlanningPOI],
     routes: dict[str, RouteResult],
+    route_strategy: int,
 ) -> PlanCandidate:
     days: list[DayPlan] = []
     scheduled_pois: list[PlanningPOI] = []
@@ -206,7 +224,7 @@ def _materialize_candidate(
     walking_dates: list[date] = []
     for draft_day in draft.days:
         day, day_pois, day_routes = _materialize_day(
-            trip, draft_day, poi_by_id, routes
+            trip, draft_day, poi_by_id, routes, route_strategy
         )
         days.append(day)
         scheduled_pois.extend(day_pois)
@@ -223,7 +241,10 @@ def _materialize_candidate(
                 PlanningAssumption(
                     field="walking_distance",
                     value="min(round(driving_distance_meters * 0.12), 2000)",
-                    reason="基于真实驾车距离派生接驳步行估算，非步行路线事实",
+                    reason=(
+                        "基于路线 Provider 标准化距离派生接驳步行估算，"
+                        "非步行路线事实"
+                    ),
                     source=ValueSource.DEFAULT,
                     affected_dates=walking_dates,
                     created_at=min(route.fetched_at for route in used_routes),
@@ -302,7 +323,7 @@ def _materialize_candidate(
         score=round(score, 4),
         reason_facts=[
             f"兴趣匹配度 {metrics.preference_match:.0%}",
-            f"真实驾车路线交通 {metrics.total_travel_minutes} 分钟",
+            _route_provenance_fact(used_routes, metrics.total_travel_minutes),
             f"已知预计费用 {metrics.known_estimated_cost} 元",
             f"未知费用活动 {metrics.unknown_cost_item_count} 个",
             f"数据置信度 {metrics.data_confidence:.0%}",
@@ -316,15 +337,27 @@ def materialize_candidates(
     drafts: list[CandidateDraft],
     pois: list[PlanningPOI],
     routes: dict[str, RouteResult],
+    route_strategy: int = 32,
 ) -> list[PlanCandidate]:
     """Phase 2：只消费标准化 RouteResult 物化日程与指标。"""
     poi_by_id = {poi.facts.id: poi for poi in pois}
-    for query in collect_route_queries(trip, drafts, pois):
+    for query in collect_route_queries(
+        trip,
+        drafts,
+        pois,
+        route_strategy=route_strategy,
+    ):
         key = route_key(query)
         if key not in routes:
             raise MissingRouteResult(key)
     return [
-        _materialize_candidate(trip, draft, poi_by_id, routes)
+        _materialize_candidate(
+            trip,
+            draft,
+            poi_by_id,
+            routes,
+            route_strategy,
+        )
         for draft in drafts
     ]
 

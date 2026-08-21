@@ -34,3 +34,25 @@ def test_duplicate_or_blank_terms_do_not_create_duplicate_queries(hangzhou_trip)
         ("灵隐寺", True, 100, 7),
         ("美食", False, 50, 7),
     ]
+
+
+def test_search_plan_caps_queries_after_stable_must_visit_first_deduplication(
+    hangzhou_trip,
+):
+    """防止大量偏好越过总 Tool Use 预算，并保证必去地点先占预算。"""
+    trip = hangzhou_trip.model_copy(
+        update={
+            "must_visit": [" 必去甲 ", "必去乙", "必去甲", "必去丙"],
+            "interests": ["兴趣甲", "兴趣乙", "兴趣丙"],
+        }
+    )
+
+    queries = build_search_plan(
+        trip,
+        per_query_limit=1,
+        max_queries=2,
+    )
+
+    assert [query.keyword for query in queries] == ["必去甲", "必去乙"]
+    assert all(query.exact_match for query in queries)
+    assert all(query.limit == 1 for query in queries)

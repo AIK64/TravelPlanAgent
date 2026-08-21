@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import time
 from decimal import Decimal
 import logging
 
@@ -70,6 +71,23 @@ def test_create_plan(client, hangzhou_trip):
     body = response.json()
     assert body["status"] == "completed"
     assert body["selected_plan"]["validation"]["valid"] is True
+
+
+def test_mock_api_exposes_route_provider_confidence_and_estimate_kind(
+    client, hangzhou_trip
+):
+    """防止 API 丢失 Mock 路线 provenance，让调用方误认为是真实驾车路线。"""
+    response = client.post(
+        "/api/v1/plans",
+        json={"trip": hangzhou_trip.model_dump(mode="json")},
+    )
+
+    assert response.status_code == 200
+    facts = response.json()["selected_plan"]["reason_facts"]
+    public_text = "\n".join(facts)
+    assert "路线来源 mock（本地估算）" in public_text
+    assert "路线置信度 65%" in public_text
+    assert "真实驾车路线" not in public_text
 
 
 def test_json_response_declares_utf8_for_legacy_windows_clients(
@@ -217,6 +235,25 @@ def test_business_infeasible_still_returns_200(client, hangzhou_trip):
 
     assert response.status_code == 200
     assert response.json()["status"] == "infeasible"
+
+
+def test_daily_window_infeasible_api_response_never_selects_plan(
+    client, hangzhou_trip
+):
+    """防止 HTTP 边界把违反每日时间窗的候选返回为 completed。"""
+    constrained = hangzhou_trip.model_copy(update={"daily_end": time(12, 0)})
+
+    response = client.post(
+        "/api/v1/plans",
+        json={
+            "trip": constrained.model_dump(mode="json"),
+            "max_replan_rounds": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "infeasible"
+    assert response.json()["selected_plan"] is None
 
 
 def test_invalid_request_keeps_fastapi_4xx_semantics(client):

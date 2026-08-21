@@ -10,6 +10,7 @@ from travel_agent.domain.models import PlanningRequest, PlanningResponse
 from travel_agent.domain.tool_models import ProviderMode
 from travel_agent.graph.workflow import build_workflow, run_planning
 from travel_agent.planning.defaults import POIDefaultPolicy
+from travel_agent.planning.policy import PlanningPolicy
 from travel_agent.tools.gateway import ToolGateway, build_gateway
 from travel_agent.tools.protocols import POIProvider, RouteProvider
 from travel_agent.tools.providers.amap import (
@@ -51,11 +52,17 @@ class PlanningRuntime:
 
             gateway = build_gateway(settings, poi_provider, route_provider)
             defaults = POIDefaultPolicy(settings.unknown_fact_policy)
+            policy = PlanningPolicy(
+                poi_query_limit=settings.poi_query_limit,
+                poi_candidate_limit=settings.poi_candidate_limit,
+                route_strategy=settings.amap_driving_strategy,
+                poi_max_queries=settings.poi_max_queries,
+            )
             return cls(
                 poi_provider=poi_provider,
                 route_provider=route_provider,
                 gateway=gateway,
-                workflow=build_workflow(gateway, defaults),
+                workflow=build_workflow(gateway, defaults, policy),
                 client=client,
             )
         except BaseException:

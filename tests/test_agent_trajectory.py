@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from decimal import Decimal
 
 import pytest
@@ -606,6 +606,43 @@ async def test_validation_feedback_drives_one_bounded_replan(
 
 
 @pytest.mark.asyncio
+async def test_daily_window_violation_replans_then_stops_without_selecting(
+    hangzhou_trip,
+    workflow_harness,
+    caplog,
+):
+    """防止越界必去地点绕过 Validator 并直接进入 select_best。"""
+    caplog.set_level(logging.INFO)
+    thread_id = "trajectory-daily-window"
+    constrained = hangzhou_trip.model_copy(update={"daily_end": time(12, 0)})
+
+    response = await run_planning(
+        workflow_harness.workflow,
+        PlanningRequest(trip=constrained, max_replan_rounds=1),
+        thread_id=thread_id,
+    )
+
+    decisions = [
+        record.getMessage().split("next=", 1)[1].split(maxsplit=1)[0]
+        for record in caplog.records
+        if record.getMessage().startswith("routing.decision")
+        and f"thread_id={thread_id}" in record.getMessage()
+    ]
+    events = _event_names(caplog.records, thread_id)
+    assert response.status == "infeasible"
+    assert response.selected_plan is None
+    assert response.iterations == 1
+    assert decisions == ["replan", "mark_infeasible"]
+    assert "plan.selected" not in events
+    assert all(
+        "missing_must_visit"
+        in {violation.type for violation in candidate.validation.violations}
+        for candidate in response.candidates
+        if candidate.validation is not None
+    )
+
+
+@pytest.mark.asyncio
 async def test_poi_context_merges_by_priority_deduplicates_and_caps_at_twelve(
     hangzhou_trip,
     gateway_factory,
@@ -638,6 +675,81 @@ async def test_poi_context_merges_by_priority_deduplicates_and_caps_at_twelve(
     ]
     assert len(snapshot.values["planning_pois"]) == 12
     assert [query.priority for query in poi_provider.calls] == [100, 50]
+
+
+@pytest.mark.asyncio
+async def test_runtime_planning_policy_reaches_checkpoint_and_provider_calls(
+    hangzhou_trip,
+    monkeypatch,
+):
+    """防止非默认公开设置在 Runtime 装配后被 Graph 的硬编码静默覆盖。"""
+    poi_provider = MockPOIProvider()
+    route_provider = MockRouteProvider()
+    poi_calls: list[POISearchQuery] = []
+    route_calls: list[RouteQuery] = []
+    original_search = poi_provider.search_pois
+    original_route = route_provider.get_driving_route
+
+    async def record_search(query: POISearchQuery) -> list[POIFacts]:
+        poi_calls.append(query)
+        return await original_search(query)
+
+    async def record_route(query: RouteQuery) -> RouteResult:
+        route_calls.append(query)
+        return await original_route(query)
+
+    monkeypatch.setattr(poi_provider, "search_pois", record_search)
+    monkeypatch.setattr(route_provider, "get_driving_route", record_route)
+    monkeypatch.setattr(
+        "travel_agent.runtime.MockPOIProvider",
+        lambda: poi_provider,
+    )
+    monkeypatch.setattr(
+        "travel_agent.runtime.MockRouteProvider",
+        lambda: route_provider,
+    )
+    settings = Settings.from_env(
+        {
+            "POI_QUERY_LIMIT": "1",
+            "POI_CANDIDATE_LIMIT": "1",
+            "POI_MAX_QUERIES": "2",
+            "AMAP_DRIVING_STRATEGY": "7",
+        }
+    )
+    runtime = await PlanningRuntime.create(settings)
+    thread_id = "runtime-planning-policy"
+    trip = hangzhou_trip.model_copy(
+        update={
+            "must_visit": ["灵隐寺", "西湖"],
+            "interests": ["自然", "美食", "人文"],
+        }
+    )
+
+    try:
+        await runtime.plan(
+            PlanningRequest(trip=trip, max_replan_rounds=0),
+            thread_id=thread_id,
+        )
+        snapshot = await runtime.workflow.aget_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+    finally:
+        await runtime.close()
+
+    state = snapshot.values
+    assert [query.keyword for query in state["search_queries"]] == [
+        "灵隐寺",
+        "西湖",
+    ]
+    assert all(query.limit == 1 for query in state["search_queries"])
+    assert len(state["poi_facts"]) == 1
+    assert len(poi_calls) == 2
+    assert [query.keyword for query in poi_calls] == ["灵隐寺", "西湖"]
+    assert route_calls
+    assert all(query.strategy == 7 for query in state["route_queries"])
+    assert all(query.strategy == 7 for query in route_calls)
+    assert not hasattr(runtime, "settings")
+    assert not hasattr(runtime, "planning_policy")
 
 
 @pytest.mark.asyncio

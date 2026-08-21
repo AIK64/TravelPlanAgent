@@ -6,7 +6,7 @@ v0.2 的主题不是“接了一个地图 HTTP API”，而是让 Agent 的外�
 
 已实现：杭州离线 Mock 与显式 AMap 两种 Provider 模式；`POIProvider`/`RouteProvider` Protocol；异步 Gateway 的缓存、并发限制和有界重试；标准化的 `POIFacts`、`RouteResult`、provenance；包含 Tool 节点的 LangGraph；`InMemorySaver` Checkpoint；轨迹、契约和 API 测试。
 
-尚未实现：自然语言 LLM Parser、OTA 交易/下单、真实步行路线、天气、持久化 Checkpointer、Human-in-the-loop、长期记忆和生产级评测平台。路线工具当前只请求驾车路线；计划中的步行距离是由驾车距离派生的估算，并会以 warning 告知。
+尚未实现：自然语言 LLM Parser、OTA 交易/下单、真实步行路线、天气、持久化 Checkpointer、Human-in-the-loop、长期记忆和生产级评测平台。路线工具当前只请求驾车路线；默认 Mock 的路线是本地估算，AMap 路线是 Provider 标准化结果。最终候选会在 `reason_facts` 中给出 route provider、路线置信度和结果类型；计划中的步行距离仍由驾车距离派生，并会以 warning 告知。
 
 ## 推荐顺序
 

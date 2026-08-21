@@ -188,8 +188,9 @@ def collect_route_queries(
     trip: TripSpec,
     drafts: list[CandidateDraft],
     pois: list[PlanningPOI],
+    route_strategy: int = 32,
 ) -> list[RouteQuery]:
-    """收集首见优先、方向敏感的真实驾车路线查询。"""
+    """收集首见优先、方向敏感的 Provider 驾车路线查询。"""
     poi_by_id = {poi.facts.id: poi for poi in pois}
     anchor = (
         trip.accommodation.coordinate
@@ -212,7 +213,7 @@ def collect_route_queries(
                     origin_poi_id=previous_poi_id,
                     destination_poi_id=poi_id,
                     mode=RouteMode.DRIVING,
-                    strategy=32,
+                    strategy=route_strategy,
                 )
                 key = route_key(query)
                 if key not in seen_keys:

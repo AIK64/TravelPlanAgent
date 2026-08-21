@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from decimal import Decimal
 import os
 from pathlib import Path
@@ -197,6 +197,52 @@ def test_known_cost_over_budget_is_invalid(hangzhou_trip):
     assert result.status is ValidationStatus.INVALID
     assert [(item.type, item.severity) for item in result.violations] == [
         ("budget_exceeded", ViolationSeverity.ERROR)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("daily_start", "daily_end", "start_delta", "end_delta"),
+    [
+        (time(12, 30), time(20, 0), 90, 150),
+        (time(9, 0), time(12, 30), 90, 150),
+    ],
+)
+def test_activity_outside_daily_window_is_a_hard_error(
+    hangzhou_trip,
+    daily_start,
+    daily_end,
+    start_delta,
+    end_delta,
+):
+    """防止活动越过用户每日时间窗后仍被条件边视为可交付候选。"""
+    trip = hangzhou_trip.model_copy(
+        update={"daily_start": daily_start, "daily_end": daily_end}
+    )
+    candidate = _candidate_with_activity(
+        trip,
+        estimated_cost=Decimal("100"),
+    )
+    start_at = trip.arrival.at + timedelta(minutes=start_delta)
+    candidate.days[0].items[0] = candidate.days[0].items[0].model_copy(
+        update={
+            "start_at": start_at,
+            "end_at": trip.arrival.at + timedelta(minutes=end_delta),
+        }
+    )
+
+    result = validate_candidate(trip, candidate, pois=[])
+
+    assert result.status is ValidationStatus.INVALID
+    assert [
+        (item.type, item.severity, item.day)
+        for item in result.violations
+        if item.type == "outside_daily_window"
+    ] == [
+        (
+            "outside_daily_window",
+            ViolationSeverity.ERROR,
+            trip.start_date,
+        )
     ]
 
 

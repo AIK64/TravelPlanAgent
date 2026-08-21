@@ -81,7 +81,7 @@ class MockPOIProvider:
 
 
 class MockRouteProvider:
-    """将确定性路线估算器适配为路线事实。"""
+    """将确定性路线估算器适配为显式低置信度的本地估算结果。"""
 
     name = "mock"
 

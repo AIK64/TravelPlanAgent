@@ -2,7 +2,7 @@
 
 ## 60 秒讲清 v0.2
 
-“我把旅行规划的地图事实获取做成显式 LangGraph Tool Use。Graph 先由确定性代码形成检索意图，异步 Gateway 在限流、缓存和有界重试下调用唯一选中的 Provider，把带来源信息的 POI/路线事实写回 typed State；候选经确定性 Validator 后由条件边选择方案、重规划或无解。工具不可用走 503，而非伪装成无解。`thread_id` 串起 API、日志和 Checkpoint，轨迹测试验证中间事件。”
+“我把旅行规划的地图事实获取做成显式 LangGraph Tool Use。Graph 先由确定性代码在总查询预算内形成 must-visit 优先的检索意图，异步 Gateway 在限流、缓存和有界重试下调用唯一选中的 Provider，把带来源信息的 POI/路线结果写回 typed State；候选经包含每日时间窗的确定性 Validator 后，由条件边选择方案、重规划或无解。Mock 路线明确是本地估算，工具不可用走 503，而非伪装成无解。`thread_id` 串起 API、日志和 Checkpoint，轨迹测试验证中间事件。”
 
 ## 建议练习
 
@@ -11,6 +11,7 @@
 3. 用 10 元预算请求观察 `pending_replan_round`、`iterations` 和 `replan.completed`；将最大轮数设为 5，确认业务边界先于 recursion guard。
 4. 为缓存命中编写断言：Provider 调用次数不增加，但 `ToolExecutionSummary.cache_hit` 改为 true。
 5. 运行 AMap fixture 契约测试，故意破坏一项外部字段，验证原始响应不会穿透到 State。
+6. 把 `POI_MAX_QUERIES` 设为 2，并提交更多 must-visit/interests；从 `search_plan.created`、Checkpoint 和 Provider spy 核对必去优先及总调用上界。
 
 ## 下一项 Agent 能力
 

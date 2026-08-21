@@ -8,7 +8,7 @@
 |---|---|---|---|
 | `thread_id` | API 生成或调用方传入 | 初始值不再改写 | Gateway、日志和 Checkpoint 全程关联 |
 | `trip` | `request.trip` | 初始值不再改写 | 检索、默认补全、草案、路线、物化与 Validator 读取 |
-| `search_queries` | `[]` | `build_search_plan` | `load_pois` 调用 POI 工具；本轮结束保留于 Checkpoint |
+| `search_queries` | `[]` | `build_search_plan` | must-visit 优先并按 `POI_MAX_QUERIES` 裁剪；`load_pois` 调用 POI 工具；本轮结束保留于 Checkpoint |
 | `poi_facts` | `[]` | `load_pois` | `resolve_poi_facts` 读取；保存标准化 `POIFacts` |
 | `planning_pois` | `[]` | `resolve_poi_facts` | 草案、路线收集、物化、校验读取；跨 replan 保留 |
 | `poi_resolution_issues` | `[]` | `resolve_poi_facts` | 诊断事实缺失；跨 replan 保留于 Checkpoint |
@@ -32,6 +32,8 @@
 
 业务预算来自请求的 `max_replan_rounds`，模型限制最大 **5** 轮；`iterations < max_replan_rounds` 才能回环。LangGraph 还以 `recursion_limit=35` 作为独立防护。前者是可解释业务终止条件，后者防止实现错误造成无限图执行。
 
+另一项独立预算是 `PlanningPolicy.poi_max_queries`：它只限制单次请求初始 POI Tool Use 的 query/coroutine/provider-call 数，不与 Provider 内部重试次数混用。`search_plan.created query_count=...` 与 Checkpoint 的 `search_queries` 可以直接观察实际消耗。路线 strategy 同样由该 policy 同时注入 query 收集与候选物化，确保两侧 `route_key` 一致。
+
 ## 两条真实事件轨迹
 
 成功路径（事件前缀）：
@@ -51,5 +53,7 @@ candidate.validated → routing.decision next=replan → replan.round_started
 → candidate.generated → candidate.validated → replan.completed
 → routing.decision next=mark_infeasible → planning.infeasible → planning.completed
 ```
+
+每日时间窗无法容纳必去地点时也走同一业务闭环：Planner 保持该地点未安排，Validator 报告 `missing_must_visit`，条件边先 Replan，仍无解时 `mark_infeasible`；不会进入 `select_best`。
 
 `test_validation_feedback_drives_one_bounded_replan` 断言该顺序；`test_maximum_business_replan_budget_stops_before_recursion_guard` 断言 5 次 replan 后停止。`thread_id` 同时关联 API、工具事件、State 和 `InMemorySaver` Checkpoint；它不是用户身份，也不能携带密钥。

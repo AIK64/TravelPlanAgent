@@ -12,7 +12,10 @@ def test_settings_default_to_mock():
 
     assert settings.provider is ProviderMode.MOCK
     assert settings.tool_max_attempts == 3
+    assert settings.poi_query_limit == 10
     assert settings.poi_candidate_limit == 12
+    assert settings.poi_max_queries == 12
+    assert settings.amap_driving_strategy == 32
 
 
 def test_amap_requires_key():
@@ -40,6 +43,25 @@ def test_settings_repr_does_not_expose_amap_api_key():
     assert "test-key" not in repr(settings)
 
 
+def test_settings_parse_non_default_planning_policy():
+    """防止公开规划设置只存在于环境变量示例而未进入配置对象。"""
+    settings = Settings.from_env(
+        {
+            "POI_QUERY_LIMIT": "1",
+            "POI_CANDIDATE_LIMIT": "1",
+            "POI_MAX_QUERIES": "2",
+            "AMAP_DRIVING_STRATEGY": "7",
+        }
+    )
+
+    assert (
+        settings.poi_query_limit,
+        settings.poi_candidate_limit,
+        settings.poi_max_queries,
+        settings.amap_driving_strategy,
+    ) == (1, 1, 2, 7)
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [
@@ -50,6 +72,13 @@ def test_settings_repr_does_not_expose_amap_api_key():
         ("TOOL_MAX_CONCURRENCY", "0"),
         ("POI_CACHE_TTL_SECONDS", "0"),
         ("ROUTE_CACHE_TTL_SECONDS", "0"),
+        ("POI_QUERY_LIMIT", "0"),
+        ("POI_QUERY_LIMIT", "26"),
+        ("POI_CANDIDATE_LIMIT", "0"),
+        ("POI_CANDIDATE_LIMIT", "101"),
+        ("POI_MAX_QUERIES", "0"),
+        ("POI_MAX_QUERIES", "101"),
+        ("AMAP_DRIVING_STRATEGY", "-1"),
     ],
 )
 def test_settings_reject_invalid_execution_budget(name: str, value: str):

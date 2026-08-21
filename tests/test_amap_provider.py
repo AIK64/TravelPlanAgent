@@ -59,12 +59,13 @@ def amap_poi_provider(
     payload: dict[str, object],
     *,
     status_code: int = 200,
+    headers: dict[str, str] | None = None,
 ) -> tuple[AMapPOIProvider, list[httpx.Request]]:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(status_code, json=payload)
+        return httpx.Response(status_code, json=payload, headers=headers)
 
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(handler),
@@ -284,6 +285,60 @@ async def test_amap_provider_maps_http_503_without_leaking_key(load_fixture):
     assert raised.value.category is ToolErrorCategory.UPSTREAM_UNAVAILABLE
     assert raised.value.retryable is True
     assert SECRET_KEY not in str(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "retry_after", "expected_category"),
+    [
+        (429, "1.5", ToolErrorCategory.RATE_LIMIT),
+        (503, "2", ToolErrorCategory.UPSTREAM_UNAVAILABLE),
+    ],
+)
+async def test_amap_retryable_http_error_carries_safe_retry_after_seconds(
+    load_fixture,
+    status_code,
+    retry_after,
+    expected_category,
+):
+    """防止适配器丢失供应商恢复窗口，导致 Gateway 过早重试。"""
+    provider, _ = amap_poi_provider(
+        load_fixture("server_busy.json"),
+        status_code=status_code,
+        headers={"Retry-After": retry_after},
+    )
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.search_pois(QUERY)
+
+    assert raised.value.category is expected_category
+    assert raised.value.retry_after_seconds == float(retry_after)
+    assert_public_error_has_no_sensitive_chain(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "retry_after",
+    ["", "-1", "NaN", "Infinity", "RAW_RETRY_HEADER"],
+)
+async def test_amap_ignores_malformed_retry_after_without_leaking_it(
+    load_fixture,
+    retry_after,
+):
+    """防止畸形 header 进入等待计算、日志或带请求 URL 的异常链。"""
+    provider, _ = amap_poi_provider(
+        load_fixture("server_busy.json"),
+        status_code=503,
+        headers={"Retry-After": retry_after},
+    )
+
+    with pytest.raises(ToolProviderError) as raised:
+        await provider.search_pois(QUERY)
+
+    assert raised.value.retry_after_seconds is None
+    if retry_after:
+        assert retry_after not in str(raised.value)
+    assert_public_error_has_no_sensitive_chain(raised.value)
 
 
 @pytest.mark.asyncio
