@@ -80,6 +80,14 @@ class AlwaysTimeoutPOIProvider(FakePOIProvider):
         raise ToolProviderError.timeout("poi")
 
 
+class TimeoutThenSuccessPOIProvider(FakePOIProvider):
+    async def search_pois(self, query: POISearchQuery) -> list[POIFacts]:
+        self.calls += 1
+        if self.calls == 1:
+            raise ToolProviderError.timeout("poi.search")
+        return poi_facts()
+
+
 class CoordinatedTimeoutPOIProvider(AlwaysTimeoutPOIProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -335,6 +343,46 @@ async def test_gateway_emits_safe_lifecycle_logs(caplog):
         assert any(all(field in message for field in fields) for message in event_messages), event
     assert all("thread_id=gateway-test" in message for message in messages)
     assert all("keyword" not in message and "museum" not in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_gateway_logs_retry_then_completion_and_second_call_cache_hit(caplog):
+    """错误日志顺序或缓存字段会让一次恢复性 Tool Use 无法从轨迹中还原。"""
+    provider = TimeoutThenSuccessPOIProvider()
+    gateway = make_gateway(poi_provider=provider)
+    thread_id = "retry-cache-observability"
+    context = ToolCallContext(thread_id=thread_id)
+    caplog.set_level("INFO", logger="travel_agent.tools.gateway")
+
+    first = (await gateway.search_pois([QUERY], context))[0]
+    second = (await gateway.search_pois([QUERY], context))[0]
+
+    assert provider.calls == 2
+    assert first.status is ToolStatus.SUCCESS
+    assert first.attempt_count == 2
+    assert first.cache_hit is False
+    assert second.status is ToolStatus.SUCCESS
+    assert second.attempt_count == 0
+    assert second.cache_hit is True
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if f"thread_id={thread_id}" in record.getMessage()
+    ]
+    assert [message.split(maxsplit=1)[0] for message in messages] == [
+        "tool.started",
+        "tool.retry_scheduled",
+        "tool.completed",
+        "tool.started",
+        "tool.cache_hit",
+    ]
+    assert "attempt=1" in messages[0]
+    assert "attempt=1" in messages[1]
+    assert "next_attempt=2" in messages[1]
+    assert "attempt_count=2" in messages[2]
+    assert "cache_hit=false" in messages[2]
+    assert "cache_hit=true" in messages[4]
 
 
 @pytest.mark.asyncio

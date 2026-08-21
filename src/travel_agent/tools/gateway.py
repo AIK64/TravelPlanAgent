@@ -28,11 +28,23 @@ from travel_agent.tools.retry import RetryEvent, RetryPolicy
 
 
 T = TypeVar("T")
+SafeLogScalar = str | int | float | bool | None
 logger = logging.getLogger("travel_agent.tools.gateway")
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _log_event(event: str, **fields: SafeLogScalar) -> None:
+    """只允许经过选择的标量字段进入工具日志，避免记录参数或原始响应。"""
+    if not all(
+        value is None or isinstance(value, (str, int, float, bool))
+        for value in fields.values()
+    ):
+        raise TypeError("tool log fields must be safe scalars")
+    details = " ".join(f"{name}={value}" for name, value in fields.items())
+    logger.info("%s %s", event, details)
 
 
 class ToolGateway:
@@ -172,11 +184,12 @@ class ToolGateway:
         provider: str,
         operation: str,
     ) -> None:
-        logger.info(
-            "tool.started thread_id=%s provider=%s operation=%s",
-            context.thread_id,
-            provider,
-            operation,
+        _log_event(
+            "tool.started",
+            thread_id=context.thread_id,
+            provider=provider,
+            operation=operation,
+            attempt=1,
         )
 
     async def _log_retry(
@@ -186,15 +199,14 @@ class ToolGateway:
         provider: str,
         operation: str,
     ) -> None:
-        logger.info(
-            "tool.retry_scheduled thread_id=%s provider=%s operation=%s "
-            "attempt=%s next_attempt=%s delay_seconds=%.3f",
-            context.thread_id,
-            provider,
-            operation,
-            event.attempt,
-            event.next_attempt,
-            event.delay_seconds,
+        _log_event(
+            "tool.retry_scheduled",
+            thread_id=context.thread_id,
+            provider=provider,
+            operation=operation,
+            attempt=event.attempt,
+            next_attempt=event.next_attempt,
+            delay_seconds=round(event.delay_seconds, 3),
         )
 
     def _log_result(
@@ -205,39 +217,39 @@ class ToolGateway:
         operation: str,
     ) -> None:
         if result.cache_hit:
-            logger.info(
-                "tool.cache_hit thread_id=%s provider=%s operation=%s "
-                "attempt_count=%s elapsed_ms=%s",
-                context.thread_id,
-                provider,
-                operation,
-                result.attempt_count,
-                result.elapsed_ms,
+            _log_event(
+                "tool.cache_hit",
+                thread_id=context.thread_id,
+                provider=provider,
+                operation=operation,
+                attempt_count=result.attempt_count,
+                cache_hit="true",
+                elapsed_ms=result.elapsed_ms,
             )
         elif result.status is ToolStatus.SUCCESS:
-            logger.info(
-                "tool.completed thread_id=%s provider=%s operation=%s "
-                "attempt_count=%s elapsed_ms=%s",
-                context.thread_id,
-                provider,
-                operation,
-                result.attempt_count,
-                result.elapsed_ms,
+            _log_event(
+                "tool.completed",
+                thread_id=context.thread_id,
+                provider=provider,
+                operation=operation,
+                attempt_count=result.attempt_count,
+                cache_hit="false",
+                elapsed_ms=result.elapsed_ms,
             )
         else:
             error = result.error
             assert error is not None
-            logger.info(
-                "tool.failed thread_id=%s provider=%s operation=%s "
-                "attempt_count=%s elapsed_ms=%s category=%s code=%s retryable=%s",
-                context.thread_id,
-                provider,
-                operation,
-                result.attempt_count,
-                result.elapsed_ms,
-                error.category.value,
-                error.code,
-                error.retryable,
+            _log_event(
+                "tool.failed",
+                thread_id=context.thread_id,
+                provider=provider,
+                operation=operation,
+                attempt_count=result.attempt_count,
+                cache_hit="false",
+                elapsed_ms=result.elapsed_ms,
+                category=error.category.value,
+                code=error.code,
+                retryable=error.retryable,
             )
 
 

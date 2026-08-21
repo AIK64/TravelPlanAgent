@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import traceback
 from collections.abc import Callable
 from decimal import Decimal
@@ -15,9 +17,14 @@ from travel_agent.domain.tool_models import (
     RouteMode,
     RouteQuery,
     ToolErrorCategory,
+    ToolCallContext,
+    ToolStatus,
 )
+from travel_agent.tools.cache import AsyncTTLCache
 from travel_agent.tools.errors import ToolProviderError
+from travel_agent.tools.gateway import ToolGateway
 from travel_agent.tools.providers.amap import AMapClient, AMapPOIProvider, AMapRouteProvider
+from travel_agent.tools.retry import RetryPolicy
 
 
 QUERY = POISearchQuery(city="杭州", keyword="博物馆", limit=10)
@@ -405,3 +412,60 @@ async def test_amap_normalization_error_exposes_no_sensitive_exception_chain(
 
     assert raised.value.category is ToolErrorCategory.INVALID_RESPONSE
     assert_public_error_has_no_sensitive_chain(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_amap_secret_never_appears_in_gateway_logs_or_safe_result(caplog):
+    """凭证、供应商 URL 和查询参数不能越过 Provider/Gateway 安全边界。"""
+    secret = "amap-super-secret-test-key"
+    raw_payload = "RAW_AMAP_SUPPLIER_PAYLOAD"
+
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout(raw_payload, request=request)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(timeout_handler),
+        base_url="https://restapi.amap.com",
+    )
+    amap_client = AMapClient(client, api_key=secret)
+    provider = AMapPOIProvider(amap_client)
+    gateway = ToolGateway(
+        poi_provider=provider,
+        route_provider=AMapRouteProvider(amap_client),
+        cache=AsyncTTLCache(max_entries=10),
+        retry=RetryPolicy(
+            max_attempts=1,
+            base_delay_seconds=0,
+            max_delay_seconds=0,
+            jitter=lambda: 0.0,
+        ),
+        semaphore=asyncio.Semaphore(1),
+        poi_cache_ttl_seconds=60,
+        route_cache_ttl_seconds=60,
+    )
+    caplog.set_level(logging.INFO)
+
+    try:
+        result = (
+            await gateway.search_pois(
+                [QUERY], ToolCallContext(thread_id="amap-secret-boundary")
+            )
+        )[0]
+    finally:
+        await client.aclose()
+
+    assert result.status is ToolStatus.FAILED
+    assert result.error is not None
+    safe_error = ToolProviderError.timeout("poi.search")
+    assert str(safe_error) == safe_error.safe_message
+    public_text = "\n".join(
+        [
+            result.model_dump_json(),
+            *(record.getMessage() for record in caplog.records),
+        ]
+    )
+    assert secret not in public_text
+    assert "restapi.amap.com" not in public_text
+    assert "key=" not in public_text
+    assert "keywords=" not in public_text
+    assert raw_payload not in public_text

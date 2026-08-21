@@ -18,6 +18,7 @@ from travel_agent.domain.tool_models import (
 )
 from travel_agent.graph.workflow import build_workflow, run_planning
 from travel_agent.planning.defaults import POIDefaultPolicy
+from travel_agent.runtime import PlanningRuntime
 from travel_agent.tools.errors import ToolProviderError, ToolUnavailableError
 from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
 
@@ -154,6 +155,33 @@ class AuthenticationFailurePOIProvider(MockPOIProvider):
         raise ToolProviderError.authentication("poi.search")
 
 
+class AlwaysTimeoutAMapPOIProvider:
+    name = "amap"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def search_pois(self, query: POISearchQuery) -> list[POIFacts]:
+        self.calls += 1
+        raise ToolProviderError.timeout("poi.search")
+
+
+class UnusedAMapRouteProvider:
+    name = "amap"
+
+    async def get_driving_route(self, query: RouteQuery) -> RouteResult:
+        raise AssertionError("POI failure must stop before route lookup")
+
+
+class ExplodingUnselectedMockProvider(MockPOIProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def search_pois(self, query: POISearchQuery) -> list[POIFacts]:
+        self.calls += 1
+        raise AssertionError("unselected Mock provider must never be called")
+
+
 class TimeoutRouteProvider(MockRouteProvider):
     async def get_driving_route(self, query: RouteQuery) -> RouteResult:
         raise ToolProviderError.timeout("route.get_driving")
@@ -265,6 +293,75 @@ async def test_poi_tool_failure_raises_without_validation_or_replan(
         "planning.infeasible",
     } & set(events)
     snapshot = await workflow.aget_state(
+        {"configurable": {"thread_id": thread_id}}
+    )
+    assert snapshot.values["status"] == "search_planned"
+    assert snapshot.values["iterations"] == 0
+    assert snapshot.values["candidates"] == []
+
+
+@pytest.mark.asyncio
+async def test_amap_failure_retries_selected_provider_without_mock_fallback(
+    hangzhou_trip,
+    gateway_factory,
+    caplog,
+):
+    """AMap 失败只能耗尽选中 Provider 的公开重试预算，不能静默回退 Mock。"""
+    selected_amap = AlwaysTimeoutAMapPOIProvider()
+    selected_route = UnusedAMapRouteProvider()
+    unselected_mock = ExplodingUnselectedMockProvider()
+    gateway = gateway_factory(
+        poi_provider=selected_amap,
+        route_provider=selected_route,
+        max_attempts=3,
+    )
+    runtime = PlanningRuntime(
+        poi_provider=selected_amap,
+        route_provider=selected_route,
+        gateway=gateway,
+        workflow=build_workflow(
+            gateway,
+            POIDefaultPolicy(UnknownFactPolicy.ASSUME_WITH_WARNING),
+        ),
+        client=None,
+    )
+    request = PlanningRequest(
+        trip=hangzhou_trip.model_copy(
+            update={"must_visit": ["灵隐寺"], "interests": []}
+        ),
+        max_replan_rounds=2,
+    )
+    thread_id = "amap-no-fallback"
+    caplog.set_level(logging.INFO)
+
+    with pytest.raises(ToolUnavailableError) as raised:
+        await runtime.plan(request, thread_id=thread_id)
+
+    assert raised.value.result.attempt_count == 3
+    assert selected_amap.calls == 3
+    assert unselected_mock.calls == 0
+    assert all(
+        unselected_mock is not owned
+        for owned in (
+            runtime.poi_provider,
+            runtime.route_provider,
+            runtime.gateway,
+            runtime.workflow,
+            runtime.client,
+        )
+    )
+    assert not hasattr(runtime, "fallback_provider")
+    events = _event_names(caplog.records, thread_id)
+    assert events.count("tool.retry_scheduled") == 2
+    assert "tool.failed" in events
+    assert "planning.failed" in events
+    assert not {
+        "candidate.validated",
+        "routing.decision",
+        "replan.round_started",
+        "planning.infeasible",
+    } & set(events)
+    snapshot = await runtime.workflow.aget_state(
         {"configurable": {"thread_id": thread_id}}
     )
     assert snapshot.values["status"] == "search_planned"
