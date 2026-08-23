@@ -8,13 +8,21 @@ from fastapi import FastAPI
 from travel_agent import __version__
 from travel_agent.api.errors import (
     UTF8JSONResponse,
+    clarification_conflict_exception_handler,
+    clarification_not_found_exception_handler,
     tool_unavailable_exception_handler,
+    requirement_unavailable_exception_handler,
 )
 from travel_agent.api.routes import router
 from travel_agent.config import Settings
 from travel_agent.logging_config import configure_logging
 from travel_agent.runtime import PlanningRuntime
 from travel_agent.tools.errors import ToolUnavailableError
+from travel_agent.requirements.errors import RequirementUnavailableError
+from travel_agent.requirements.errors import (
+    ClarificationResumeConflictError,
+    ClarificationThreadNotFoundError,
+)
 
 
 RuntimeFactory = Callable[[Settings], Awaitable[PlanningRuntime]]
@@ -42,14 +50,26 @@ def create_app(
         version=__version__,
         default_response_class=UTF8JSONResponse,
         description=(
-            "A deterministic first slice of a stateful "
-            "Plan-Execute-Validate-Replan travel agent."
+            "A grounded natural-language and structured-input travel agent with "
+            "explicit Parse-Tool-Validate-Replan trajectories."
         ),
         lifespan=lifespan,
     )
     app.add_exception_handler(
         ToolUnavailableError,
         tool_unavailable_exception_handler,
+    )
+    app.add_exception_handler(
+        RequirementUnavailableError,
+        requirement_unavailable_exception_handler,
+    )
+    app.add_exception_handler(
+        ClarificationThreadNotFoundError,
+        clarification_not_found_exception_handler,
+    )
+    app.add_exception_handler(
+        ClarificationResumeConflictError,
+        clarification_conflict_exception_handler,
     )
     app.include_router(router)
     return app

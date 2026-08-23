@@ -106,10 +106,41 @@ HANGZHOU_POIS: tuple[POI, ...] = (
 )
 
 
+HANGZHOU_ANCHORS: tuple[POI, ...] = (
+    POI(
+        id="hz_east_station",
+        name="杭州东站",
+        city="杭州",
+        coordinate=Coordinate(longitude=120.2120, latitude=30.2909),
+        categories=["交通枢纽", "火车站"],
+        opening_window=TimeWindow(start=time(0, 1), end=time(23, 59)),
+        estimated_duration_minutes=30,
+        estimated_cost=Decimal("0"),
+        indoor_outdoor="indoor",
+        suitability_tags=["到达", "离开"],
+    ),
+    POI(
+        id="hz_west_lake_east",
+        name="西湖东侧",
+        city="杭州",
+        coordinate=Coordinate(longitude=120.1650, latitude=30.2500),
+        categories=["住宿区域"],
+        opening_window=TimeWindow(start=time(0, 1), end=time(23, 59)),
+        estimated_duration_minutes=30,
+        estimated_cost=Decimal("0"),
+        indoor_outdoor="mixed",
+        suitability_tags=["住宿"],
+    ),
+)
+
+
 def get_mock_pois(city: str) -> list[POI]:
     """Return isolated copies so Provider adapters cannot mutate the fixture."""
     normalized = city.strip().removesuffix("市")
     if normalized != "杭州":
         return []
-    return [poi.model_copy(deep=True) for poi in HANGZHOU_POIS]
+    return [
+        poi.model_copy(deep=True)
+        for poi in (*HANGZHOU_POIS, *HANGZHOU_ANCHORS)
+    ]
 

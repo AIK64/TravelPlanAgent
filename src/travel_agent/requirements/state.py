@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from typing import TypedDict
+
+from travel_agent.domain.models import PlanningResponse, TripSpec
+from travel_agent.domain.tool_models import POIFacts, ToolExecutionSummary, ToolResult
+from travel_agent.requirements.anchors import AnchorSearchIntent
+from travel_agent.requirements.models import (
+    AnchorResolution,
+    ClarificationResumeValue,
+    NaturalPlanningRequest,
+    RequirementDraft,
+    RequirementExecutionSummary,
+    RequirementIssue,
+    RequirementPatch,
+)
+
+
+class RequirementState(TypedDict):
+    thread_id: str
+    natural_request: NaturalPlanningRequest
+    requirement_draft: RequirementDraft | None
+    requirement_issues: list[RequirementIssue]
+    clarification_questions: list[str]
+    clarification_round: int
+    max_clarification_rounds: int
+    clarification_target_fields: list[str]
+    clarification_input: ClarificationResumeValue | None
+    clarification_patch: RequirementPatch | None
+    changed_fields: list[str]
+    rejected_patch_fields: list[str]
+    clarification_exhausted: bool
+    anchor_search_plan: list[AnchorSearchIntent]
+    anchor_results: list[ToolResult[list[POIFacts]]]
+    anchor_resolutions: dict[str, AnchorResolution]
+    reused_anchor_roles: list[str]
+    invalidated_anchor_roles: list[str]
+    llm_summaries: list[RequirementExecutionSummary]
+    tool_summaries: list[ToolExecutionSummary]
+    trip: TripSpec | None
+    planning_response: PlanningResponse | None
+    status: str
+    message: str | None

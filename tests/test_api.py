@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import time
+from datetime import date
 from decimal import Decimal
 import logging
+import sys
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,6 +17,12 @@ from travel_agent.config import Settings
 from travel_agent.domain.models import PlanningResponse
 from travel_agent.domain.tool_models import ProviderMode
 from travel_agent.runtime import PlanningRuntime
+from travel_agent.requirements.errors import (
+    RequirementErrorCategory,
+    RequirementUnavailableError,
+)
+from travel_agent.requirements.providers.openai import OpenAIRequirementModel
+from travel_agent.requirements.providers.deepseek import DeepSeekRequirementModel
 from travel_agent.tools.providers.amap import AMapPOIProvider, AMapRouteProvider
 from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
 
@@ -24,7 +33,20 @@ RUNTIME_OWNED_FIELDS = {
     "gateway",
     "workflow",
     "client",
+    "requirement_model",
+    "requirement_gateway",
+    "requirement_workflow",
+    "model_client",
+    "checkpoint_context",
+    "resume_locks",
 }
+
+
+COMPLETE_NATURAL_TEXT = (
+    "2026年10月2日到10月4日去杭州，3个人，预算1500元，住西湖东侧，"
+    "喜欢自然和美食，2日10:30到杭州东站，4日19:00从杭州东站离开，"
+    "灵隐寺必须去，不想太累。"
+)
 
 
 @dataclass
@@ -55,7 +77,7 @@ def test_openapi_version_matches_package_version(client):
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.4.0"
     assert response.json()["info"]["version"] == __version__
 
 
@@ -71,6 +93,158 @@ def test_create_plan(client, hangzhou_trip):
     body = response.json()
     assert body["status"] == "completed"
     assert body["selected_plan"]["validation"]["valid"] is True
+
+
+def test_create_plan_from_complete_natural_language(client):
+    response = client.post(
+        "/api/v1/plans/from-text",
+        json={
+            "text": COMPLETE_NATURAL_TEXT,
+            "reference_date": "2026-08-23",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["trip"]["arrival"]["name"] == "杭州东站"
+    assert body["planning"]["selected_plan"] is not None
+    assert body["thread_id"]
+
+
+def test_incomplete_natural_language_returns_structured_clarification(client):
+    response = client.post(
+        "/api/v1/plans/from-text",
+        json={
+            "text": "2026年10月2日到10月4日去杭州，2日10:30到杭州东站。",
+            "reference_date": "2026-08-23",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "needs_clarification"
+    assert body["planning"] is None
+    assert {issue["field"] for issue in body["issues"]} == {
+        "departure.name",
+        "departure.at",
+    }
+    assert body["clarification_questions"]
+
+
+def test_natural_language_clarification_can_resume_same_thread(client):
+    initial = client.post(
+        "/api/v1/plans/from-text",
+        json={
+            "text": (
+                "2026年10月2日到10月4日去杭州，3个人，预算1500元，"
+                "住西湖东侧，喜欢自然和美食，2日10:30到杭州东站，"
+                "灵隐寺必须去，不想太累。"
+            ),
+            "reference_date": "2026-08-23",
+        },
+    )
+
+    assert initial.status_code == 200
+    interrupted = initial.json()
+    assert interrupted["status"] == "needs_clarification"
+    assert interrupted["can_resume"] is True
+    assert interrupted["interrupt"]["payload"]["target_fields"] == [
+        "departure.name",
+        "departure.at",
+    ]
+
+    resumed = client.post(
+        f"/api/v1/plans/from-text/{interrupted['thread_id']}/resume",
+        json={
+            "interrupt_id": interrupted["interrupt"]["id"],
+            "request_id": "e90bc26b-2ab0-4fe6-b733-df8f04081a14",
+            "answer": "10月4日19:00从杭州东站离开。",
+        },
+    )
+
+    assert resumed.status_code == 200
+    body = resumed.json()
+    assert body["status"] == "completed"
+    assert body["can_resume"] is False
+    assert body["interrupt"] is None
+    assert body["trip"]["departure"]["name"] == "杭州东站"
+
+
+def test_resume_rejects_unknown_and_stale_threads(client):
+    payload = {
+        "interrupt_id": "stale-interrupt",
+        "request_id": "d5130656-7be3-4c4d-91b4-51601279e21c",
+        "answer": "10月4日19:00从杭州东站离开。",
+    }
+
+    missing = client.post(
+        "/api/v1/plans/from-text/missing-thread/resume",
+        json=payload,
+    )
+
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "clarification_thread_not_found"
+
+    initial = client.post(
+        "/api/v1/plans/from-text",
+        json={
+            "text": "2026年10月2日到10月4日去杭州，2日10:30到杭州东站。",
+            "reference_date": "2026-08-23",
+        },
+    ).json()
+    stale = client.post(
+        f"/api/v1/plans/from-text/{initial['thread_id']}/resume",
+        json=payload,
+    )
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "stale_interrupt"
+
+
+def test_requirement_model_failure_returns_503_with_safe_detail(monkeypatch):
+    class FailedNaturalRuntime:
+        async def plan_from_text(self, _request, thread_id):
+            raise RequirementUnavailableError(
+                provider="openai",
+                model="configured-model",
+                category=RequirementErrorCategory.TIMEOUT,
+                code="timeout",
+                retryable=True,
+                safe_message="需求解析服务暂时超时",
+                thread_id=thread_id,
+                attempt_count=2,
+            )
+
+        async def close(self):
+            return None
+
+    async def runtime_factory(_settings):
+        return FailedNaturalRuntime()
+
+    monkeypatch.setattr("travel_agent.api.routes.uuid4", lambda: "model-failed")
+    application = create_app(
+        Settings.from_env({}), runtime_factory=runtime_factory
+    )
+
+    with TestClient(application) as test_client:
+        response = test_client.post(
+            "/api/v1/plans/from-text",
+            json={"text": COMPLETE_NATURAL_TEXT, "reference_date": "2026-08-23"},
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "code": "timeout",
+            "provider": "openai",
+            "model": "configured-model",
+            "category": "timeout",
+            "retryable": True,
+            "thread_id": "model-failed",
+            "message": "需求解析服务暂时超时",
+        }
+    }
 
 
 def test_mock_api_exposes_route_provider_confidence_and_estimate_kind(
@@ -139,6 +313,95 @@ async def test_amap_runtime_contains_only_amap_providers_and_closes_client():
     await runtime.close()
 
     assert client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_openai_requirement_runtime_is_explicit_and_closes_client(monkeypatch):
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    clients = []
+
+    def create_client(**kwargs):
+        client = FakeOpenAIClient(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(AsyncOpenAI=create_client),
+    )
+    settings = Settings.from_env(
+        {
+            "REQUIREMENT_PROVIDER": "openai",
+            "OPENAI_API_KEY": "test-openai-key",
+            "REQUIREMENT_MODEL": "configured-model",
+        }
+    )
+
+    runtime = await PlanningRuntime.create(settings)
+    try:
+        assert isinstance(runtime.requirement_model, OpenAIRequirementModel)
+        assert runtime.requirement_model.model == "configured-model"
+        assert runtime.model_client is clients[0]
+        assert clients[0].kwargs["max_retries"] == 0
+        assert "test-openai-key" not in repr(runtime.requirement_model)
+    finally:
+        await runtime.close()
+
+    assert clients[0].closed
+
+
+@pytest.mark.asyncio
+async def test_deepseek_requirement_runtime_is_explicit_and_closes_client(
+    monkeypatch,
+):
+    class FakeDeepSeekClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    clients = []
+
+    def create_client(**kwargs):
+        client = FakeDeepSeekClient(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setitem(
+        sys.modules,
+        "openai",
+        SimpleNamespace(AsyncOpenAI=create_client),
+    )
+    settings = Settings.from_env(
+        {
+            "REQUIREMENT_PROVIDER": "deepseek",
+            "DEEPSEEK_API_KEY": "deepseek-test-key",
+            "DEEPSEEK_MODEL": "deepseek-v4-flash",
+        }
+    )
+
+    runtime = await PlanningRuntime.create(settings)
+    try:
+        assert isinstance(runtime.requirement_model, DeepSeekRequirementModel)
+        assert runtime.requirement_model.model == "deepseek-v4-flash"
+        assert runtime.model_client is clients[0]
+        assert clients[0].kwargs["base_url"] == "https://api.deepseek.com"
+        assert clients[0].kwargs["max_retries"] == 0
+        assert "deepseek-test-key" not in repr(runtime.requirement_model)
+    finally:
+        await runtime.close()
+
+    assert clients[0].closed
 
 
 @pytest.mark.asyncio

@@ -64,22 +64,6 @@
 - 所有 Loop 都有迭代、调用次数或时间预算，避免无限执行。
 - 关键 Agent 行为优先使用轨迹测试，而不只测试最终文本。
 
-## v0.2 的 Agent 重点
-
-v0.2 虽然建设 Provider 和 Tool Gateway，但目的不是展示 HTTP 集成，而是完成可靠 Tool Use：
-
-```text
-Agent 形成检索意图
-→ Graph 进入工具节点
-→ Tool Gateway 调用选定 Provider
-→ 标准化结果写回 State
-→ Agent 根据结果形成候选计划
-→ Validator 发现问题
-→ Conditional Edge 决定 Select / Replan / Stop
-```
-
-验收和文档必须展示工具调用前后的 State 变化、工具事件、重试轨迹、条件路由和 Replan，而不能只展示“成功调用了高德 API”。
-
 ## 简历与演示导向
 
 项目材料优先呈现：
@@ -92,3 +76,5 @@ Agent 形成检索意图
 - 可量化评测结果。
 
 地图 API、缓存和后端组件应作为上述 Agent 能力的工程支撑来描述，而不是项目主角。
+
+项目的代码开发，关键的方法等合适的地方都要加上对应的日志输出，保证执行时整个流程可控制追溯。

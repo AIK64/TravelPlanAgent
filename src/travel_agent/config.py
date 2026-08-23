@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Mapping
+from urllib.parse import urlsplit
 
 from travel_agent.domain.tool_models import ProviderMode, UnknownFactPolicy
 from travel_agent.planning.policy import PlanningPolicy
+from travel_agent.requirements.models import RequirementProviderMode
+
+
+class CheckpointBackend(StrEnum):
+    MEMORY = "memory"
+    SQLITE = "sqlite"
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +33,18 @@ class Settings:
     poi_max_queries: int = 12
     unknown_fact_policy: UnknownFactPolicy = UnknownFactPolicy.ASSUME_WITH_WARNING
     amap_driving_strategy: int = 32
+    requirement_provider: RequirementProviderMode = RequirementProviderMode.MOCK
+    openai_api_key: str | None = field(default=None, repr=False)
+    requirement_model: str = "mock-requirement-v1"
+    requirement_timeout_seconds: float = 20.0
+    requirement_max_attempts: int = 2
+    requirement_backoff_base_seconds: float = 0.5
+    requirement_max_backoff_seconds: float = 2.0
+    deepseek_api_key: str | None = field(default=None, repr=False)
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = ""
+    checkpoint_backend: CheckpointBackend = CheckpointBackend.MEMORY
+    checkpoint_sqlite_path: str = ".data/travel-agent-checkpoints.sqlite3"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -51,6 +71,40 @@ class Settings:
                 source.get("UNKNOWN_FACT_POLICY", "assume_with_warning").strip().lower()
             ),
             amap_driving_strategy=int(source.get("AMAP_DRIVING_STRATEGY", "32")),
+            requirement_provider=RequirementProviderMode(
+                source.get("REQUIREMENT_PROVIDER", "mock").strip().lower()
+            ),
+            openai_api_key=source.get("OPENAI_API_KEY", "").strip() or None,
+            requirement_model=source.get(
+                "REQUIREMENT_MODEL", "mock-requirement-v1"
+            ).strip(),
+            requirement_timeout_seconds=float(
+                source.get("REQUIREMENT_TIMEOUT_SECONDS", "20")
+            ),
+            requirement_max_attempts=int(
+                source.get("REQUIREMENT_MAX_ATTEMPTS", "2")
+            ),
+            requirement_backoff_base_seconds=float(
+                source.get("REQUIREMENT_BACKOFF_BASE_SECONDS", "0.5")
+            ),
+            requirement_max_backoff_seconds=float(
+                source.get("REQUIREMENT_MAX_BACKOFF_SECONDS", "2")
+            ),
+            deepseek_api_key=source.get("DEEPSEEK_API_KEY", "").strip() or None,
+            deepseek_base_url=source.get(
+                "DEEPSEEK_BASE_URL",
+                "https://api.deepseek.com",
+            )
+            .strip()
+            .rstrip("/"),
+            deepseek_model=source.get("DEEPSEEK_MODEL", "").strip(),
+            checkpoint_backend=CheckpointBackend(
+                source.get("CHECKPOINT_BACKEND", "memory").strip().lower()
+            ),
+            checkpoint_sqlite_path=source.get(
+                "CHECKPOINT_SQLITE_PATH",
+                ".data/travel-agent-checkpoints.sqlite3",
+            ).strip(),
         )
         settings.validate()
         return settings
@@ -72,9 +126,68 @@ class Settings:
             raise ValueError("POI_CACHE_TTL_SECONDS must be positive")
         if self.route_cache_ttl_seconds <= 0:
             raise ValueError("ROUTE_CACHE_TTL_SECONDS must be positive")
+        if self.requirement_provider is RequirementProviderMode.OPENAI:
+            if not self.openai_api_key:
+                raise ValueError(
+                    "OPENAI_API_KEY is required when REQUIREMENT_PROVIDER=openai"
+                )
+            if (
+                not self.requirement_model
+                or self.requirement_model == "mock-requirement-v1"
+            ):
+                raise ValueError(
+                    "REQUIREMENT_MODEL is required when REQUIREMENT_PROVIDER=openai"
+                )
+        if self.requirement_provider is RequirementProviderMode.DEEPSEEK:
+            if not self.deepseek_api_key:
+                raise ValueError(
+                    "DEEPSEEK_API_KEY is required when "
+                    "REQUIREMENT_PROVIDER=deepseek"
+                )
+            if not self.deepseek_model:
+                raise ValueError(
+                    "DEEPSEEK_MODEL is required when "
+                    "REQUIREMENT_PROVIDER=deepseek"
+                )
+            if self.deepseek_model in {"deepseek-chat", "deepseek-reasoner"}:
+                raise ValueError(
+                    "DEEPSEEK_MODEL uses a retired alias; choose an active model"
+                )
+            _validate_deepseek_base_url(self.deepseek_base_url)
+        if self.requirement_timeout_seconds <= 0:
+            raise ValueError("REQUIREMENT_TIMEOUT_SECONDS must be positive")
+        if self.requirement_max_attempts < 1:
+            raise ValueError("REQUIREMENT_MAX_ATTEMPTS must be at least 1")
+        if self.requirement_backoff_base_seconds < 0:
+            raise ValueError("REQUIREMENT_BACKOFF_BASE_SECONDS must be non-negative")
+        if self.requirement_max_backoff_seconds < 0:
+            raise ValueError("REQUIREMENT_MAX_BACKOFF_SECONDS must be non-negative")
+        if (
+            self.checkpoint_backend is CheckpointBackend.SQLITE
+            and not self.checkpoint_sqlite_path
+        ):
+            raise ValueError(
+                "CHECKPOINT_SQLITE_PATH is required when CHECKPOINT_BACKEND=sqlite"
+            )
         PlanningPolicy(
             poi_query_limit=self.poi_query_limit,
             poi_candidate_limit=self.poi_candidate_limit,
             route_strategy=self.amap_driving_strategy,
             poi_max_queries=self.poi_max_queries,
+        )
+
+
+def _validate_deepseek_base_url(value: str) -> None:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "DEEPSEEK_BASE_URL must be an HTTPS URL without credentials, "
+            "query, or fragment"
         )
