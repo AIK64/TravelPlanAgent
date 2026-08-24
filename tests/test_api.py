@@ -17,6 +17,9 @@ from travel_agent.config import Settings
 from travel_agent.critique.gateway import CriticGateway
 from travel_agent.critique.providers.mock import MockCriticModel
 from travel_agent.critique.providers.deepseek import DeepSeekCriticModel
+from travel_agent.edits.providers.deepseek import DeepSeekEditModel
+from travel_agent.edits.providers.mock import MockEditModel
+from travel_agent.edits.providers.openai import OpenAIEditModel
 from travel_agent.domain.models import PlanningResponse
 from travel_agent.domain.tool_models import ProviderMode
 from travel_agent.runtime import PlanningRuntime
@@ -43,7 +46,14 @@ RUNTIME_OWNED_FIELDS = {
     "critic_model",
     "critic_gateway",
     "critic_model_client",
+    "edit_model",
+    "edit_gateway",
+    "edit_model_client",
+    "plan_repository",
+    "lifecycle_workflow",
+    "lifecycle_service",
     "checkpoint_context",
+    "repository_context",
     "resume_locks",
 }
 
@@ -83,7 +93,7 @@ def test_openapi_version_matches_package_version(client):
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
-    assert __version__ == "0.7.0"
+    assert __version__ == "0.8.0"
     assert response.json()["info"]["version"] == __version__
 
 
@@ -295,6 +305,7 @@ async def test_mock_runtime_contains_only_mock_providers():
         assert isinstance(runtime.route_provider, MockRouteProvider)
         assert isinstance(runtime.critic_model, MockCriticModel)
         assert isinstance(runtime.critic_gateway, CriticGateway)
+        assert isinstance(runtime.edit_model, MockEditModel)
         assert runtime.critic_model_client is None
         assert runtime.client is None
         assert not hasattr(runtime, "fallback_provider")
@@ -361,6 +372,54 @@ async def test_deepseek_critic_runtime_is_independent_and_closes_client(monkeypa
         assert runtime.model_client is None
         assert clients[0].kwargs["base_url"] == "https://api.deepseek.com"
         assert clients[0].kwargs["max_retries"] == 0
+    finally:
+        await runtime.close()
+    assert clients[0].closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider,model,key_name,model_type,uses_base_url",
+    [
+        ("openai", "openai-edit-model", "OPENAI_API_KEY", OpenAIEditModel, False),
+        ("deepseek", "deepseek-edit-model", "DEEPSEEK_API_KEY", DeepSeekEditModel, True),
+    ],
+)
+async def test_external_edit_runtime_is_explicit_and_closes_client(
+    monkeypatch, provider, model, key_name, model_type, uses_base_url
+):
+    class FakeOpenAIClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    clients = []
+
+    def create_client(**kwargs):
+        client = FakeOpenAIClient(**kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setitem(
+        sys.modules, "openai", SimpleNamespace(AsyncOpenAI=create_client)
+    )
+    runtime = await PlanningRuntime.create(
+        Settings.from_env(
+            {
+                "EDIT_PROVIDER": provider,
+                "EDIT_MODEL": model,
+                key_name: "secret-key",
+            }
+        )
+    )
+    try:
+        assert isinstance(runtime.edit_model, model_type)
+        assert runtime.edit_model_client is clients[0]
+        assert clients[0].kwargs["max_retries"] == 0
+        assert ("base_url" in clients[0].kwargs) is uses_base_url
     finally:
         await runtime.close()
     assert clients[0].closed

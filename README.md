@@ -1,8 +1,8 @@
 # Constraint-Aware Travel Agent
 
-面向中国城市旅行场景的约束感知规划 Agent。v0.7 在 v0.6 硬合法候选之后加入 Grounded LLM Soft Critic：模型只评价节奏、兴趣覆盖、多样性、休息友好度和区域连贯性，结论必须引用有界 Evidence；确定性 Quality Gate 负责排序和动作准入，并支持一次经过 Hard Validator 回归的局部软修复。
+面向中国城市旅行场景的约束感知规划 Agent。v0.8 在 Grounded LLM Soft Critic 之后加入可恢复的计划生命周期：用户选择候选形成 V1，锁定日期或项目，用结构化或自然语言方式编辑；Agent 经 Impact Analysis、增量 Tool Use、Hard Validator、Soft Critic 和局部性守卫生成 Preview，只有用户批准后才提交 V2。
 
-## 当前进度：v0.7.0
+## 当前进度：v0.8.0
 
 ```text
 Natural Language
@@ -20,6 +20,12 @@ Natural Language
       │                    └─ One Soft Repair → Route Delta → Hard Validate → Re-evaluate
       └─ invalid → Select Target → Critic → RepairPlan
                    → Local Repair → Delta Route Tool Use → Revalidate
+  → Candidate Selection Interrupt → Persist V1
+  → Lock / Edit Intent → Grounding → Impact / Lock Guard
+  → Local Preview → POI/Route Delta → Hard Validate / Soft Critic
+  → Approval Interrupt
+      ├─ approve → CAS Commit V2 → Continue
+      └─ reject  → Keep V1 → Continue
 ```
 
 已完成：
@@ -56,12 +62,20 @@ Natural Language
 - Critic 超时、认证、Schema 或 Grounding 失败均降级交付硬合法计划，不会返回业务 `infeasible`。
 - API 返回 Critic 状态、执行摘要、有效 Critique、Grounded Explanation 和软修复轮次。
 - 15 条离线 Soft Critic Fixture 和 with/without critic 消融脚本，覆盖 Grounding、动作安全、选择一致率和硬约束回归。
+- 独立 `PlanLifecycleWorkflow`、`PlanVersion`、`PlanPreview`、稳定 `item_id`、日期/项目锁和结构化 V1/V2 Diff。
+- Candidate Selection、Edit Grounding、Impact Analysis、Lock/Locality Guard、Preview 和 Approval 均在 Graph 中可观察。
+- 独立 `EditModel` Protocol 与 Mock、DeepSeek、OpenAI Provider；模型只解析白名单动作，不写计划或判断硬约束。
+- move/reorder/remove/add/replace 复用 POI Facts 和 Route Result，只为新增实体或变化邻接边调用工具。
+- Preview/Commit 两阶段、Approval Token、Repository CAS、request ID 幂等和旧 Interrupt/Version/Revision 409。
+- 内存/SQLite Plan Repository；SQLite 模式已覆盖候选选择 Interrupt 的服务重启恢复。
+- 15 条离线 Lifecycle Fixture 及实际 API/轨迹测试，覆盖锁定保持、未影响日期保持、Diff、审批、幂等和有界终止。
 
-当前边界：Soft Critic 只对规划时的候选执行一次受控评价/修复，尚不支持完成计划后的用户选择、锁定、编辑和审批；这些属于 v0.8。当前路线矩阵覆盖 POI 候选的必要有向边，不是 OTA 级全量交通规划。SQLite 只用于单机演示；长期 Memory、天气事件、计划版本 Diff、MCP 和生产化分别属于后续版本。
+当前边界：计划编辑最多包含三个原子动作、影响两个日期，TripSpec 硬约束变化要求创建新计划；当前路线矩阵不是 OTA 级全量交通规划。SQLite 只用于单机演示；天气事件、长期 Memory、MCP、完整前端和生产化分别属于后续版本。
 
 ## 学习入口
 
 - 后续开发以 [v0.6 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md) 为准；v1.0 完成核心 Agent，v1.1 增加 Preference Memory，v1.2 完成 MCP 与平台化。
+- 从 [v0.8 计划生命周期 HITL 文档](docs/v0.8/README.md) 查看会话 API、DeepSeek 编辑配置、Graph、失败语义和评测；完整取舍见 [设计报告](docs/v0.8/design.md)。
 - 从 [v0.7 Grounded LLM Soft Critic 文档](docs/v0.7/README.md) 查看当前实现、配置、Graph、失败语义与评测；完整设计见 [设计报告](docs/v0.7/design.md)。
 - 从 [v0.6 约束优化与真实路线文档](docs/v0.6/README.md) 查看当前 Graph、求解预算、降级语义与消融 Benchmark。
 - [v0.5 局部自修复文档](docs/v0.5/README.md) 解释当前保留的 Critic/Repair 回退闭环。

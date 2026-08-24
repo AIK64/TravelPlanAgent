@@ -24,6 +24,12 @@ class CriticProviderMode(StrEnum):
     DEEPSEEK = "deepseek"
 
 
+class EditProviderMode(StrEnum):
+    MOCK = "mock"
+    OPENAI = "openai"
+    DEEPSEEK = "deepseek"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     provider: ProviderMode = ProviderMode.MOCK
@@ -64,11 +70,19 @@ class Settings:
     requirement_max_attempts: int = 2
     requirement_backoff_base_seconds: float = 0.5
     requirement_max_backoff_seconds: float = 2.0
+    edit_provider: EditProviderMode = EditProviderMode.MOCK
+    edit_model: str = "mock-plan-edit-v1"
+    edit_timeout_seconds: float = 20.0
+    edit_max_attempts: int = 2
+    edit_max_output_tokens: int = 1_200
+    plan_max_versions: int = 20
+    plan_max_affected_days: int = 2
     deepseek_api_key: str | None = field(default=None, repr=False)
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = ""
     checkpoint_backend: CheckpointBackend = CheckpointBackend.MEMORY
     checkpoint_sqlite_path: str = ".data/travel-agent-checkpoints.sqlite3"
+    plan_sqlite_path: str = ".data/travel-agent-plans.sqlite3"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -161,6 +175,19 @@ class Settings:
             requirement_max_backoff_seconds=float(
                 source.get("REQUIREMENT_MAX_BACKOFF_SECONDS", "2")
             ),
+            edit_provider=EditProviderMode(
+                source.get("EDIT_PROVIDER", "mock").strip().lower()
+            ),
+            edit_model=source.get("EDIT_MODEL", "mock-plan-edit-v1").strip(),
+            edit_timeout_seconds=float(source.get("EDIT_TIMEOUT_SECONDS", "20")),
+            edit_max_attempts=int(source.get("EDIT_MAX_ATTEMPTS", "2")),
+            edit_max_output_tokens=int(
+                source.get("EDIT_MAX_OUTPUT_TOKENS", "1200")
+            ),
+            plan_max_versions=int(source.get("PLAN_MAX_VERSIONS", "20")),
+            plan_max_affected_days=int(
+                source.get("PLAN_MAX_AFFECTED_DAYS", "2")
+            ),
             deepseek_api_key=source.get("DEEPSEEK_API_KEY", "").strip() or None,
             deepseek_base_url=source.get(
                 "DEEPSEEK_BASE_URL",
@@ -175,6 +202,9 @@ class Settings:
             checkpoint_sqlite_path=source.get(
                 "CHECKPOINT_SQLITE_PATH",
                 ".data/travel-agent-checkpoints.sqlite3",
+            ).strip(),
+            plan_sqlite_path=source.get(
+                "PLAN_SQLITE_PATH", ".data/travel-agent-plans.sqlite3"
             ).strip(),
         )
         settings.validate()
@@ -266,6 +296,29 @@ class Settings:
             raise ValueError("REQUIREMENT_BACKOFF_BASE_SECONDS must be non-negative")
         if self.requirement_max_backoff_seconds < 0:
             raise ValueError("REQUIREMENT_MAX_BACKOFF_SECONDS must be non-negative")
+        if self.edit_provider is EditProviderMode.OPENAI:
+            if not self.openai_api_key:
+                raise ValueError("OPENAI_API_KEY is required when EDIT_PROVIDER=openai")
+            if not self.edit_model or self.edit_model == "mock-plan-edit-v1":
+                raise ValueError("EDIT_MODEL is required when EDIT_PROVIDER=openai")
+        if self.edit_provider is EditProviderMode.DEEPSEEK:
+            if not self.deepseek_api_key:
+                raise ValueError("DEEPSEEK_API_KEY is required when EDIT_PROVIDER=deepseek")
+            if not self.edit_model or self.edit_model == "mock-plan-edit-v1":
+                raise ValueError("EDIT_MODEL is required when EDIT_PROVIDER=deepseek")
+            if self.edit_model in {"deepseek-chat", "deepseek-reasoner"}:
+                raise ValueError("EDIT_MODEL uses a retired alias; choose an active model")
+            _validate_deepseek_base_url(self.deepseek_base_url)
+        if self.edit_timeout_seconds <= 0:
+            raise ValueError("EDIT_TIMEOUT_SECONDS must be positive")
+        if self.edit_max_attempts < 1:
+            raise ValueError("EDIT_MAX_ATTEMPTS must be at least 1")
+        if self.edit_max_output_tokens < 1:
+            raise ValueError("EDIT_MAX_OUTPUT_TOKENS must be positive")
+        if not 1 <= self.plan_max_versions <= 100:
+            raise ValueError("PLAN_MAX_VERSIONS must be between 1 and 100")
+        if not 1 <= self.plan_max_affected_days <= 7:
+            raise ValueError("PLAN_MAX_AFFECTED_DAYS must be between 1 and 7")
         if (
             self.checkpoint_backend is CheckpointBackend.SQLITE
             and not self.checkpoint_sqlite_path
@@ -273,6 +326,8 @@ class Settings:
             raise ValueError(
                 "CHECKPOINT_SQLITE_PATH is required when CHECKPOINT_BACKEND=sqlite"
             )
+        if self.checkpoint_backend is CheckpointBackend.SQLITE and not self.plan_sqlite_path:
+            raise ValueError("PLAN_SQLITE_PATH is required when CHECKPOINT_BACKEND=sqlite")
         PlanningPolicy(
             poi_query_limit=self.poi_query_limit,
             poi_candidate_limit=self.poi_candidate_limit,

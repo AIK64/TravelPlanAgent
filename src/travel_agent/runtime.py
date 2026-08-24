@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 from langgraph.graph.state import CompiledStateGraph
 
-from travel_agent.config import CriticProviderMode, Settings
+from travel_agent.config import CriticProviderMode, EditProviderMode, Settings
 from travel_agent.critique.evidence import EvidenceBudget
 from travel_agent.critique.gateway import CriticGateway
 from travel_agent.critique.protocols import CriticModel
@@ -16,9 +16,21 @@ from travel_agent.critique.providers.mock import MockCriticModel
 from travel_agent.critique.providers.openai import OpenAICriticModel
 from travel_agent.critique.quality import CriticPolicy
 from travel_agent.domain.models import PlanningRequest, PlanningResponse
+from travel_agent.domain.lifecycle_models import (
+    LifecycleResumeRequest,
+    PlanSessionResponse,
+)
 from travel_agent.domain.optimization_models import OptimizationBudget
 from travel_agent.domain.tool_models import ProviderMode
 from travel_agent.graph.workflow import build_workflow, run_planning
+from travel_agent.edits.gateway import EditGateway
+from travel_agent.edits.protocols import EditModel
+from travel_agent.edits.providers.mock import MockEditModel
+from travel_agent.edits.providers.openai import OpenAIEditModel
+from travel_agent.edits.providers.deepseek import DeepSeekEditModel
+from travel_agent.lifecycle.repository import PlanRepository, open_plan_repository
+from travel_agent.lifecycle.service import PlanLifecycleService
+from travel_agent.lifecycle.workflow import build_lifecycle_workflow
 from travel_agent.planning.defaults import POIDefaultPolicy
 from travel_agent.planning.policy import PlanningPolicy
 from travel_agent.tools.gateway import ToolGateway, build_gateway
@@ -64,7 +76,14 @@ class PlanningRuntime:
     critic_model: CriticModel | None = None
     critic_gateway: CriticGateway | None = None
     critic_model_client: Any | None = None
+    edit_model: EditModel | None = None
+    edit_gateway: EditGateway | None = None
+    edit_model_client: Any | None = None
+    plan_repository: PlanRepository | None = None
+    lifecycle_workflow: CompiledStateGraph | None = None
+    lifecycle_service: PlanLifecycleService | None = None
     checkpoint_context: Any | None = field(default=None, repr=False)
+    repository_context: Any | None = field(default=None, repr=False)
     resume_locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -73,8 +92,11 @@ class PlanningRuntime:
         client: httpx.AsyncClient | None = None
         model_client: Any | None = None
         critic_model_client: Any | None = None
+        edit_model_client: Any | None = None
         checkpoint_context: Any | None = None
+        repository_context: Any | None = None
         checkpoint_entered = False
+        repository_entered = False
         try:
             if settings.provider is ProviderMode.MOCK:
                 poi_provider: POIProvider = MockPOIProvider()
@@ -232,6 +254,77 @@ class PlanningRuntime:
                 planning_workflow=workflow,
                 checkpointer=requirement_checkpointer,
             )
+            if settings.edit_provider is EditProviderMode.MOCK:
+                edit_model: EditModel = MockEditModel()
+            else:
+                try:
+                    from openai import AsyncOpenAI
+                except ImportError as error:
+                    extra = (
+                        "llm-openai"
+                        if settings.edit_provider is EditProviderMode.OPENAI
+                        else "llm-deepseek"
+                    )
+                    raise RuntimeError(
+                        f"Install the {extra} extra to use "
+                        f"EDIT_PROVIDER={settings.edit_provider.value}"
+                    ) from error
+                if settings.edit_provider is EditProviderMode.OPENAI:
+                    assert settings.openai_api_key is not None
+                    edit_model_client = AsyncOpenAI(
+                        api_key=settings.openai_api_key,
+                        timeout=settings.edit_timeout_seconds,
+                        max_retries=0,
+                    )
+                    edit_model = OpenAIEditModel(
+                        client=edit_model_client, model=settings.edit_model
+                    )
+                else:
+                    assert settings.deepseek_api_key is not None
+                    edit_model_client = AsyncOpenAI(
+                        api_key=settings.deepseek_api_key,
+                        base_url=settings.deepseek_base_url,
+                        timeout=settings.edit_timeout_seconds,
+                        max_retries=0,
+                    )
+                    edit_model = DeepSeekEditModel(
+                        client=edit_model_client,
+                        model=settings.edit_model,
+                        max_tokens=settings.edit_max_output_tokens,
+                    )
+            edit_gateway = EditGateway(
+                model=edit_model,
+                timeout_seconds=settings.edit_timeout_seconds,
+                max_attempts=settings.edit_max_attempts,
+            )
+            repository_context = open_plan_repository(
+                backend=settings.checkpoint_backend.value,
+                sqlite_path=settings.plan_sqlite_path,
+            )
+            plan_repository = await repository_context.__aenter__()
+            repository_entered = True
+            lifecycle_workflow = build_lifecycle_workflow(
+                repository=plan_repository,
+                tool_gateway=gateway,
+                edit_gateway=edit_gateway,
+                planning_policy=policy,
+                poi_default_policy=defaults,
+                critic_gateway=critic_gateway,
+                critic_policy=critic_policy,
+                evidence_budget=EvidenceBudget(
+                    max_candidates=1,
+                    max_input_chars=settings.critic_max_input_chars,
+                ),
+                max_affected_days=settings.plan_max_affected_days,
+                max_versions=settings.plan_max_versions,
+                checkpointer=requirement_checkpointer,
+            )
+            lifecycle_service = PlanLifecycleService(
+                repository=plan_repository,
+                planning_workflow=workflow,
+                lifecycle_workflow=lifecycle_workflow,
+                requirement_workflow=requirement_workflow,
+            )
             return cls(
                 poi_provider=poi_provider,
                 route_provider=route_provider,
@@ -245,9 +338,18 @@ class PlanningRuntime:
                 critic_model=critic_model,
                 critic_gateway=critic_gateway,
                 critic_model_client=critic_model_client,
+                edit_model=edit_model,
+                edit_gateway=edit_gateway,
+                edit_model_client=edit_model_client,
+                plan_repository=plan_repository,
+                lifecycle_workflow=lifecycle_workflow,
+                lifecycle_service=lifecycle_service,
                 checkpoint_context=checkpoint_context,
+                repository_context=repository_context,
             )
         except BaseException:
+            if repository_context is not None and repository_entered:
+                await repository_context.__aexit__(None, None, None)
             if checkpoint_context is not None and checkpoint_entered:
                 await checkpoint_context.__aexit__(None, None, None)
             if model_client is not None:
@@ -257,6 +359,12 @@ class PlanningRuntime:
                 and critic_model_client is not model_client
             ):
                 await critic_model_client.close()
+            if (
+                edit_model_client is not None
+                and edit_model_client is not model_client
+                and edit_model_client is not critic_model_client
+            ):
+                await edit_model_client.close()
             if client is not None:
                 await client.aclose()
             raise
@@ -269,8 +377,16 @@ class PlanningRuntime:
             and self.critic_model_client is not self.model_client
         ):
             await self.critic_model_client.close()
+        if (
+            self.edit_model_client is not None
+            and self.edit_model_client is not self.model_client
+            and self.edit_model_client is not self.critic_model_client
+        ):
+            await self.edit_model_client.close()
         if self.client is not None:
             await self.client.aclose()
+        if self.repository_context is not None:
+            await self.repository_context.__aexit__(None, None, None)
         if self.checkpoint_context is not None:
             await self.checkpoint_context.__aexit__(None, None, None)
 
@@ -308,3 +424,46 @@ class PlanningRuntime:
                 request,
                 thread_id=thread_id,
             )
+
+    async def create_plan_session(
+        self, request: PlanningRequest, *, session_id: str
+    ) -> PlanSessionResponse:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.create(request, session_id=session_id)
+
+    async def create_plan_session_from_text(
+        self, request: NaturalPlanningRequest, *, session_id: str
+    ) -> PlanSessionResponse:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.create_from_text(
+            request, session_id=session_id
+        )
+
+    async def resume_plan_session(
+        self, request: LifecycleResumeRequest, *, session_id: str
+    ) -> PlanSessionResponse:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.resume(session_id, request)
+
+    async def get_plan_session(self, *, session_id: str) -> PlanSessionResponse:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.get(session_id)
+
+    async def get_plan_versions(self, *, session_id: str):
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.versions(session_id)
+
+    async def get_plan_version(self, *, session_id: str, version_id: str):
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.version(session_id, version_id)
+
+    async def get_plan_diff(self, *, session_id: str, from_id: str, to_id: str):
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.diff(session_id, from_id, to_id)

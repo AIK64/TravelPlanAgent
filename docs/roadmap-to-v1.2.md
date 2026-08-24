@@ -1,7 +1,7 @@
-# Travel Agent v0.7 → v1.2 迭代路线
+# Travel Agent v0.8 → v1.2 迭代路线
 
 > 状态：当前唯一权威版本路线  
-> 当前基线：v0.7.0（已完成）
+> 当前基线：v0.8.0（已完成）
 > 决策日期：2026-08-24
 
 ## 1. 路线决策
@@ -12,7 +12,7 @@
 2. `v1.1` 增加 Preference Memory、上下文裁剪、跨会话个性化及 Memory 消融实验。
 3. `v1.2` 增加 Travel MCP Server、备用 Provider、完整前端和生产化部署。
 
-v0.7 已完成。从当前 v0.7.0 到 v1.0 还需三个迭代：`v0.8`、`v0.9` 和 `v1.0`。完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
+v0.8 已完成。从当前 v0.8.0 到 v1.0 还需两个迭代：`v0.9` 和 `v1.0`。完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
 
 多 Agent 不作为强制版本目标。只有当某项职责确实需要独立推理上下文、独立决策循环或独立运行预算，并且消融实验能证明它优于单 Graph/Subgraph，才允许升级为 Agent。地图查询、时间计算、约束验证、缓存和 Provider 适配器始终是工具或确定性服务，不为“多 Agent”标签进行包装。
 
@@ -45,7 +45,7 @@ v1.0 应能稳定演示以下轨迹：
 | v0.5（已完成） | 违规驱动的局部自修复 | `Validate → Critic → RepairPlan → LocalReplan → Revalidate` | Replanning Locality、路线复用率、轨迹测试 |
 | v0.6（已完成） | 约束优化与真实路线质量 | `BuildProblem → Optimize → Materialize → Validate` | 路线效率、求解终止、优化器消融 |
 | v0.7（已完成） | Grounded LLM Soft Critic | `HardValidate → SoftCritic → EvidenceGuard → QualityGate` | Grounding 准确率、软约束评测、Provider 降级轨迹 |
-| v0.8 | 计划生命周期 HITL | `Select/Change → Interrupt → Impact → LocalReplan → Version` | 锁定项不变、V1/V2 Diff、重启恢复 |
+| v0.8（已完成） | 计划生命周期 HITL | `Select/Change → Interrupt → Impact → LocalReplan → Version` | 锁定项不变、V1/V2 Diff、重启恢复 |
 | v0.9 | 天气事件驱动重规划 | `WeatherEvent → ImpactAnalyzer → LocalReplan` | 事件幂等性、affected-days 保持率、故障语义 |
 | v1.0 | 评测驱动的核心 Agent 发布 | 统一 ExecutionBudget、Trace 和回归门禁 | 100+ Benchmark、Baseline、消融、故障注入 |
 | v1.1 | 长期 Preference Memory | `Retrieve → ComposeContext → Plan → Propose → Confirm → Persist` | 跨会话测试、上下文预算、Memory 消融 |
@@ -215,29 +215,30 @@ hard_validate
 
 ## 7. v0.8：计划生命周期与 HITL
 
+详细实现规格见 [v0.8 计划生命周期 HITL 设计报告](v0.8/design.md)。
+
 ### 7.1 Agent 能力
 
 在计划生成后支持用户选择候选、锁定项目、提交自然语言修改，并通过 Interrupt/Resume 审批影响范围和生成新版本。
 
 ### 7.2 State、Node、Edge
 
-新增：
+已实现：
 
-- `PlanVersion`、`PlanLock`、`PlanChangeRequest`、`ChangePatch`、`ImpactResult`、`PlanDiff`。
+- `PlanVersion`、`PlanPreview`、`PlanLock`、`EditPatch`、`ImpactResult`、`PlanDiff`。
 - 当前版本号、父版本、锁定项、待审批变更和幂等 request ID。
 
 Graph：
 
 ```text
-await_candidate_selection
-  → persist_plan_v1
-  → await_change_request
-  → parse_change_patch
+await_user_action
+  → dispatch_action
+  → select_candidate / change_lock / parse_edit
   → analyze_change_impact
-  → await_change_approval
-  → apply_local_change
-  → validate_global_constraints
-  → persist_new_version
+  → build_local_preview
+  → await_user_action (Preview Approval Interrupt)
+  → resolve_approval
+  → commit V2 / reject Preview
 ```
 
 ### 7.3 持久化与边界
@@ -249,7 +250,9 @@ await_candidate_selection
 
 ### 7.4 Trace 与验收
 
-完成标准：服务重启后可恢复待选择或待审批任务；修改 Day 2 时其他日期和锁定项保持不变；PlanDiff 能说明新增、删除、移动、时间和路线变化。
+已完成服务重启恢复、候选选择、日期/项目锁、自然语言与结构化编辑、编辑澄清、局部 Route Delta、Preview 审批、V2 CAS 提交、拒绝不改 V1、旧 Interrupt 冲突和 request ID 幂等。PlanDiff 可说明新增、删除、移动、重排、时间、路线与日期指标变化。
+
+2026-08-24 本机全 Mock 验收共收集 372 项测试，370 项通过、2 项 Live Smoke 跳过，总覆盖率 90.03%。15 条生命周期 Fixture 的 Intent、Grounding、Impact、锁定保持、未影响日期保持、Diff、Commit、幂等和有界终止指标均为 100%，硬约束回归为 0%，标注路线复用率为 36.84%。Fixture 结果用于确定性回归，不作为真实 DeepSeek 线上准确率声明。
 
 ## 8. v0.9：天气事件驱动重规划
 
@@ -484,16 +487,16 @@ MCP 工具具有明确输入输出 Schema、权限、错误码、幂等规则、
 
 ## 15. 当前下一步
 
-当前下一迭代进入 v0.8：计划生命周期 HITL。下一版设计应以用户选择、锁定、编辑审批、局部 Impact Analysis 和 Plan V1/V2 Diff 为核心，并复用 v0.7 的硬/软评价边界。
+当前下一迭代进入 v0.9：天气事件驱动重规划。下一版设计应以标准化 `WeatherSnapshot`、稳定 `ChangeEvent`、事件幂等和 affected-days Impact Analysis 为核心，并复用 v0.8 的锁、Preview、审批、局部重规划和版本 Diff。
 
 ```text
-Completed Plan
-  → User Select / Lock / Edit Intent
-  → Interrupt / Approval
-  → Impact Analysis
+Active Plan Version
+  → Weather Tool / ChangeEvent
+  → Event Deduplication
+  → Impact Analysis / Lock Conflict
   → Local Replan
   → Hard Validate / Soft Critic
-  → Plan Version + Local Diff
+  → Preview / Approval / New Version
 ```
 
-在 v0.8 验收完成前，不提前实现天气、Memory、MCP 或前端；用户编辑也不得绕过 Hard Validator、Grounding Gate 或局部性守卫。
+在 v0.9 验收完成前，不提前实现 Memory、MCP 或前端；天气事件也不得绕过用户锁、Hard Validator、Grounding Gate、局部性守卫或版本提交语义。

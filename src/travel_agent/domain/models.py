@@ -175,6 +175,8 @@ class POIResolutionIssue(BaseModel):
 
 
 class PlanItem(BaseModel):
+    # 一次性规划保持向后兼容；进入 v0.8 生命周期时由版本层补齐稳定 ID。
+    item_id: str | None = None
     type: ItemType
     name: str
     start_at: datetime

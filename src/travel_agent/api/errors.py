@@ -11,6 +11,12 @@ from travel_agent.requirements.errors import (
     ClarificationResumeConflictError,
     ClarificationThreadNotFoundError,
 )
+from travel_agent.edits.errors import EditUnavailableError
+from travel_agent.lifecycle.errors import (
+    LifecycleActionError,
+    LifecycleConflictError,
+    LifecycleNotFoundError,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -85,3 +91,36 @@ async def clarification_conflict_exception_handler(
         detail["code"],
     )
     return UTF8JSONResponse(status_code=409, content={"detail": detail})
+
+
+async def edit_unavailable_exception_handler(
+    _request: Request, error: EditUnavailableError
+) -> UTF8JSONResponse:
+    detail = error.safe_detail()
+    logger.error(
+        "api.edit_unavailable session_id=%s provider=%s model=%s code=%s",
+        detail["session_id"],
+        detail["provider"],
+        detail["model"],
+        detail["code"],
+    )
+    return UTF8JSONResponse(status_code=503, content={"detail": detail})
+
+
+async def lifecycle_not_found_exception_handler(
+    _request: Request, error: LifecycleNotFoundError
+) -> UTF8JSONResponse:
+    return UTF8JSONResponse(status_code=404, content={"detail": error.safe_detail()})
+
+
+async def lifecycle_conflict_exception_handler(
+    _request: Request, error: LifecycleConflictError
+) -> UTF8JSONResponse:
+    return UTF8JSONResponse(status_code=409, content={"detail": error.safe_detail()})
+
+
+async def lifecycle_action_exception_handler(
+    _request: Request, error: LifecycleActionError
+) -> UTF8JSONResponse:
+    status_code = 409 if error.code in {"lock_conflict"} else 422
+    return UTF8JSONResponse(status_code=status_code, content={"detail": error.safe_detail()})

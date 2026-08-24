@@ -12,6 +12,10 @@ from travel_agent.api.errors import (
     clarification_not_found_exception_handler,
     tool_unavailable_exception_handler,
     requirement_unavailable_exception_handler,
+    edit_unavailable_exception_handler,
+    lifecycle_action_exception_handler,
+    lifecycle_conflict_exception_handler,
+    lifecycle_not_found_exception_handler,
 )
 from travel_agent.api.routes import router
 from travel_agent.config import Settings
@@ -22,6 +26,12 @@ from travel_agent.requirements.errors import RequirementUnavailableError
 from travel_agent.requirements.errors import (
     ClarificationResumeConflictError,
     ClarificationThreadNotFoundError,
+)
+from travel_agent.edits.errors import EditUnavailableError
+from travel_agent.lifecycle.errors import (
+    LifecycleActionError,
+    LifecycleConflictError,
+    LifecycleNotFoundError,
 )
 
 
@@ -70,6 +80,16 @@ def create_app(
     app.add_exception_handler(
         ClarificationResumeConflictError,
         clarification_conflict_exception_handler,
+    )
+    app.add_exception_handler(EditUnavailableError, edit_unavailable_exception_handler)
+    app.add_exception_handler(
+        LifecycleNotFoundError, lifecycle_not_found_exception_handler
+    )
+    app.add_exception_handler(
+        LifecycleConflictError, lifecycle_conflict_exception_handler
+    )
+    app.add_exception_handler(
+        LifecycleActionError, lifecycle_action_exception_handler
     )
     app.include_router(router)
     return app
