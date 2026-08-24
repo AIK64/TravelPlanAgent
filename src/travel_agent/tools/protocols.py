@@ -19,3 +19,6 @@ class RouteProvider(Protocol):
 
     async def get_driving_route(self, query: RouteQuery) -> RouteResult:
         raise NotImplementedError
+
+    async def get_walking_route(self, query: RouteQuery) -> RouteResult:
+        raise NotImplementedError

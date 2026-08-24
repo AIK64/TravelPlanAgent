@@ -28,7 +28,9 @@ from travel_agent.domain.tool_models import (
     ToolResult,
 )
 from travel_agent.graph.workflow import build_workflow
+from travel_agent.planning.optimization import OptimizationTimeoutError
 from travel_agent.planning.defaults import POIDefaultPolicy
+from travel_agent.planning.policy import PlanningPolicy
 from travel_agent.domain.tool_models import UnknownFactPolicy
 from travel_agent.tools.cache import AsyncTTLCache
 from travel_agent.tools.errors import ToolUnavailableError
@@ -91,6 +93,17 @@ class RecordingMockRouteProvider(MockRouteProvider):
         self.calls.append(query)
         return await super().get_driving_route(query)
 
+    async def get_walking_route(self, query: RouteQuery) -> RouteResult:
+        self.calls.append(query)
+        return await super().get_walking_route(query)
+
+
+class ForcedFallbackOptimizer:
+    name = "forced-timeout-for-repair-regression"
+
+    def solve(self, _problem):
+        raise OptimizationTimeoutError("forced fallback")
+
 
 @dataclass(frozen=True)
 class WorkflowHarness:
@@ -145,6 +158,32 @@ def workflow_harness() -> WorkflowHarness:
 @pytest.fixture
 def mock_workflow(workflow_harness):
     return workflow_harness.workflow
+
+
+@pytest.fixture
+def fallback_workflow_harness() -> WorkflowHarness:
+    poi_provider = RecordingMockPOIProvider()
+    route_provider = RecordingMockRouteProvider()
+    gateway = make_gateway(
+        poi_provider=poi_provider,
+        route_provider=route_provider,
+    )
+    return WorkflowHarness(
+        workflow=build_workflow(
+            gateway,
+            POIDefaultPolicy(UnknownFactPolicy.ASSUME_WITH_WARNING),
+            PlanningPolicy(use_real_walking_routes=False),
+            optimizer=ForcedFallbackOptimizer(),
+        ),
+        gateway=gateway,
+        poi_provider=poi_provider,
+        route_provider=route_provider,
+    )
+
+
+@pytest.fixture
+def fallback_workflow(fallback_workflow_harness):
+    return fallback_workflow_harness.workflow
 
 
 @pytest.fixture

@@ -50,8 +50,10 @@ async def test_info_logs_show_planning_flow(caplog, hangzhou_trip, mock_workflow
         "node.started",
         "search_plan.created",
         "poi_context.loaded",
-        "candidate_drafts.prepared",
-        "routes.loaded",
+        "route_matrix.loaded",
+        "optimization.problem_built",
+        "optimization.started",
+        "optimization.completed",
         "candidate.generated",
         "candidate.validated",
         "routing.decision",
@@ -96,7 +98,7 @@ async def test_debug_logs_include_candidate_day_summaries(
 
 
 @pytest.mark.asyncio
-async def test_info_logs_show_replan_to_infeasible_flow(
+async def test_info_logs_show_critic_hard_conflict_to_infeasible_flow(
     caplog,
     hangzhou_trip,
     mock_workflow,
@@ -114,16 +116,24 @@ async def test_info_logs_show_replan_to_infeasible_flow(
 
     messages = [record.getMessage() for record in caplog.records]
     assert any(
-        message.startswith("routing.decision") and "next=replan" in message
+        message.startswith("routing.decision")
+        and "next=select_repair_target" in message
         for message in messages
     )
-    assert any(message.startswith("replan.round_started") for message in messages)
-    assert any(message.startswith("replan.completed") for message in messages)
+    assert any(message.startswith("repair.target.selected") for message in messages)
     assert any(
-        message.startswith("routing.decision") and "next=mark_infeasible" in message
+        message.startswith("critic.completed")
+        and "repairable=false" in message
+        and "terminal_reason=hard_constraint_conflict:budget" in message
         for message in messages
     )
-    assert any(message.startswith("planning.infeasible") for message in messages)
+    assert not any(message.startswith("repair.plan.created") for message in messages)
+    assert not any(message.startswith("replan.completed") for message in messages)
+    assert any(
+        message.startswith("planning.infeasible")
+        and "reason=hard_constraint_conflict:budget" in message
+        for message in messages
+    )
     assert any(
         message.startswith("planning.completed") and "status=infeasible" in message
         for message in messages

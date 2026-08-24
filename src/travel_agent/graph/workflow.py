@@ -18,8 +18,16 @@ from travel_agent.domain.models import (
     TripSpec,
     ValidationStatus,
 )
+from travel_agent.domain.optimization_models import (
+    OptimizationBudget,
+    OptimizationProblem,
+    OptimizationResult,
+    OptimizationSolveStatus,
+)
+from travel_agent.domain.repair_models import RepairAttempt, RepairOutcome
 from travel_agent.domain.tool_models import (
     POIFacts,
+    RouteQuery,
     ToolCallContext,
     ToolExecutionSummary,
     ToolResult,
@@ -28,11 +36,29 @@ from travel_agent.domain.tool_models import (
 from travel_agent.graph.state import TravelState
 from travel_agent.planning.defaults import POIDefaultPolicy
 from travel_agent.planning.drafts import (
-    collect_route_queries,
+    CandidateDraft,
     prepare_candidate_drafts,
 )
+from travel_agent.planning.critic import (
+    analyze_candidate,
+    error_violations,
+    select_repair_target as choose_repair_target,
+    violation_fingerprint,
+)
+from travel_agent.planning.impact import collect_route_delta, day_fingerprint
 from travel_agent.planning.planner import materialize_candidates
+from travel_agent.planning.optimization import (
+    ORToolsOptimizationSolver,
+    OptimizationSolver,
+    OptimizationTimeoutError,
+    build_optimization_problem as create_optimization_problem,
+    collect_route_matrix_queries,
+    degraded_result,
+    drafts_from_optimization,
+    select_optimization_pois,
+)
 from travel_agent.planning.policy import PlanningPolicy
+from travel_agent.planning.repair import apply_repair_plan, build_repair_plan
 from travel_agent.planning.search_plan import build_search_plan as create_search_plan
 from travel_agent.planning.validator import validate_candidate
 from travel_agent.tools.errors import ToolUnavailableError
@@ -54,6 +80,22 @@ _CHECKPOINT_ALLOWED_TYPES = (
     ("travel_agent.domain.models", "TripSpec"),
     ("travel_agent.domain.models", "ValidationStatus"),
     ("travel_agent.domain.models", "ViolationSeverity"),
+    ("travel_agent.domain.optimization_models", "ObjectiveBreakdown"),
+    ("travel_agent.domain.optimization_models", "ObjectiveWeights"),
+    ("travel_agent.domain.optimization_models", "OptimizationBudget"),
+    ("travel_agent.domain.optimization_models", "OptimizationDayAssignment"),
+    ("travel_agent.domain.optimization_models", "OptimizationPOI"),
+    ("travel_agent.domain.optimization_models", "OptimizationProblem"),
+    ("travel_agent.domain.optimization_models", "OptimizationResult"),
+    ("travel_agent.domain.optimization_models", "OptimizationSolution"),
+    ("travel_agent.domain.optimization_models", "OptimizationSolveStatus"),
+    ("travel_agent.domain.optimization_models", "RouteMatrixEntry"),
+    ("travel_agent.domain.repair_models", "CriticReport"),
+    ("travel_agent.domain.repair_models", "RepairAction"),
+    ("travel_agent.domain.repair_models", "RepairActionKind"),
+    ("travel_agent.domain.repair_models", "RepairAttempt"),
+    ("travel_agent.domain.repair_models", "RepairOutcome"),
+    ("travel_agent.domain.repair_models", "RepairPlan"),
     ("travel_agent.domain.tool_models", "POIFacts"),
     ("travel_agent.domain.tool_models", "POISearchQuery"),
     ("travel_agent.domain.tool_models", "RouteMode"),
@@ -192,15 +234,16 @@ def select_best_candidate(candidates: list[PlanCandidate]) -> PlanCandidate:
 
 def route_after_validation(
     state: TravelState,
-) -> Literal["select_best", "replan", "mark_infeasible"]:
+) -> Literal["select_best", "select_repair_target", "mark_infeasible"]:
     deliverable = _deliverable_candidates(state)
     if deliverable:
         next_node = "select_best"
     elif (
-        state["planning_pois"]
+        state["repair_terminal_reason"] is None
+        and state["planning_pois"]
         and state["iterations"] < state["max_replan_rounds"]
     ):
-        next_node = "replan"
+        next_node = "select_repair_target"
     else:
         next_node = "mark_infeasible"
     logger.info(
@@ -215,10 +258,45 @@ def route_after_validation(
     return next_node
 
 
+def route_after_critic(
+    state: TravelState,
+) -> Literal["build_repair_plan", "mark_infeasible"]:
+    report = state["critic_report"]
+    return (
+        "build_repair_plan"
+        if report is not None and report.repairable
+        else "mark_infeasible"
+    )
+
+
+def route_after_repair_plan(
+    state: TravelState,
+) -> Literal["apply_local_repair", "mark_infeasible"]:
+    return (
+        "apply_local_repair"
+        if state["repair_plan"] is not None
+        and state["repair_terminal_reason"] is None
+        else "mark_infeasible"
+    )
+
+
+def route_after_delta_routes(
+    state: TravelState,
+) -> Literal["load_delta_routes", "materialize_candidates"]:
+    return (
+        "load_delta_routes"
+        if state["delta_route_queries"]
+        else "materialize_candidates"
+    )
+
+
 def build_workflow(
     gateway: ToolGateway,
     defaults: POIDefaultPolicy,
     policy: PlanningPolicy = PlanningPolicy(),
+    *,
+    optimizer: OptimizationSolver | None = None,
+    optimization_budget: OptimizationBudget = OptimizationBudget(),
 ) -> CompiledStateGraph:
     """构建只通过注入 ToolGateway 获取外部事实的异步规划图。"""
 
@@ -326,38 +404,21 @@ def build_workflow(
             "status": "poi_context_loaded",
         }
 
-    def prepare_drafts(state: TravelState) -> dict:
-        _log_node_started(state, "prepare_candidate_drafts")
-        planning_round = _planning_round(state)
-        drafts = prepare_candidate_drafts(
-            state["trip"],
-            state["planning_pois"],
-            replan_round=planning_round,
-        )
-        logger.info(
-            "candidate_drafts.prepared | thread_id=%s round=%s draft_count=%s",
-            state["thread_id"],
-            planning_round,
-            len(drafts),
-        )
-        _log_node_completed(
-            state,
-            "prepare_candidate_drafts",
-            "candidate_drafts_prepared",
-            draft_count=len(drafts),
-        )
-        return {
-            "candidate_drafts": drafts,
-            "status": "candidate_drafts_prepared",
-        }
+    active_optimizer = optimizer or ORToolsOptimizationSolver()
 
-    async def load_routes(state: TravelState) -> dict:
-        _log_node_started(state, "load_routes")
-        queries = collect_route_queries(
+    async def build_route_matrix(state: TravelState) -> dict:
+        _log_node_started(state, "build_route_matrix")
+        optimization_pois = select_optimization_pois(
             state["trip"],
-            state["candidate_drafts"],
             state["planning_pois"],
-            route_strategy=policy.route_strategy,
+            optimization_budget,
+        )
+        queries = collect_route_matrix_queries(
+            state["trip"],
+            optimization_pois,
+            modes=policy.route_modes,
+            strategy=policy.route_strategy,
+            max_walking_leg_meters=policy.max_walking_leg_meters,
         )
         results = await gateway.get_routes(
             queries,
@@ -371,46 +432,181 @@ def build_workflow(
             assert result.data is not None
             routes[key] = result.data
         summaries = [
-            _tool_summary(result, "route.get_driving")
+            _tool_summary(
+                result,
+                f"route.get_{result.data.mode.value}" if result.data else "route.get",
+            )
             for result in results.values()
         ]
+        cache_hits = sum(result.cache_hit for result in results.values())
+        provider_calls = len(results) - cache_hits
         logger.info(
-            "routes.loaded | thread_id=%s round=%s query_count=%s route_count=%s",
+            "route_matrix.loaded | thread_id=%s mode=%s poi_count=%s "
+            "query_count=%s route_count=%s cache_hits=%s provider_calls=%s",
             state["thread_id"],
-            _planning_round(state),
+            "+".join(mode.value for mode in policy.route_modes),
+            len(optimization_pois),
             len(queries),
             len(routes),
+            cache_hits,
+            provider_calls,
         )
         _log_node_completed(
             state,
-            "load_routes",
-            "routes_loaded",
+            "build_route_matrix",
+            "route_matrix_loaded",
             route_count=len(routes),
         )
         return {
+            "optimization_pois": optimization_pois,
             "route_queries": queries,
+            "delta_route_queries": [],
             "route_results": routes,
+            "reused_route_keys": [],
+            "last_route_loaded_count": len(routes),
+            "last_route_reused_count": 0,
+            "route_matrix_cache_hits": cache_hits,
+            "route_matrix_provider_calls": provider_calls,
             "tool_summaries": [*state["tool_summaries"], *summaries],
-            "status": "routes_loaded",
+            "status": "route_matrix_loaded",
         }
 
-    def materialize(state: TravelState) -> dict:
-        _log_node_started(state, "materialize_candidates")
+    def build_optimization_problem(state: TravelState) -> dict:
+        _log_node_started(state, "build_optimization_problem")
+        problem = create_optimization_problem(
+            state["trip"],
+            state["optimization_pois"],
+            state["route_results"],
+            optimization_budget,
+            modes=policy.route_modes,
+            strategy=policy.route_strategy,
+            max_walking_leg_meters=policy.max_walking_leg_meters,
+        )
+        logger.info(
+            "optimization.problem_built | thread_id=%s problem_id=%s "
+            "poi_count=%s route_count=%s day_count=%s mode=%s",
+            state["thread_id"],
+            problem.id,
+            len(problem.pois),
+            len(problem.route_matrix),
+            len(problem.dates),
+            "+".join(mode.value for mode in policy.route_modes),
+        )
+        _log_node_completed(
+            state,
+            "build_optimization_problem",
+            "optimization_problem_built",
+            poi_count=len(problem.pois),
+        )
+        return {
+            "optimization_problem": problem,
+            "status": "optimization_problem_built",
+        }
+
+    def solve_candidate_variants(state: TravelState) -> dict:
+        _log_node_started(state, "solve_candidate_variants")
+        problem = state["optimization_problem"]
+        if problem is None:
+            raise RuntimeError("optimization requires a problem")
+        logger.info(
+            "optimization.started | thread_id=%s problem_id=%s solver=%s "
+            "max_solve_ms=%s max_search_states=%s variants=%s",
+            state["thread_id"],
+            problem.id,
+            getattr(active_optimizer, "name", type(active_optimizer).__name__),
+            problem.budget.max_solve_ms,
+            problem.budget.max_search_states,
+            problem.budget.variant_count,
+        )
+        degraded_reason: str | None = None
+        started = perf_counter()
+        try:
+            result = active_optimizer.solve(problem)
+            if not result.solutions:
+                degraded_reason = "optimizer_infeasible"
+        except OptimizationTimeoutError:
+            result = None
+            degraded_reason = "optimizer_timeout"
+        if degraded_reason is not None:
+            fallback_drafts = prepare_candidate_drafts(
+                state["trip"],
+                state["optimization_pois"],
+                replan_round=0,
+            )
+            elapsed_ms = round((perf_counter() - started) * 1000, 2)
+            result = degraded_result(
+                fallback_drafts,
+                reason=degraded_reason,
+                elapsed_ms=elapsed_ms,
+            )
+            drafts = fallback_drafts
+            logger.warning(
+                "optimization.degraded | thread_id=%s problem_id=%s reason=%s "
+                "fallback=%s elapsed_ms=%s",
+                state["thread_id"],
+                problem.id,
+                degraded_reason,
+                result.solver,
+                result.elapsed_ms,
+            )
+        else:
+            assert result is not None
+            drafts = drafts_from_optimization(result)
+            objective_summary = ",".join(
+                f"{solution.style.value}:{solution.objective_value}"
+                for solution in result.solutions
+            )
+            logger.info(
+                "optimization.completed | thread_id=%s problem_id=%s status=%s "
+                "solver=%s solution_count=%s search_states=%s elapsed_ms=%s "
+                "objectives=%s",
+                state["thread_id"],
+                problem.id,
+                result.status.value,
+                result.solver,
+                len(result.solutions),
+                result.search_states,
+                result.elapsed_ms,
+                objective_summary or "none",
+            )
+        _log_node_completed(
+            state,
+            "solve_candidate_variants",
+            "optimization_solved",
+            solution_count=len(drafts),
+            degraded=str(result.status is OptimizationSolveStatus.DEGRADED).lower(),
+        )
+        return {
+            "optimization_result": result,
+            "candidate_drafts": drafts,
+            "status": "optimization_solved",
+        }
+
+    def _materialize(state: TravelState, node_name: str) -> dict:
+        _log_node_started(state, node_name)
         candidates = materialize_candidates(
             state["trip"],
             state["candidate_drafts"],
             state["planning_pois"],
             state["route_results"],
             route_strategy=policy.route_strategy,
+            route_modes=policy.route_modes,
+            max_walking_leg_meters=policy.max_walking_leg_meters,
         )
         _log_candidates(state, candidates)
         _log_node_completed(
             state,
-            "materialize_candidates",
+            node_name,
             "candidates_materialized",
             candidate_count=len(candidates),
         )
         return {"candidates": candidates, "status": "candidates_materialized"}
+
+    def materialize_optimized(state: TravelState) -> dict:
+        return _materialize(state, "materialize_optimized_candidates")
+
+    def materialize_repaired(state: TravelState) -> dict:
+        return _materialize(state, "materialize_candidates")
 
     def validate(state: TravelState) -> dict:
         _log_node_started(state, "validate_candidates")
@@ -467,11 +663,96 @@ def build_workflow(
         }
         pending_round = state["pending_replan_round"]
         if pending_round is not None:
+            report = state["critic_report"]
+            plan = state["repair_plan"]
+            if report is None or plan is None or len(validated) != 1:
+                raise RuntimeError("repair validation requires one candidate and repair context")
+            repaired = validated[0]
+            day_by_date = {day.date.isoformat(): day for day in repaired.days}
+            for day_text, expected_fingerprint in state[
+                "preserved_day_hashes"
+            ].items():
+                day = day_by_date.get(day_text)
+                if day is None or day_fingerprint(day) != expected_fingerprint:
+                    raise RuntimeError(
+                        f"local repair changed preserved day: {day_text}"
+                    )
+
+            after_fingerprint = violation_fingerprint(repaired)
+            after_errors = error_violations(repaired)
+            after_error_types = {violation.type for violation in after_errors}
+            resolved = repaired.validation.status in _DELIVERABLE_STATUSES
+            repeated_fingerprint = (
+                after_fingerprint == report.violation_fingerprint
+                or any(
+                    after_fingerprint
+                    in {
+                        attempt.before_violation_fingerprint,
+                        attempt.after_violation_fingerprint,
+                    }
+                    for attempt in state["repair_history"]
+                )
+            )
+            source_resolved = bool(
+                set(plan.source_violation_types) - after_error_types
+            )
+            improved = (
+                len(after_errors) < report.error_count
+                or (
+                    source_resolved
+                    and len(after_errors) <= report.error_count
+                )
+            )
+            terminal_reason: str | None = None
+            if resolved:
+                outcome = RepairOutcome.RESOLVED
+            elif repeated_fingerprint:
+                outcome = RepairOutcome.NO_PROGRESS
+                terminal_reason = "repeated_violation_fingerprint"
+            elif improved:
+                outcome = RepairOutcome.IMPROVED
+            else:
+                outcome = RepairOutcome.NO_PROGRESS
+                terminal_reason = "repair_no_progress"
+
+            attempt = RepairAttempt(
+                round=pending_round,
+                target_candidate_id=plan.target_candidate_id,
+                before_violation_fingerprint=report.violation_fingerprint,
+                after_violation_fingerprint=after_fingerprint,
+                before_error_count=report.error_count,
+                after_error_count=len(after_errors),
+                action_fingerprint=plan.action_fingerprint,
+                action_kinds=tuple(action.kind for action in plan.actions),
+                outcome=outcome,
+                affected_days=plan.affected_days,
+                preserved_day_count=len(plan.preserved_days),
+                reused_route_count=state["last_route_reused_count"],
+                loaded_route_count=state["last_route_loaded_count"],
+                terminal_reason=terminal_reason,
+            )
             update.update(
                 {
                     "iterations": pending_round,
                     "pending_replan_round": None,
+                    "repair_history": [*state["repair_history"], attempt],
+                    "repair_terminal_reason": terminal_reason,
                 }
+            )
+            logger.info(
+                "repair.validation.delta | thread_id=%s round=%s candidate_id=%s "
+                "before_errors=%s after_errors=%s outcome=%s affected_days=%s "
+                "preserved_days=%s reused_routes=%s loaded_routes=%s",
+                state["thread_id"],
+                pending_round,
+                repaired.id,
+                report.error_count,
+                len(after_errors),
+                outcome.value,
+                len(plan.affected_days),
+                len(plan.preserved_days),
+                state["last_route_reused_count"],
+                state["last_route_loaded_count"],
             )
             logger.info(
                 "replan.completed | thread_id=%s round=%s status=validated "
@@ -481,28 +762,286 @@ def build_workflow(
                 len(validated),
                 deliverable_count,
             )
+            if resolved or terminal_reason is not None:
+                logger.info(
+                    "repair.terminated | thread_id=%s round=%s outcome=%s reason=%s",
+                    state["thread_id"],
+                    pending_round,
+                    outcome.value,
+                    terminal_reason or "resolved",
+                )
         return update
 
-    def replan(state: TravelState) -> dict:
-        _log_node_started(state, "replan")
-        next_round = state["iterations"] + 1
+    def select_repair_target(state: TravelState) -> dict:
+        _log_node_started(state, "select_repair_target")
+        target = choose_repair_target(
+            state["candidates"], state["trip"], state["planning_pois"]
+        )
         logger.info(
-            "replan.round_started | thread_id=%s round=%s status=pending "
-            "strategy=reduce_density_low_cost",
+            "repair.target.selected | thread_id=%s candidate_id=%s "
+            "candidate_count=%s score=%s",
             state["thread_id"],
-            next_round,
+            target.id,
+            len(state["candidates"]),
+            target.score,
+        )
+        _log_node_completed(
+            state,
+            "select_repair_target",
+            "repair_target_selected",
+            candidate_id=target.id,
         )
         return {
-            "pending_replan_round": next_round,
-            "candidate_drafts": [],
+            "repair_target_candidate_id": target.id,
+            "critic_report": None,
+            "repair_plan": None,
+            "status": "repair_target_selected",
+        }
+
+    def analyze_violations(state: TravelState) -> dict:
+        _log_node_started(state, "analyze_violations")
+        target_id = state["repair_target_candidate_id"]
+        candidate = next(
+            candidate
+            for candidate in state["candidates"]
+            if candidate.id == target_id
+        )
+        report = analyze_candidate(
+            candidate, state["trip"], state["planning_pois"]
+        )
+        logger.info(
+            "critic.completed | thread_id=%s candidate_id=%s errors=%s "
+            "warnings=%s violation_types=%s affected_days=%s repairable=%s "
+            "terminal_reason=%s",
+            state["thread_id"],
+            candidate.id,
+            report.error_count,
+            report.warning_count,
+            ",".join(report.violation_types) or "none",
+            len(report.affected_days),
+            str(report.repairable).lower(),
+            report.terminal_reason or "none",
+        )
+        _log_node_completed(
+            state,
+            "analyze_violations",
+            "violations_analyzed",
+            repairable=str(report.repairable).lower(),
+        )
+        return {
+            "critic_report": report,
+            "repair_terminal_reason": report.terminal_reason,
+            "status": "violations_analyzed",
+        }
+
+    def create_repair_plan(state: TravelState) -> dict:
+        _log_node_started(state, "build_repair_plan")
+        target_id = state["repair_target_candidate_id"]
+        candidate = next(
+            candidate
+            for candidate in state["candidates"]
+            if candidate.id == target_id
+        )
+        draft = next(
+            draft
+            for draft in state["candidate_drafts"]
+            if draft.id == target_id
+        )
+        next_round = state["iterations"] + 1
+        report = state["critic_report"]
+        if report is None:
+            raise RuntimeError("repair plan requires critic report")
+        plan, terminal_reason = build_repair_plan(
+            state["trip"],
+            candidate,
+            draft,
+            state["planning_pois"],
+            report,
+            repair_round=next_round,
+        )
+        if plan is not None and any(
+            attempt.action_fingerprint == plan.action_fingerprint
+            for attempt in state["repair_history"]
+        ):
+            terminal_reason = "repeated_repair_action"
+            plan = None
+        logger.info(
+            "repair.plan.created | thread_id=%s round=%s candidate_id=%s "
+            "action_count=%s action_types=%s affected_days=%s status=%s reason=%s",
+            state["thread_id"],
+            next_round,
+            candidate.id,
+            len(plan.actions) if plan else 0,
+            (
+                ",".join(action.kind.value for action in plan.actions)
+                if plan
+                else "none"
+            ),
+            len(plan.affected_days) if plan else 0,
+            "ready" if plan else "unavailable",
+            terminal_reason or "none",
+        )
+        _log_node_completed(
+            state,
+            "build_repair_plan",
+            "repair_plan_ready" if plan else "repair_unavailable",
+        )
+        return {
+            "repair_plan": plan,
+            "repair_terminal_reason": terminal_reason,
+            "status": "repair_plan_ready" if plan else "repair_unavailable",
+        }
+
+    def apply_local_repair(state: TravelState) -> dict:
+        _log_node_started(state, "apply_local_repair")
+        target_id = state["repair_target_candidate_id"]
+        candidate = next(
+            candidate
+            for candidate in state["candidates"]
+            if candidate.id == target_id
+        )
+        draft = next(
+            draft
+            for draft in state["candidate_drafts"]
+            if draft.id == target_id
+        )
+        plan = state["repair_plan"]
+        if plan is None:
+            raise RuntimeError("local repair requires repair plan")
+        repaired_draft, applied_plan = apply_repair_plan(
+            state["trip"],
+            draft,
+            state["planning_pois"],
+            plan,
+            route_strategy=policy.route_strategy,
+            route_modes=policy.route_modes,
+            max_walking_leg_meters=policy.max_walking_leg_meters,
+        )
+        preserved_hashes = {
+            day.date.isoformat(): day_fingerprint(day)
+            for day in candidate.days
+            if day.date in applied_plan.preserved_days
+        }
+        logger.info(
+            "repair.action.applied | thread_id=%s round=%s candidate_id=%s "
+            "repaired_candidate_id=%s action_count=%s affected_days=%s "
+            "preserved_days=%s",
+            state["thread_id"],
+            applied_plan.round,
+            candidate.id,
+            repaired_draft.id,
+            len(applied_plan.actions),
+            len(applied_plan.affected_days),
+            len(applied_plan.preserved_days),
+        )
+        logger.info(
+            "repair.routes.invalidated | thread_id=%s round=%s route_count=%s",
+            state["thread_id"],
+            applied_plan.round,
+            len(applied_plan.invalidated_route_keys),
+        )
+        _log_node_completed(
+            state,
+            "apply_local_repair",
+            "local_repair_applied",
+            candidate_id=repaired_draft.id,
+        )
+        return {
+            "pending_replan_round": applied_plan.round,
+            "candidate_drafts": [repaired_draft],
             "route_queries": [],
-            "route_results": {},
+            "delta_route_queries": [],
+            "reused_route_keys": [],
             "candidates": [],
             "selected_plan": None,
-            "status": "replan_pending",
+            "repair_plan": applied_plan,
+            "preserved_day_hashes": preserved_hashes,
+            "last_route_loaded_count": 0,
+            "last_route_reused_count": 0,
+            "status": "local_repair_applied",
             "message": (
-                f"第 {next_round} 轮重规划：降低活动密度并优先低成本地点"
+                f"第 {applied_plan.round} 轮局部修复："
+                f"影响 {len(applied_plan.affected_days)} 个日期"
             ),
+        }
+
+    def collect_delta_routes(state: TravelState) -> dict:
+        _log_node_started(state, "collect_delta_routes")
+        draft = state["candidate_drafts"][0]
+        delta = collect_route_delta(
+            state["trip"],
+            draft,
+            state["planning_pois"],
+            state["route_results"],
+            route_strategy=policy.route_strategy,
+            route_modes=policy.route_modes,
+            max_walking_leg_meters=policy.max_walking_leg_meters,
+        )
+        logger.info(
+            "repair.routes.reused | thread_id=%s round=%s required=%s "
+            "reused=%s missing=%s",
+            state["thread_id"],
+            state["pending_replan_round"],
+            len(delta.required_queries),
+            len(delta.reused_route_keys),
+            len(delta.missing_queries),
+        )
+        _log_node_completed(
+            state,
+            "collect_delta_routes",
+            "delta_routes_collected",
+            reused=len(delta.reused_route_keys),
+            missing=len(delta.missing_queries),
+        )
+        return {
+            "route_queries": list(delta.required_queries),
+            "delta_route_queries": list(delta.missing_queries),
+            "reused_route_keys": list(delta.reused_route_keys),
+            "last_route_reused_count": len(delta.reused_route_keys),
+            "last_route_loaded_count": 0,
+            "status": "delta_routes_collected",
+        }
+
+    async def load_delta_routes(state: TravelState) -> dict:
+        _log_node_started(state, "load_delta_routes")
+        queries: list[RouteQuery] = state["delta_route_queries"]
+        results = await gateway.get_routes(
+            queries,
+            ToolCallContext(thread_id=state["thread_id"]),
+        )
+        for result in results.values():
+            if result.status is ToolStatus.FAILED:
+                raise ToolUnavailableError.from_result(result, state["thread_id"])
+        loaded = {}
+        for key, result in results.items():
+            assert result.data is not None
+            loaded[key] = result.data
+        summaries = [
+            _tool_summary(
+                result,
+                f"route.get_{result.data.mode.value}" if result.data else "route.get",
+            )
+            for result in results.values()
+        ]
+        logger.info(
+            "repair.routes.loaded | thread_id=%s round=%s query_count=%s "
+            "route_count=%s",
+            state["thread_id"],
+            state["pending_replan_round"],
+            len(queries),
+            len(loaded),
+        )
+        _log_node_completed(
+            state,
+            "load_delta_routes",
+            "delta_routes_loaded",
+            route_count=len(loaded),
+        )
+        return {
+            "route_results": {**state["route_results"], **loaded},
+            "last_route_loaded_count": len(loaded),
+            "tool_summaries": [*state["tool_summaries"], *summaries],
+            "status": "delta_routes_loaded",
         }
 
     def select_best(state: TravelState) -> dict:
@@ -530,39 +1069,64 @@ def build_workflow(
     def mark_infeasible(state: TravelState) -> dict:
         _log_node_started(state, "mark_infeasible")
         logger.warning(
-            "planning.infeasible | thread_id=%s iterations=%s candidate_count=%s",
+            "planning.infeasible | thread_id=%s iterations=%s candidate_count=%s "
+            "reason=%s",
             state["thread_id"],
             state["iterations"],
             len(state["candidates"]),
+            state["repair_terminal_reason"] or "budget_or_candidates_exhausted",
         )
         _log_node_completed(state, "mark_infeasible", "infeasible")
         return {
             "selected_plan": None,
             "status": "infeasible",
-            "message": "在当前约束和重规划预算内没有找到合法方案",
+            "message": (
+                "在当前约束和局部修复预算内没有找到合法方案"
+                f"（{state['repair_terminal_reason']}）"
+                if state["repair_terminal_reason"]
+                else "在当前约束和局部修复预算内没有找到合法方案"
+            ),
         }
 
     builder = StateGraph(TravelState)
     builder.add_node("build_search_plan", build_search_plan)
     builder.add_node("load_pois", load_pois)
     builder.add_node("resolve_poi_facts", resolve_poi_facts)
-    builder.add_node("prepare_candidate_drafts", prepare_drafts)
-    builder.add_node("load_routes", load_routes)
-    builder.add_node("materialize_candidates", materialize)
+    builder.add_node("build_route_matrix", build_route_matrix)
+    builder.add_node("build_optimization_problem", build_optimization_problem)
+    builder.add_node("solve_candidate_variants", solve_candidate_variants)
+    builder.add_node("materialize_optimized_candidates", materialize_optimized)
+    builder.add_node("materialize_candidates", materialize_repaired)
     builder.add_node("validate_candidates", validate)
-    builder.add_node("replan", replan)
+    builder.add_node("select_repair_target", select_repair_target)
+    builder.add_node("analyze_violations", analyze_violations)
+    builder.add_node("build_repair_plan", create_repair_plan)
+    builder.add_node("apply_local_repair", apply_local_repair)
+    builder.add_node("collect_delta_routes", collect_delta_routes)
+    builder.add_node("load_delta_routes", load_delta_routes)
     builder.add_node("select_best", select_best)
     builder.add_node("mark_infeasible", mark_infeasible)
 
     builder.add_edge(START, "build_search_plan")
     builder.add_edge("build_search_plan", "load_pois")
     builder.add_edge("load_pois", "resolve_poi_facts")
-    builder.add_edge("resolve_poi_facts", "prepare_candidate_drafts")
-    builder.add_edge("prepare_candidate_drafts", "load_routes")
-    builder.add_edge("load_routes", "materialize_candidates")
+    builder.add_edge("resolve_poi_facts", "build_route_matrix")
+    builder.add_edge("build_route_matrix", "build_optimization_problem")
+    builder.add_edge("build_optimization_problem", "solve_candidate_variants")
+    builder.add_edge(
+        "solve_candidate_variants", "materialize_optimized_candidates"
+    )
+    builder.add_edge("materialize_optimized_candidates", "validate_candidates")
     builder.add_edge("materialize_candidates", "validate_candidates")
     builder.add_conditional_edges("validate_candidates", route_after_validation)
-    builder.add_edge("replan", "prepare_candidate_drafts")
+    builder.add_edge("select_repair_target", "analyze_violations")
+    builder.add_conditional_edges("analyze_violations", route_after_critic)
+    builder.add_conditional_edges("build_repair_plan", route_after_repair_plan)
+    builder.add_edge("apply_local_repair", "collect_delta_routes")
+    builder.add_conditional_edges(
+        "collect_delta_routes", route_after_delta_routes
+    )
+    builder.add_edge("load_delta_routes", "materialize_candidates")
     builder.add_edge("select_best", END)
     builder.add_edge("mark_infeasible", END)
     checkpoint_serde = JsonPlusSerializer(
@@ -578,16 +1142,31 @@ def initial_state(request: PlanningRequest, thread_id: str) -> TravelState:
         "search_queries": [],
         "poi_facts": [],
         "planning_pois": [],
+        "optimization_pois": [],
+        "optimization_problem": None,
+        "optimization_result": None,
+        "route_matrix_cache_hits": 0,
+        "route_matrix_provider_calls": 0,
         "poi_resolution_issues": [],
         "candidate_drafts": [],
         "route_queries": [],
+        "delta_route_queries": [],
         "route_results": {},
+        "reused_route_keys": [],
         "tool_summaries": [],
         "candidates": [],
         "selected_plan": None,
         "iterations": 0,
         "pending_replan_round": None,
         "max_replan_rounds": request.max_replan_rounds,
+        "repair_target_candidate_id": None,
+        "critic_report": None,
+        "repair_plan": None,
+        "repair_history": [],
+        "preserved_day_hashes": {},
+        "repair_terminal_reason": None,
+        "last_route_loaded_count": 0,
+        "last_route_reused_count": 0,
         "status": "started",
         "message": None,
     }
@@ -620,11 +1199,12 @@ async def run_planning(
         request.max_replan_rounds,
     )
     try:
+        recursion_limit = max(16, 12 + request.max_replan_rounds * 8)
         result = await workflow.ainvoke(
             initial_state(request, run_thread_id),
             config={
                 "configurable": {"thread_id": run_thread_id},
-                "recursion_limit": 35,
+                "recursion_limit": recursion_limit,
             },
         )
     except Exception:

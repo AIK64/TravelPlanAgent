@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Mapping
 from urllib.parse import urlsplit
 
+from travel_agent.domain.optimization_models import OptimizationBudget
 from travel_agent.domain.tool_models import ProviderMode, UnknownFactPolicy
 from travel_agent.planning.policy import PlanningPolicy
 from travel_agent.requirements.models import RequirementProviderMode
@@ -33,6 +34,12 @@ class Settings:
     poi_max_queries: int = 12
     unknown_fact_policy: UnknownFactPolicy = UnknownFactPolicy.ASSUME_WITH_WARNING
     amap_driving_strategy: int = 32
+    max_walking_leg_meters: int = 1_500
+    use_real_walking_routes: bool = True
+    optimization_max_solve_ms: int = 800
+    optimization_max_search_states: int = 20_000
+    optimization_candidate_limit: int = 8
+    optimization_variant_count: int = 3
     requirement_provider: RequirementProviderMode = RequirementProviderMode.MOCK
     openai_api_key: str | None = field(default=None, repr=False)
     requirement_model: str = "mock-requirement-v1"
@@ -71,6 +78,25 @@ class Settings:
                 source.get("UNKNOWN_FACT_POLICY", "assume_with_warning").strip().lower()
             ),
             amap_driving_strategy=int(source.get("AMAP_DRIVING_STRATEGY", "32")),
+            max_walking_leg_meters=int(
+                source.get("MAX_WALKING_LEG_METERS", "1500")
+            ),
+            use_real_walking_routes=_parse_bool(
+                source.get("USE_REAL_WALKING_ROUTES", "true"),
+                name="USE_REAL_WALKING_ROUTES",
+            ),
+            optimization_max_solve_ms=int(
+                source.get("OPTIMIZATION_MAX_SOLVE_MS", "800")
+            ),
+            optimization_max_search_states=int(
+                source.get("OPTIMIZATION_MAX_SEARCH_STATES", "20000")
+            ),
+            optimization_candidate_limit=int(
+                source.get("OPTIMIZATION_CANDIDATE_LIMIT", "8")
+            ),
+            optimization_variant_count=int(
+                source.get("OPTIMIZATION_VARIANT_COUNT", "3")
+            ),
             requirement_provider=RequirementProviderMode(
                 source.get("REQUIREMENT_PROVIDER", "mock").strip().lower()
             ),
@@ -173,7 +199,15 @@ class Settings:
             poi_query_limit=self.poi_query_limit,
             poi_candidate_limit=self.poi_candidate_limit,
             route_strategy=self.amap_driving_strategy,
+            max_walking_leg_meters=self.max_walking_leg_meters,
+            use_real_walking_routes=self.use_real_walking_routes,
             poi_max_queries=self.poi_max_queries,
+        )
+        OptimizationBudget(
+            max_solve_ms=self.optimization_max_solve_ms,
+            max_search_states=self.optimization_max_search_states,
+            candidate_limit=self.optimization_candidate_limit,
+            variant_count=self.optimization_variant_count,
         )
 
 
@@ -191,3 +225,12 @@ def _validate_deepseek_base_url(value: str) -> None:
             "DEEPSEEK_BASE_URL must be an HTTPS URL without credentials, "
             "query, or fragment"
         )
+
+
+def _parse_bool(value: str, *, name: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")

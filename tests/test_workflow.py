@@ -26,9 +26,11 @@ async def test_workflow_builds_valid_plan(hangzhou_trip, mock_workflow):
     assert response.selected_plan is not None
     assert response.selected_plan.validation is not None
     assert response.selected_plan.validation.valid
-    assert (
-        response.selected_plan.validation.status
-        is ValidationStatus.VALID_WITH_WARNINGS
+    assert response.selected_plan.validation.status is ValidationStatus.VALID
+    assert all(
+        not item.walking_distance_estimated
+        for day in response.selected_plan.days
+        for item in day.items
     )
     scheduled_names = {
         item.name
@@ -54,7 +56,7 @@ async def test_workflow_returns_infeasible_when_required_poi_exceeds_budget(
 
     assert response.status == "infeasible"
     assert response.selected_plan is None
-    assert response.iterations == 1
+    assert response.iterations == 0
 
 
 @pytest.mark.asyncio
@@ -105,11 +107,18 @@ def test_graph_exposes_tool_use_and_replan_nodes(mock_workflow):
         "build_search_plan",
         "load_pois",
         "resolve_poi_facts",
-        "prepare_candidate_drafts",
-        "load_routes",
+        "build_route_matrix",
+        "build_optimization_problem",
+        "solve_candidate_variants",
+        "materialize_optimized_candidates",
         "materialize_candidates",
         "validate_candidates",
-        "replan",
+        "select_repair_target",
+        "analyze_violations",
+        "build_repair_plan",
+        "apply_local_repair",
+        "collect_delta_routes",
+        "load_delta_routes",
         "select_best",
         "mark_infeasible",
     } <= node_names
@@ -117,13 +126,17 @@ def test_graph_exposes_tool_use_and_replan_nodes(mock_workflow):
         ("__start__", "build_search_plan"),
         ("build_search_plan", "load_pois"),
         ("load_pois", "resolve_poi_facts"),
-        ("resolve_poi_facts", "prepare_candidate_drafts"),
-        ("prepare_candidate_drafts", "load_routes"),
-        ("load_routes", "materialize_candidates"),
+        ("resolve_poi_facts", "build_route_matrix"),
+        ("build_route_matrix", "build_optimization_problem"),
+        ("build_optimization_problem", "solve_candidate_variants"),
+        ("solve_candidate_variants", "materialize_optimized_candidates"),
+        ("materialize_optimized_candidates", "validate_candidates"),
         ("materialize_candidates", "validate_candidates"),
-        ("replan", "prepare_candidate_drafts"),
+        ("select_repair_target", "analyze_violations"),
+        ("apply_local_repair", "collect_delta_routes"),
+        ("load_delta_routes", "materialize_candidates"),
         ("select_best", "__end__"),
         ("mark_infeasible", "__end__"),
     } <= edges
-    assert ("replan", "validate_candidates") not in edges
+    assert "replan" not in node_names
 

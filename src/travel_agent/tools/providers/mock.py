@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, timezone
 
 from travel_agent.domain.tool_models import (
     POIFacts,
     POISearchQuery,
+    RouteMode,
     RouteQuery,
     RouteResult,
     ValueSource,
 )
 from travel_agent.planning.mock_data import get_mock_pois
 from travel_agent.planning.routing import estimate_route
+from travel_agent.planning.routing import haversine_distance_meters
 
 
 def _normalize(value: str) -> str:
@@ -95,5 +98,19 @@ class MockRouteProvider:
             mode=query.mode,
             provider=self.name,
             data_confidence=0.65,
+            fetched_at=datetime.now(timezone.utc),
+        )
+
+    async def get_walking_route(self, query: RouteQuery) -> RouteResult:
+        distance_meters = max(
+            1,
+            round(haversine_distance_meters(query.origin, query.destination) * 1.08),
+        )
+        return RouteResult(
+            distance_meters=distance_meters,
+            duration_minutes=max(1, math.ceil(distance_meters / 75)),
+            mode=RouteMode.WALKING,
+            provider=self.name,
+            data_confidence=0.75,
             fetched_at=datetime.now(timezone.utc),
         )

@@ -189,8 +189,11 @@ def collect_route_queries(
     drafts: list[CandidateDraft],
     pois: list[PlanningPOI],
     route_strategy: int = 32,
+    route_mode: RouteMode = RouteMode.DRIVING,
+    route_modes: tuple[RouteMode, ...] | None = None,
+    max_walking_leg_meters: int = 1_500,
 ) -> list[RouteQuery]:
-    """收集首见优先、方向敏感的 Provider 驾车路线查询。"""
+    """收集首见优先、方向敏感且模式隔离的路线查询。"""
     poi_by_id = {poi.facts.id: poi for poi in pois}
     anchor = (
         trip.accommodation.coordinate
@@ -207,18 +210,28 @@ def collect_route_queries(
                 poi = poi_by_id.get(poi_id)
                 if poi is None:
                     raise MissingPlanningPOI(poi_id)
-                query = RouteQuery(
-                    origin=previous_coordinate,
-                    destination=poi.facts.coordinate,
-                    origin_poi_id=previous_poi_id,
-                    destination_poi_id=poi_id,
-                    mode=RouteMode.DRIVING,
-                    strategy=route_strategy,
-                )
-                key = route_key(query)
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    queries.append(query)
+                for active_mode in route_modes or (route_mode,):
+                    if (
+                        active_mode is RouteMode.WALKING
+                        and haversine_distance_meters(
+                            previous_coordinate,
+                            poi.facts.coordinate,
+                        )
+                        > max_walking_leg_meters * 1.25
+                    ):
+                        continue
+                    query = RouteQuery(
+                        origin=previous_coordinate,
+                        destination=poi.facts.coordinate,
+                        origin_poi_id=previous_poi_id,
+                        destination_poi_id=poi_id,
+                        mode=active_mode,
+                        strategy=(route_strategy if active_mode is RouteMode.DRIVING else 0),
+                    )
+                    key = route_key(query)
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        queries.append(query)
                 previous_coordinate = poi.facts.coordinate
                 previous_poi_id = poi_id
     return queries

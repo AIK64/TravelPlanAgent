@@ -29,6 +29,7 @@ from travel_agent.planning.drafts import (
     MissingPlanningPOI,
     collect_route_queries,
 )
+from travel_agent.planning.routing import haversine_distance_meters
 
 
 def _normalize(value: str) -> str:
@@ -49,14 +50,15 @@ def _route_query(
     origin_poi_id: str | None,
     destination_poi_id: str,
     route_strategy: int,
+    route_mode: RouteMode,
 ) -> RouteQuery:
     return RouteQuery(
         origin=origin,
         destination=destination,
         origin_poi_id=origin_poi_id,
         destination_poi_id=destination_poi_id,
-        mode=RouteMode.DRIVING,
-        strategy=route_strategy,
+        mode=route_mode,
+        strategy=route_strategy if route_mode is RouteMode.DRIVING else 0,
     )
 
 
@@ -96,6 +98,9 @@ def _materialize_day(
     poi_by_id: dict[str, PlanningPOI],
     routes: dict[str, RouteResult],
     route_strategy: int,
+    route_mode: RouteMode,
+    route_modes: tuple[RouteMode, ...] | None,
+    max_walking_leg_meters: int,
 ) -> tuple[DayPlan, list[PlanningPOI], list[RouteResult]]:
     current_date = draft_day.date
     timezone = trip.arrival.at.tzinfo
@@ -124,17 +129,62 @@ def _materialize_day(
         poi = poi_by_id.get(poi_id)
         if poi is None:
             raise MissingPlanningPOI(poi_id)
-        query = _route_query(
-            current_coordinate,
-            poi.facts.coordinate,
-            current_poi_id,
-            poi_id,
-            route_strategy,
-        )
-        key = route_key(query)
-        route = routes.get(key)
-        if route is None:
-            raise MissingRouteResult(key)
+        active_modes = route_modes or (route_mode,)
+        route_by_mode: dict[RouteMode, RouteResult] = {}
+        for active_mode in active_modes:
+            if (
+                active_mode is RouteMode.WALKING
+                and haversine_distance_meters(
+                    current_coordinate,
+                    poi.facts.coordinate,
+                )
+                > max_walking_leg_meters * 1.25
+            ):
+                continue
+            query = _route_query(
+                current_coordinate,
+                poi.facts.coordinate,
+                current_poi_id,
+                poi_id,
+                route_strategy,
+                active_mode,
+            )
+            key = route_key(query)
+            result = routes.get(key)
+            if result is None:
+                raise MissingRouteResult(key)
+            route_by_mode[active_mode] = result
+
+        walking_route = route_by_mode.get(RouteMode.WALKING)
+        driving_route = route_by_mode.get(RouteMode.DRIVING)
+        if (
+            walking_route is not None
+            and driving_route is not None
+            and (
+                walking_route.distance_meters > max_walking_leg_meters
+                or walking_total + walking_route.distance_meters
+                > trip.mobility.max_daily_walking_meters
+            )
+        ):
+            route = driving_route
+            walking_meters = 0
+            walking_is_estimated = False
+        elif walking_route is not None:
+            route = walking_route
+            walking_meters = route.distance_meters
+            walking_is_estimated = False
+        else:
+            assert driving_route is not None
+            route = driving_route
+            hybrid_routes_enabled = (
+                route_modes is not None and RouteMode.WALKING in route_modes
+            )
+            walking_meters = (
+                0
+                if hybrid_routes_enabled
+                else min(round(route.distance_meters * 0.12), 2_000)
+            )
+            walking_is_estimated = not hybrid_routes_enabled
 
         arrival_time = current_time + timedelta(minutes=route.duration_minutes)
         opening_window = poi.opening_windows[current_date]
@@ -149,7 +199,6 @@ def _materialize_day(
         if end_at > day_end or end_at > closing:
             break
 
-        walking_meters = min(round(route.distance_meters * 0.12), 2_000)
         items.append(
             PlanItem(
                 type=ItemType.ACTIVITY,
@@ -160,7 +209,7 @@ def _materialize_day(
                 travel_from_previous_minutes=route.duration_minutes,
                 distance_from_previous_meters=route.distance_meters,
                 estimated_cost=poi.party_cost,
-                walking_distance_estimated=True,
+                walking_distance_estimated=walking_is_estimated,
             )
         )
         scheduled_pois.append(poi)
@@ -216,6 +265,9 @@ def _materialize_candidate(
     poi_by_id: dict[str, PlanningPOI],
     routes: dict[str, RouteResult],
     route_strategy: int,
+    route_mode: RouteMode,
+    route_modes: tuple[RouteMode, ...] | None,
+    max_walking_leg_meters: int,
 ) -> PlanCandidate:
     days: list[DayPlan] = []
     scheduled_pois: list[PlanningPOI] = []
@@ -224,7 +276,14 @@ def _materialize_candidate(
     walking_dates: list[date] = []
     for draft_day in draft.days:
         day, day_pois, day_routes = _materialize_day(
-            trip, draft_day, poi_by_id, routes, route_strategy
+            trip,
+            draft_day,
+            poi_by_id,
+            routes,
+            route_strategy,
+            route_mode,
+            route_modes,
+            max_walking_leg_meters,
         )
         days.append(day)
         scheduled_pois.extend(day_pois)
@@ -234,7 +293,12 @@ def _materialize_candidate(
         for poi in day_pois:
             _append_unique_assumptions(assumptions, poi.assumptions)
 
-    if used_routes:
+    estimated_walking_routes = (
+        [route for route in used_routes if route.mode is not RouteMode.WALKING]
+        if RouteMode.WALKING not in (route_modes or (route_mode,))
+        else []
+    )
+    if estimated_walking_routes:
         _append_unique_assumptions(
             assumptions,
             [
@@ -247,7 +311,9 @@ def _materialize_candidate(
                     ),
                     source=ValueSource.DEFAULT,
                     affected_dates=walking_dates,
-                    created_at=min(route.fetched_at for route in used_routes),
+                    created_at=min(
+                        route.fetched_at for route in estimated_walking_routes
+                    ),
                 )
             ],
         )
@@ -338,6 +404,9 @@ def materialize_candidates(
     pois: list[PlanningPOI],
     routes: dict[str, RouteResult],
     route_strategy: int = 32,
+    route_mode: RouteMode = RouteMode.DRIVING,
+    route_modes: tuple[RouteMode, ...] | None = None,
+    max_walking_leg_meters: int = 1_500,
 ) -> list[PlanCandidate]:
     """Phase 2：只消费标准化 RouteResult 物化日程与指标。"""
     poi_by_id = {poi.facts.id: poi for poi in pois}
@@ -346,6 +415,9 @@ def materialize_candidates(
         drafts,
         pois,
         route_strategy=route_strategy,
+        route_mode=route_mode,
+        route_modes=route_modes,
+        max_walking_leg_meters=max_walking_leg_meters,
     ):
         key = route_key(query)
         if key not in routes:
@@ -357,6 +429,9 @@ def materialize_candidates(
             poi_by_id,
             routes,
             route_strategy,
+            route_mode,
+            route_modes,
+            max_walking_leg_meters,
         )
         for draft in drafts
     ]

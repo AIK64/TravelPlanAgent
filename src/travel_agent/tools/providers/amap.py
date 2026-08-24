@@ -302,7 +302,7 @@ class AMapPOIProvider:
 
 
 class AMapRouteProvider:
-    """将高德驾车路线归一化为供应商无关路线事实。"""
+    """将高德驾车/步行路线归一化为供应商无关路线事实。"""
 
     name = "amap"
 
@@ -316,15 +316,41 @@ class AMapRouteProvider:
             "strategy": query.strategy,
         }
         if query.origin_poi_id is not None:
-            params["originid"] = query.origin_poi_id
+            params["origin_id"] = query.origin_poi_id
         if query.destination_poi_id is not None:
-            params["destinationid"] = query.destination_poi_id
+            params["destination_id"] = query.destination_poi_id
 
         payload = await self._amap_client.request_json(
             "route.driving",
             "/v5/direction/driving",
             params,
         )
+        return self._normalize_route(payload, RouteMode.DRIVING, "route.driving")
+
+    async def get_walking_route(self, query: RouteQuery) -> RouteResult:
+        params: dict[str, object] = {
+            "origin": _format_coordinate(query.origin),
+            "destination": _format_coordinate(query.destination),
+            "show_fields": "cost",
+        }
+        if query.origin_poi_id is not None:
+            params["origin_id"] = query.origin_poi_id
+        if query.destination_poi_id is not None:
+            params["destination_id"] = query.destination_poi_id
+
+        payload = await self._amap_client.request_json(
+            "route.walking",
+            "/v5/direction/walking",
+            params,
+        )
+        return self._normalize_route(payload, RouteMode.WALKING, "route.walking")
+
+    @staticmethod
+    def _normalize_route(
+        payload: dict[str, object],
+        mode: RouteMode,
+        operation: str,
+    ) -> RouteResult:
         error: ToolProviderError | None = None
         try:
             route = payload.get("route")
@@ -344,13 +370,13 @@ class AMapRouteProvider:
             return RouteResult(
                 distance_meters=distance,
                 duration_minutes=math.ceil(duration_seconds / 60),
-                mode=RouteMode.DRIVING,
-                provider=self.name,
+                mode=mode,
+                provider="amap",
                 data_confidence=0.95,
                 fetched_at=datetime.now(timezone.utc),
             )
         except (TypeError, ValueError):
-            error = AMapClient._invalid_response("route.driving")
+            error = AMapClient._invalid_response(operation)
         if error is not None:
             raise error
         raise AssertionError("unreachable")

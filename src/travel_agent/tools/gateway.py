@@ -13,6 +13,7 @@ from travel_agent.config import Settings
 from travel_agent.domain.tool_models import (
     POIFacts,
     POISearchQuery,
+    RouteMode,
     RouteQuery,
     RouteResult,
     ToolCallContext,
@@ -108,9 +109,17 @@ class ToolGateway:
                     cache_key=f"{provider}|route|{key}",
                     ttl_seconds=self._route_cache_ttl_seconds,
                     provider=provider,
-                    operation="route.get_driving",
+                    operation=f"route.get_{query.mode.value}",
                     context=context,
-                    call=lambda query=query: self._route_provider.get_driving_route(query),
+                    call=(
+                        (lambda query=query: self._route_provider.get_walking_route(query))
+                        if query.mode is RouteMode.WALKING
+                        else (
+                            lambda query=query: self._route_provider.get_driving_route(
+                                query
+                            )
+                        )
+                    ),
                 )
                 for key, query in unique_queries.items()
             )

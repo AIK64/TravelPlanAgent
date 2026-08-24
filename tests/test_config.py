@@ -20,6 +20,9 @@ def test_settings_default_to_mock():
     assert settings.poi_candidate_limit == 12
     assert settings.poi_max_queries == 12
     assert settings.amap_driving_strategy == 32
+    assert settings.max_walking_leg_meters == 1_500
+    assert settings.use_real_walking_routes is True
+    assert settings.optimization_variant_count == 3
 
 
 def test_amap_requires_key():
@@ -165,6 +168,8 @@ def test_settings_parse_non_default_planning_policy():
             "POI_CANDIDATE_LIMIT": "1",
             "POI_MAX_QUERIES": "2",
             "AMAP_DRIVING_STRATEGY": "7",
+            "USE_REAL_WALKING_ROUTES": "false",
+            "OPTIMIZATION_VARIANT_COUNT": "1",
         }
     )
 
@@ -174,6 +179,13 @@ def test_settings_parse_non_default_planning_policy():
         settings.poi_max_queries,
         settings.amap_driving_strategy,
     ) == (1, 1, 2, 7)
+    assert settings.use_real_walking_routes is False
+    assert settings.optimization_variant_count == 1
+
+
+def test_settings_rejects_invalid_boolean():
+    with pytest.raises(ValueError, match="USE_REAL_WALKING_ROUTES"):
+        Settings.from_env({"USE_REAL_WALKING_ROUTES": "sometimes"})
 
 
 @pytest.mark.parametrize(

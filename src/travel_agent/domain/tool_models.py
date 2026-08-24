@@ -28,6 +28,7 @@ class UnknownFactPolicy(StrEnum):
 
 class RouteMode(StrEnum):
     DRIVING = "driving"
+    WALKING = "walking"
 
 
 class ToolStatus(StrEnum):
@@ -193,9 +194,9 @@ class ToolExecutionSummary(BaseModel):
 
 
 def route_key(query: RouteQuery) -> str:
-    """构造方向敏感、精度稳定的路线缓存键。"""
+    """构造含坐标版本、方向、模式和策略的稳定路线键。"""
     return (
-        f"{query.origin.longitude:.6f},{query.origin.latitude:.6f}"
+        f"route:v1|{query.origin.longitude:.6f},{query.origin.latitude:.6f}"
         f"->{query.destination.longitude:.6f},{query.destination.latitude:.6f}"
         f"|{query.mode.value}|{query.strategy}"
     )

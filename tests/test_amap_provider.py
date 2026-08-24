@@ -110,6 +110,23 @@ async def test_amap_route_provider_normalizes_distance_and_seconds(load_fixture)
 
 
 @pytest.mark.asyncio
+async def test_amap_route_provider_uses_v5_walking_endpoint(load_fixture):
+    provider, seen = amap_route_provider(load_fixture("route_success.json"))
+    query = ROUTE_QUERY.model_copy(
+        update={"mode": RouteMode.WALKING, "strategy": 0}
+    )
+
+    result = await provider.get_walking_route(query)
+
+    assert result.mode is RouteMode.WALKING
+    assert result.distance_meters == 8230
+    assert result.duration_minutes == 21
+    assert seen[0].url.path == "/v5/direction/walking"
+    assert seen[0].url.params["show_fields"] == "cost"
+    assert "strategy" not in seen[0].url.params
+
+
+@pytest.mark.asyncio
 async def test_amap_route_provider_formats_coordinates_and_omits_absent_poi_ids(
     load_fixture,
 ):
@@ -120,8 +137,8 @@ async def test_amap_route_provider_formats_coordinates_and_omits_absent_poi_ids(
 
     assert seen[0].url.params["origin"] == "120.100000,30.100000"
     assert seen[0].url.params["destination"] == "120.200000,30.200000"
-    assert "originid" not in seen[0].url.params
-    assert "destinationid" not in seen[0].url.params
+    assert "origin_id" not in seen[0].url.params
+    assert "destination_id" not in seen[0].url.params
 
 
 @pytest.mark.asyncio
@@ -134,8 +151,8 @@ async def test_amap_route_provider_passes_present_poi_ids(load_fixture):
 
     await provider.get_driving_route(query)
 
-    assert seen[0].url.params["originid"] == "origin-poi"
-    assert seen[0].url.params["destinationid"] == "destination-poi"
+    assert seen[0].url.params["origin_id"] == "origin-poi"
+    assert seen[0].url.params["destination_id"] == "destination-poi"
 
 
 @pytest.mark.asyncio

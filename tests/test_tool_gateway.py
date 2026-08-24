@@ -10,6 +10,7 @@ from travel_agent.domain.models import Coordinate
 from travel_agent.domain.tool_models import (
     POIFacts,
     POISearchQuery,
+    RouteMode,
     RouteQuery,
     RouteResult,
     ToolCallContext,
@@ -64,11 +65,18 @@ class FakeRouteProvider:
         self.calls = 0
 
     async def get_driving_route(self, query: RouteQuery) -> RouteResult:
+        return await self._route(query)
+
+    async def get_walking_route(self, query: RouteQuery) -> RouteResult:
+        return await self._route(query)
+
+    async def _route(self, query: RouteQuery) -> RouteResult:
         self.calls += 1
         return RouteResult(
             distance_meters=1000,
             duration_minutes=10,
             provider=self.name,
+            mode=query.mode,
             data_confidence=1.0,
             fetched_at=datetime.now(timezone.utc),
         )
@@ -183,6 +191,22 @@ async def test_gateway_deduplicates_route_queries():
 
     assert list(results) == [route_key(ROUTE)]
     assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_dispatches_and_caches_route_modes_independently():
+    provider = FakeRouteProvider()
+    gateway = make_gateway(route_provider=provider)
+    walking = ROUTE.model_copy(update={"mode": RouteMode.WALKING, "strategy": 0})
+
+    first = await gateway.get_routes([ROUTE, walking], CONTEXT)
+    second = await gateway.get_routes([ROUTE, walking], CONTEXT)
+
+    assert provider.calls == 2
+    assert first[route_key(ROUTE)].data.mode is RouteMode.DRIVING
+    assert first[route_key(walking)].data.mode is RouteMode.WALKING
+    assert all(result.cache_hit for result in second.values())
+    assert route_key(ROUTE) != route_key(walking)
 
 
 @pytest.mark.asyncio

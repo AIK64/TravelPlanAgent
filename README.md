@@ -1,8 +1,8 @@
 # Constraint-Aware Travel Agent
 
-面向中国城市旅行场景的约束感知规划 Agent。v0.4 在显式需求 Graph 上加入 Human-in-the-loop：缺失或歧义信息通过 LangGraph Interrupt 暂停，用户补充后沿同一 `thread_id` Resume；LLM 只生成字段 Patch，确定性代码负责白名单合并、硬约束和局部工具重跑。
+面向中国城市旅行场景的约束感知规划 Agent。v0.6 在局部自修复闭环前加入显式约束优化：Agent 将标准化 POI、时间窗、预算、移动能力和真实驾车/步行路线矩阵组装为 `OptimizationProblem`，由有界 OR-Tools CP-SAT 求解三种风格候选；超时会留下可观察的降级结果并回退到 v0.5 确定性启发式。
 
-## 当前进度：v0.4.0
+## 当前进度：v0.6.0
 
 ```text
 Natural Language
@@ -11,7 +11,12 @@ Natural Language
   → Interrupt ↔ Resume Clarification Patch
   → Anchor Tool Use / Cached Resolution Reuse
   → Assemble TripSpec
-  → Existing Plan → Tool Use → Validate → Replan Loop
+  → Build Driving/Walking Route Matrix
+  → Build OptimizationProblem → Solve Style Variants
+  → Materialize Candidate Plans → Hard Validate
+      ├─ deliverable → Select Best
+      └─ invalid → Select Target → Critic → RepairPlan
+                   → Local Repair → Delta Route Tool Use → Revalidate
 ```
 
 已完成：
@@ -28,11 +33,26 @@ Natural Language
 - 同一线程并发 Resume 串行化；旧 Interrupt 返回 409，未知线程返回 404。
 - 默认内存 Checkpoint，并提供 SQLite 单机跨进程恢复模式。
 - 6 条 Clarification Patch Benchmark，量化目标字段修复率和字段保持率。
+- 显式 `CriticReport`、`RepairAction`、`RepairPlan` 与 `RepairAttempt`，修复轨迹可从 Checkpoint 读取。
+- 预算、步行、活动时长、必去项遗漏和局部时间冲突的确定性修复策略，不放宽硬约束、不删除 `must_visit`。
+- 按邻接变化计算 Route Delta，只补查缺失路线；未受影响日期通过 Hash 守卫保证不被改写。
+- 重复违规、重复动作、无进展、无安全动作和修复轮次耗尽均有界终止；Tool 失败继续返回外部失败而非 `infeasible`。
+- 9 条离线 Repair Benchmark：精确用例准确率、修复成功率、硬约束满足率、终止率和局部性均为 100%，路线复用率 80.77%。
+- 显式 `OptimizationProblem`、`OptimizationResult` 与 `OptimizationBudget`，求解器只读取标准化领域对象。
+- Graph 可见的 `build_route_matrix → build_optimization_problem → solve_candidate_variants → materialize_optimized_candidates` 路径。
+- OR-Tools CP-SAT 在时间、搜索状态、候选数和变体数预算内生成 relaxed、balanced、exploration 候选，并输出目标分解。
+- AMap v5 驾车与步行路线统一经过 Tool Gateway；缓存键区分 Provider、模式、策略和 6 位坐标版本。
+- 近距离腿使用真实步行路线，远距离腿明确使用驾车，不再把驾车距离按比例伪装成最终步行事实。
+- 求解超时和无可行解显式记录 `optimization.degraded`，继续使用确定性最近邻回退；外部 Tool 失败仍不会伪装成业务不可行。
+- 4 条固定 Optimization Benchmark 同时比较优化器/启发式、单候选/三候选、真实步行/估算消融，并报告约束满足率、求解成功率、路线效率和延迟。
 
-当前边界：SQLite 只用于单机演示，不是多实例生产存储；中断只覆盖需求澄清，不支持完成计划后的编辑审批。Mock 解析器不代表开放域中文效果，尚未实现长期记忆、天气、真实步行路线、计划版本 Diff 和 OTA 下单。
+当前边界：v0.6 的 CP-SAT 负责硬约束和可计算目标，尚未加入 LLM 软质量评价；Grounded LLM Soft Critic 在 v0.7。当前路线矩阵覆盖 POI 候选的必要有向边，不是 OTA 级全量交通规划。SQLite 只用于单机演示；中断尚不支持完成计划后的编辑审批。长期 Memory、天气事件、计划版本 Diff、MCP 和生产化分别属于后续版本。
 
 ## 学习入口
 
+- 后续开发以 [v0.5 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md) 为准；v1.0 完成核心 Agent，v1.1 增加 Preference Memory，v1.2 完成 MCP 与平台化。
+- 从 [v0.6 约束优化与真实路线文档](docs/v0.6/README.md) 查看当前 Graph、求解预算、降级语义与消融 Benchmark。
+- [v0.5 局部自修复文档](docs/v0.5/README.md) 解释当前保留的 Critic/Repair 回退闭环。
 - 从 [v0.4 HITL 澄清恢复文档](docs/v0.4/README.md) 开始。
 - [v0.3 自然语言需求文档](docs/v0.3/README.md) 解释初始抽取与验证基线。
 - [v0.2 Tool Use 文档](docs/v0.2/README.md) 解释规划子流程和可靠工具层。
@@ -126,6 +146,8 @@ DeepSeek Provider 显式关闭 thinking mode：需求抽取是有界结构化任
 
 AMap 模式沿用 v0.2 的显式配置：设置 `TRAVEL_PROVIDER=amap` 与本机 `AMAP_API_KEY`。AMap 失败同样不会回退 Mock，也不会伪装成业务 `infeasible`。
 
+v0.6 默认同时请求驾车路线和阈值内的步行路线。`MAX_WALKING_LEG_METERS` 控制单段允许步行的最大距离；`USE_REAL_WALKING_ROUTES=false` 仅用于消融实验，会恢复历史估算语义，不建议用于最终计划。
+
 ## Benchmark 与验证
 
 默认 Benchmark 评估 Mock Fixture 的可重复回归基线，不是线上模型效果声明：
@@ -133,6 +155,8 @@ AMap 模式沿用 v0.2 的显式配置：设置 `TRAVEL_PROVIDER=amap` 与本机
 ```powershell
 .\.venv\Scripts\python.exe scripts\evaluate_requirement_parser.py
 .\.venv\Scripts\python.exe scripts\evaluate_clarification_parser.py
+.\.venv\Scripts\python.exe scripts\evaluate_local_repair.py
+.\.venv\Scripts\python.exe scripts\evaluate_optimization.py
 .\.venv\Scripts\python.exe -m pytest --cov=travel_agent --cov-report=term-missing
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m pip check

@@ -77,7 +77,7 @@ def test_openapi_version_matches_package_version(client):
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.6.0"
     assert response.json()["info"]["version"] == __version__
 
 
@@ -415,7 +415,7 @@ async def test_amap_runtime_closes_client_when_assembly_fails(monkeypatch):
 
     client = ClientProbe()
 
-    def fail_workflow(*_args):
+    def fail_workflow(*_args, **_kwargs):
         raise RuntimeError("workflow assembly failed")
 
     monkeypatch.setattr(
@@ -500,10 +500,10 @@ def test_business_infeasible_still_returns_200(client, hangzhou_trip):
     assert response.json()["status"] == "infeasible"
 
 
-def test_daily_window_infeasible_api_response_never_selects_plan(
+def test_daily_window_api_response_is_satisfied_by_initial_optimization(
     client, hangzhou_trip
 ):
-    """防止 HTTP 边界把违反每日时间窗的候选返回为 completed。"""
+    """优化器在首轮满足时间窗和必去项，无需消耗修复预算。"""
     constrained = hangzhou_trip.model_copy(update={"daily_end": time(12, 0)})
 
     response = client.post(
@@ -515,8 +515,15 @@ def test_daily_window_infeasible_api_response_never_selects_plan(
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "infeasible"
-    assert response.json()["selected_plan"] is None
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["iterations"] == 0
+    assert body["selected_plan"]["validation"]["valid"] is True
+    assert "灵隐寺" in {
+        item["name"]
+        for day in body["selected_plan"]["days"]
+        for item in day["items"]
+    }
 
 
 def test_invalid_request_keeps_fastapi_4xx_semantics(client):

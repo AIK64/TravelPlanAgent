@@ -11,6 +11,7 @@ from travel_agent.domain.models import Coordinate, PlanningRequest
 from travel_agent.domain.tool_models import (
     POIFacts,
     POISearchQuery,
+    RouteMode,
     RouteQuery,
     RouteResult,
     ToolStatus,
@@ -19,6 +20,11 @@ from travel_agent.domain.tool_models import (
 )
 from travel_agent.graph.workflow import build_workflow, run_planning
 from travel_agent.planning.defaults import POIDefaultPolicy
+from travel_agent.planning.impact import (
+    RouteDelta,
+    collect_route_delta as actual_collect_route_delta,
+)
+from travel_agent.planning.optimization import OptimizationTimeoutError
 from travel_agent.runtime import PlanningRuntime
 from travel_agent.tools.errors import ToolProviderError, ToolUnavailableError
 from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
@@ -66,9 +72,11 @@ async def test_agent_trajectory_calls_tools_updates_state_and_selects(
             "search_plan.created",
             "tool.started",
             "poi_context.loaded",
-            "candidate_drafts.prepared",
             "tool.started",
-            "routes.loaded",
+            "route_matrix.loaded",
+            "optimization.problem_built",
+            "optimization.started",
+            "optimization.completed",
             "candidate.generated",
             "candidate.validated",
             "routing.decision",
@@ -84,6 +92,9 @@ async def test_agent_trajectory_calls_tools_updates_state_and_selects(
     assert state["search_queries"]
     assert state["poi_facts"]
     assert state["planning_pois"]
+    assert state["optimization_pois"]
+    assert state["optimization_problem"] is not None
+    assert state["optimization_result"] is not None
     assert state["candidate_drafts"]
     assert state["route_queries"]
     assert state["route_results"]
@@ -92,6 +103,7 @@ async def test_agent_trajectory_calls_tools_updates_state_and_selects(
     assert {summary.operation for summary in state["tool_summaries"]} == {
         "poi.search",
         "route.get_driving",
+        "route.get_walking",
     }
     assert all(
         summary.status is ToolStatus.SUCCESS
@@ -122,10 +134,17 @@ async def test_agent_trajectory_calls_tools_updates_state_and_selects(
     assert state_before_node["load_pois"]["poi_facts"] == []
     assert state_before_node["resolve_poi_facts"]["poi_facts"]
     assert state_before_node["resolve_poi_facts"]["planning_pois"] == []
-    assert state_before_node["prepare_candidate_drafts"]["planning_pois"]
-    assert state_before_node["prepare_candidate_drafts"]["candidate_drafts"] == []
-    assert state_before_node["materialize_candidates"]["route_queries"]
-    assert state_before_node["materialize_candidates"]["route_results"]
+    assert state_before_node["build_route_matrix"]["planning_pois"]
+    assert state_before_node["build_route_matrix"]["optimization_pois"] == []
+    assert state_before_node["build_optimization_problem"]["route_queries"]
+    assert state_before_node["build_optimization_problem"]["route_results"]
+    assert state_before_node["solve_candidate_variants"]["optimization_problem"]
+    assert state_before_node["materialize_optimized_candidates"][
+        "optimization_result"
+    ]
+    assert state_before_node["materialize_optimized_candidates"][
+        "candidate_drafts"
+    ]
     assert state_before_node["validate_candidates"]["candidates"]
     assert not any(
         record.getMessage().startswith("Deserializing unregistered type")
@@ -191,6 +210,10 @@ class ExplodingUnselectedMockRouteProvider(MockRouteProvider):
         self.calls += 1
         raise AssertionError("unselected Mock route provider must never be called")
 
+    async def get_walking_route(self, query: RouteQuery) -> RouteResult:
+        self.calls += 1
+        raise AssertionError("unselected Mock route provider must never be called")
+
 
 class RuntimeClientProbe:
     def __init__(self) -> None:
@@ -217,6 +240,20 @@ class FailRepeatedRouteProvider(MockRouteProvider):
             raise ToolProviderError.timeout("route.get_driving")
         self.seen_keys.add(key)
         return await super().get_driving_route(query)
+
+
+class SentinelFailureRouteProvider(MockRouteProvider):
+    async def get_driving_route(self, query: RouteQuery) -> RouteResult:
+        if query.destination.longitude == 121.999:
+            raise ToolProviderError.timeout("route.get_driving")
+        return await super().get_driving_route(query)
+
+
+class ForcedFallbackOptimizer:
+    name = "forced-timeout-for-repair-trajectory"
+
+    def solve(self, _problem):
+        raise OptimizationTimeoutError("forced fallback")
 
 
 class PriorityPOIProvider:
@@ -267,11 +304,18 @@ class ConstantRouteProvider:
         self.calls: list[RouteQuery] = []
 
     async def get_driving_route(self, query: RouteQuery) -> RouteResult:
+        return await self._get_route(query)
+
+    async def get_walking_route(self, query: RouteQuery) -> RouteResult:
+        return await self._get_route(query)
+
+    async def _get_route(self, query: RouteQuery) -> RouteResult:
         self.calls.append(query)
         return RouteResult(
             distance_meters=1_000,
             duration_minutes=10,
             provider=self.name,
+            mode=query.mode,
             data_confidence=1.0,
             fetched_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
         )
@@ -453,19 +497,19 @@ async def test_route_tool_failure_raises_after_retry_without_business_replan(
     snapshot = await workflow.aget_state(
         {"configurable": {"thread_id": thread_id}}
     )
-    assert snapshot.values["status"] == "candidate_drafts_prepared"
+    assert snapshot.values["status"] == "poi_context_loaded"
     assert snapshot.values["iterations"] == 0
     assert snapshot.values["candidates"] == []
 
 
 @pytest.mark.asyncio
-async def test_replan_route_failure_does_not_commit_iteration_or_stale_round_state(
+async def test_local_repair_reuses_routes_without_recalling_seen_provider_keys(
     hangzhou_trip,
     gateway_factory,
     caplog,
 ):
     caplog.set_level(logging.INFO)
-    thread_id = "trajectory-replan-route-failure"
+    thread_id = "trajectory-local-route-reuse"
     workflow = build_workflow(
         gateway_factory(
             route_provider=FailRepeatedRouteProvider(),
@@ -473,92 +517,129 @@ async def test_replan_route_failure_does_not_commit_iteration_or_stale_round_sta
             route_cache_ttl_seconds=0,
         ),
         POIDefaultPolicy(UnknownFactPolicy.ASSUME_WITH_WARNING),
+        optimizer=ForcedFallbackOptimizer(),
     )
-    low_budget_trip = hangzhou_trip.model_copy(
-        update={"total_budget": Decimal("10")}
+    repairable_trip = hangzhou_trip.model_copy(
+        update={"total_budget": Decimal("300")}
     )
 
-    with pytest.raises(ToolUnavailableError) as error:
+    response = await run_planning(
+        workflow,
+        PlanningRequest(trip=repairable_trip, max_replan_rounds=2),
+        thread_id=thread_id,
+    )
+
+    assert response.status == "completed"
+    assert response.iterations == 1
+    snapshot = await workflow.aget_state(
+        {"configurable": {"thread_id": thread_id}}
+    )
+    state = snapshot.values
+    assert state["iterations"] == 1
+    assert state["pending_replan_round"] is None
+    assert state["repair_history"][0].reused_route_count > 0
+    assert (
+        state["repair_history"][0].loaded_route_count
+        < state["repair_history"][0].reused_route_count
+    )
+    assert state["route_results"]
+    assert state["selected_plan"] is not None
+
+    events = _event_names(caplog.records, thread_id)
+    assert "repair.routes.reused" in events
+    assert "repair.validation.delta" in events
+    assert "tool.retry_scheduled" not in events
+    assert "tool.failed" not in events
+    assert "planning.failed" not in events
+
+
+@pytest.mark.asyncio
+async def test_delta_route_failure_does_not_commit_repair_round(
+    hangzhou_trip,
+    gateway_factory,
+    monkeypatch,
+    caplog,
+):
+    caplog.set_level(logging.INFO)
+    thread_id = "trajectory-delta-route-failure"
+    sentinel = RouteQuery(
+        origin=hangzhou_trip.accommodation.coordinate,
+        destination=Coordinate(longitude=121.999, latitude=30.999),
+        mode=RouteMode.DRIVING,
+    )
+
+    def force_one_missing_delta(*args, **kwargs) -> RouteDelta:
+        delta = actual_collect_route_delta(*args, **kwargs)
+        return RouteDelta(
+            required_queries=(*delta.required_queries, sentinel),
+            missing_queries=(sentinel,),
+            reused_route_keys=delta.reused_route_keys,
+        )
+
+    monkeypatch.setattr(
+        "travel_agent.graph.workflow.collect_route_delta",
+        force_one_missing_delta,
+    )
+    workflow = build_workflow(
+        gateway_factory(
+            route_provider=SentinelFailureRouteProvider(),
+            max_attempts=2,
+            route_cache_ttl_seconds=0,
+        ),
+        POIDefaultPolicy(UnknownFactPolicy.ASSUME_WITH_WARNING),
+        optimizer=ForcedFallbackOptimizer(),
+    )
+    repairable_trip = hangzhou_trip.model_copy(
+        update={"total_budget": Decimal("300")}
+    )
+
+    with pytest.raises(ToolUnavailableError) as raised:
         await run_planning(
             workflow,
-            PlanningRequest(trip=low_budget_trip, max_replan_rounds=2),
+            PlanningRequest(trip=repairable_trip, max_replan_rounds=2),
             thread_id=thread_id,
         )
 
-    assert error.value.result.status is ToolStatus.FAILED
-    assert error.value.result.attempt_count == 2
-    assert error.value.safe_detail()["operation"] == "route.get_driving"
+    assert raised.value.result.attempt_count == 2
     snapshot = await workflow.aget_state(
         {"configurable": {"thread_id": thread_id}}
     )
     state = snapshot.values
     assert state["iterations"] == 0
     assert state["pending_replan_round"] == 1
-    assert {draft.id.rsplit("-", 1)[-1] for draft in state["candidate_drafts"]} == {
-        "r1"
-    }
-    assert state["route_queries"] == []
-    assert state["route_results"] == {}
-    assert state["candidates"] == []
-    assert state["selected_plan"] is None
-    assert any(
-        summary.operation == "route.get_driving"
-        and summary.status is ToolStatus.SUCCESS
-        for summary in state["tool_summaries"]
-    )
-    history = [
-        item
-        async for item in workflow.aget_state_history(
-            {"configurable": {"thread_id": thread_id}}
-        )
-    ]
-    assert any(item.values["route_results"] for item in history)
-    assert any(
-        candidate.validation is not None
-        for item in history
-        for candidate in item.values["candidates"]
-    )
-
-    messages = [
-        record.getMessage()
-        for record in caplog.records
-        if f"thread_id={thread_id}" in record.getMessage()
-    ]
-    decisions = [
-        message.split("next=", 1)[1].split(maxsplit=1)[0]
-        for message in messages
-        if message.startswith("routing.decision")
-    ]
+    assert state["repair_history"] == []
+    assert state["repair_plan"] is not None
+    assert state["candidate_drafts"][0].id.endswith("repair-r1")
+    assert state["route_results"]
+    assert state["last_route_reused_count"] > 0
+    assert state["last_route_loaded_count"] == 0
     events = _event_names(caplog.records, thread_id)
-    assert decisions == ["replan"]
-    assert events.count("candidate.validated") == 3
-    assert "replan.round_started" in events
-    assert "replan.completed" not in events
-    assert "planning.infeasible" not in events
-    assert "tool.retry_scheduled" in events
+    assert "repair.routes.reused" in events
+    assert "tool.failed" in events
     assert "planning.failed" in events
+    assert "repair.validation.delta" not in events
 
 
 @pytest.mark.asyncio
-async def test_validation_feedback_drives_one_bounded_replan(
+async def test_validation_feedback_drives_one_bounded_local_repair(
     hangzhou_trip,
-    workflow_harness,
+    fallback_workflow_harness,
     caplog,
 ):
     caplog.set_level(logging.INFO)
     thread_id = "trajectory-replan"
-    low_budget_trip = hangzhou_trip.model_copy(
-        update={"total_budget": Decimal("10")}
+    repairable_trip = hangzhou_trip.model_copy(
+        update={"total_budget": Decimal("300")}
     )
 
     response = await run_planning(
-        workflow_harness.workflow,
-        PlanningRequest(trip=low_budget_trip, max_replan_rounds=1),
+        fallback_workflow_harness.workflow,
+        PlanningRequest(trip=repairable_trip, max_replan_rounds=1),
         thread_id=thread_id,
     )
 
-    assert response.status == "infeasible"
-    assert response.selected_plan is None
+    assert response.status == "completed"
+    assert response.selected_plan is not None
     assert response.iterations == 1
     messages = [
         record.getMessage()
@@ -570,33 +651,30 @@ async def test_validation_feedback_drives_one_bounded_replan(
         for message in messages
         if message.startswith("routing.decision")
     ]
-    assert decisions == ["replan", "mark_infeasible"]
+    assert decisions == ["select_repair_target", "select_best"]
     events = _event_names(caplog.records, thread_id)
     _assert_in_order(
         events,
         [
             "routing.decision",
-            "replan.round_started",
-            "candidate_drafts.prepared",
-            "tool.started",
-            "routes.loaded",
+            "repair.target.selected",
+            "critic.completed",
+            "repair.plan.created",
+            "repair.action.applied",
+            "repair.routes.reused",
             "candidate.generated",
             "candidate.validated",
+            "repair.validation.delta",
             "replan.completed",
+            "repair.terminated",
             "routing.decision",
-            "planning.infeasible",
+            "plan.selected",
         ],
     )
-    snapshot = await workflow_harness.workflow.aget_state(
+    snapshot = await fallback_workflow_harness.workflow.aget_state(
         {"configurable": {"thread_id": thread_id}}
     )
-    route_summaries = [
-        summary
-        for summary in snapshot.values["tool_summaries"]
-        if summary.operation == "route.get_driving"
-    ]
-    assert any(not summary.cache_hit for summary in route_summaries)
-    assert any(summary.cache_hit for summary in route_summaries)
+    assert snapshot.values["repair_history"][0].reused_route_count > 0
     assert any(
         message.startswith("replan.completed")
         and "round=1" in message
@@ -606,9 +684,9 @@ async def test_validation_feedback_drives_one_bounded_replan(
 
 
 @pytest.mark.asyncio
-async def test_daily_window_violation_replans_then_stops_without_selecting(
+async def test_daily_window_missing_must_visit_is_repaired_without_bypassing_validator(
     hangzhou_trip,
-    workflow_harness,
+    fallback_workflow_harness,
     caplog,
 ):
     """防止越界必去地点绕过 Validator 并直接进入 select_best。"""
@@ -617,7 +695,7 @@ async def test_daily_window_violation_replans_then_stops_without_selecting(
     constrained = hangzhou_trip.model_copy(update={"daily_end": time(12, 0)})
 
     response = await run_planning(
-        workflow_harness.workflow,
+        fallback_workflow_harness.workflow,
         PlanningRequest(trip=constrained, max_replan_rounds=1),
         thread_id=thread_id,
     )
@@ -629,17 +707,18 @@ async def test_daily_window_violation_replans_then_stops_without_selecting(
         and f"thread_id={thread_id}" in record.getMessage()
     ]
     events = _event_names(caplog.records, thread_id)
-    assert response.status == "infeasible"
-    assert response.selected_plan is None
+    assert response.status == "completed"
+    assert response.selected_plan is not None
     assert response.iterations == 1
-    assert decisions == ["replan", "mark_infeasible"]
-    assert "plan.selected" not in events
-    assert all(
-        "missing_must_visit"
-        in {violation.type for violation in candidate.validation.violations}
-        for candidate in response.candidates
-        if candidate.validation is not None
-    )
+    assert decisions == ["select_repair_target", "select_best"]
+    assert "repair.validation.delta" in events
+    assert "plan.selected" in events
+    scheduled_names = {
+        item.name
+        for day in response.selected_plan.days
+        for item in day.items
+    }
+    assert "灵隐寺" in scheduled_names
 
 
 @pytest.mark.asyncio
@@ -689,6 +768,7 @@ async def test_runtime_planning_policy_reaches_checkpoint_and_provider_calls(
     route_calls: list[RouteQuery] = []
     original_search = poi_provider.search_pois
     original_route = route_provider.get_driving_route
+    original_walk = route_provider.get_walking_route
 
     async def record_search(query: POISearchQuery) -> list[POIFacts]:
         poi_calls.append(query)
@@ -698,8 +778,13 @@ async def test_runtime_planning_policy_reaches_checkpoint_and_provider_calls(
         route_calls.append(query)
         return await original_route(query)
 
+    async def record_walk(query: RouteQuery) -> RouteResult:
+        route_calls.append(query)
+        return await original_walk(query)
+
     monkeypatch.setattr(poi_provider, "search_pois", record_search)
     monkeypatch.setattr(route_provider, "get_driving_route", record_route)
+    monkeypatch.setattr(route_provider, "get_walking_route", record_walk)
     monkeypatch.setattr(
         "travel_agent.runtime.MockPOIProvider",
         lambda: poi_provider,
@@ -753,7 +838,7 @@ async def test_runtime_planning_policy_reaches_checkpoint_and_provider_calls(
 
 
 @pytest.mark.asyncio
-async def test_maximum_business_replan_budget_stops_before_recursion_guard(
+async def test_hard_constraint_conflict_stops_before_consuming_repair_budget(
     hangzhou_trip,
     workflow_harness,
     caplog,
@@ -777,12 +862,14 @@ async def test_maximum_business_replan_budget_stops_before_recursion_guard(
         and f"thread_id={thread_id}" in record.getMessage()
     ]
     assert response.status == "infeasible"
-    assert response.iterations == 5
-    assert decisions == ["replan"] * 5 + ["mark_infeasible"]
+    assert response.iterations == 0
+    assert decisions == ["select_repair_target"]
     events = _event_names(caplog.records, thread_id)
-    assert events.count("replan.round_started") == 5
-    assert events.count("replan.completed") == 5
+    assert events.count("critic.completed") == 1
+    assert "repair.plan.created" not in events
+    assert "replan.completed" not in events
     snapshot = await workflow_harness.workflow.aget_state(
         {"configurable": {"thread_id": thread_id}}
     )
     assert snapshot.values["pending_replan_round"] is None
+    assert snapshot.values["repair_terminal_reason"] == "hard_constraint_conflict:budget"

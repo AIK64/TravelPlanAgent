@@ -1,0 +1,4 @@
+{"id":"baseline","category":"baseline","trip_patch":{},"max_replan_rounds":2}
+{"id":"budget-300","category":"budget","trip_patch":{"total_budget":"300"},"max_replan_rounds":2}
+{"id":"short-window","category":"time_window","trip_patch":{"daily_end":"12:00:00"},"max_replan_rounds":2}
+{"id":"walking-1000","category":"walking","trip_patch":{"mobility":{"max_daily_walking_meters":1000}},"max_replan_rounds":2}

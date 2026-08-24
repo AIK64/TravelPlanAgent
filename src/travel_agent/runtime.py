@@ -9,6 +9,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from travel_agent.config import Settings
 from travel_agent.domain.models import PlanningRequest, PlanningResponse
+from travel_agent.domain.optimization_models import OptimizationBudget
 from travel_agent.domain.tool_models import ProviderMode
 from travel_agent.graph.workflow import build_workflow, run_planning
 from travel_agent.planning.defaults import POIDefaultPolicy
@@ -84,9 +85,22 @@ class PlanningRuntime:
                 poi_query_limit=settings.poi_query_limit,
                 poi_candidate_limit=settings.poi_candidate_limit,
                 route_strategy=settings.amap_driving_strategy,
+                max_walking_leg_meters=settings.max_walking_leg_meters,
+                use_real_walking_routes=settings.use_real_walking_routes,
                 poi_max_queries=settings.poi_max_queries,
             )
-            workflow = build_workflow(gateway, defaults, policy)
+            optimization_budget = OptimizationBudget(
+                max_solve_ms=settings.optimization_max_solve_ms,
+                max_search_states=settings.optimization_max_search_states,
+                candidate_limit=settings.optimization_candidate_limit,
+                variant_count=settings.optimization_variant_count,
+            )
+            workflow = build_workflow(
+                gateway,
+                defaults,
+                policy,
+                optimization_budget=optimization_budget,
+            )
             if settings.requirement_provider is RequirementProviderMode.MOCK:
                 requirement_model: RequirementModel = MockRequirementModel()
             else:
