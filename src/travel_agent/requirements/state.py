@@ -14,11 +14,14 @@ from travel_agent.requirements.models import (
     RequirementIssue,
     RequirementPatch,
 )
+from travel_agent.memory.models import PreferenceContext
 
 
 class RequirementState(TypedDict):
     execution: NotRequired[dict | None]
     thread_id: str
+    tenant_id: str
+    user_id: str
     natural_request: NaturalPlanningRequest
     requirement_draft: RequirementDraft | None
     requirement_issues: list[RequirementIssue]
@@ -39,6 +42,8 @@ class RequirementState(TypedDict):
     llm_summaries: list[RequirementExecutionSummary]
     tool_summaries: list[ToolExecutionSummary]
     trip: TripSpec | None
+    preference_context: PreferenceContext | None
+    personalized_fields: list[str]
     planning_response: PlanningResponse | None
     status: str
     message: str | None

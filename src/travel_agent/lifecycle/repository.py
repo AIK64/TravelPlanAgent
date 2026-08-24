@@ -142,10 +142,19 @@ class SQLitePlanRepository:
 
 @asynccontextmanager
 async def open_plan_repository(
-    *, backend: str, sqlite_path: str
+    *, backend: str, sqlite_path: str, database_url: str = ""
 ) -> AsyncIterator[PlanRepository]:
     repository: PlanRepository
-    if backend == "sqlite":
+    if backend == "postgres":
+        from travel_agent.infrastructure.postgres import (
+            PostgresPlanRepository,
+            create_postgres_pool,
+        )
+
+        repository = PostgresPlanRepository(
+            await create_postgres_pool(database_url)
+        )
+    elif backend == "sqlite":
         repository = SQLitePlanRepository(sqlite_path)
     else:
         repository = InMemoryPlanRepository()

@@ -55,7 +55,12 @@ class PlanLifecycleService:
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def create(
-        self, request: PlanningRequest, *, session_id: str | None = None
+        self,
+        request: PlanningRequest,
+        *,
+        session_id: str | None = None,
+        tenant_id: str = "local",
+        user_id: str = "demo",
     ) -> PlanSessionResponse:
         resolved_id = session_id or str(uuid4())
         planning_thread_id = f"planning:{resolved_id}"
@@ -71,6 +76,8 @@ class PlanLifecycleService:
         snapshot = await self._planning_snapshot(planning_thread_id)
         session = PlanSessionRecord(
             session_id=resolved_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
             lifecycle_thread_id=f"lifecycle:{resolved_id}",
             status=PlanSessionStatus.AWAITING_CANDIDATE_SELECTION,
             snapshot=snapshot,
@@ -84,14 +91,23 @@ class PlanLifecycleService:
         )
 
     async def create_from_text(
-        self, request: NaturalPlanningRequest, *, session_id: str | None = None
+        self,
+        request: NaturalPlanningRequest,
+        *,
+        session_id: str | None = None,
+        tenant_id: str = "local",
+        user_id: str = "demo",
     ) -> PlanSessionResponse:
         if self._requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
         resolved_id = session_id or str(uuid4())
         intake_thread_id = f"intake:{resolved_id}"
         response = await run_natural_planning(
-            self._requirement_workflow, request, thread_id=intake_thread_id
+            self._requirement_workflow,
+            request,
+            thread_id=intake_thread_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
         )
         if response.status == "needs_clarification":
             session = PlanSessionRecord(
@@ -99,6 +115,8 @@ class PlanLifecycleService:
                 lifecycle_thread_id=f"lifecycle:{resolved_id}",
                 intake_thread_id=intake_thread_id,
                 status=PlanSessionStatus.NEEDS_REQUIREMENT_CLARIFICATION,
+                tenant_id=tenant_id,
+                user_id=user_id,
                 external_interrupt=(
                     response.interrupt.model_dump(mode="json")
                     if response.interrupt is not None
@@ -123,6 +141,8 @@ class PlanLifecycleService:
             lifecycle_thread_id=f"lifecycle:{resolved_id}",
             intake_thread_id=intake_thread_id,
             status=PlanSessionStatus.AWAITING_CANDIDATE_SELECTION,
+            tenant_id=tenant_id,
+            user_id=user_id,
             snapshot=snapshot,
         )
         await self._repository.create(session)
@@ -286,6 +306,8 @@ class PlanLifecycleService:
                 answer=request.action.answer,
             ),
             thread_id=session.intake_thread_id or "",
+            tenant_id=session.tenant_id,
+            user_id=session.user_id,
         )
         previous = session.session_revision
         session.session_revision += 1

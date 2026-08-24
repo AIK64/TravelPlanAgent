@@ -21,6 +21,7 @@ class CheckpointBackend(StrEnum):
 class RunStoreBackend(StrEnum):
     MEMORY = "memory"
     SQLITE = "sqlite"
+    POSTGRES = "postgres"
 
 
 class CriticProviderMode(StrEnum):
@@ -39,12 +40,26 @@ class EditProviderMode(StrEnum):
 class WeatherProviderMode(StrEnum):
     MOCK = "mock"
     AMAP = "amap"
+    QWEATHER = "qweather"
+
+
+class AgentMode(StrEnum):
+    SINGLE_GRAPH = "single_graph"
+    SPECIALIST_SUBAGENTS = "specialist_subagents"
+    SHADOW_SUBAGENTS = "shadow_subagents"
+
+
+class AsyncExecutionBackend(StrEnum):
+    LOCAL = "local"
+    REDIS = "redis"
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
     provider: ProviderMode = ProviderMode.MOCK
     amap_api_key: str | None = field(default=None, repr=False)
+    baidu_api_key: str | None = field(default=None, repr=False)
+    map_fallback_provider: str = "none"
     tool_timeout_seconds: float = 5.0
     tool_max_attempts: int = 3
     tool_backoff_base_seconds: float = 0.25
@@ -89,6 +104,9 @@ class Settings:
     plan_max_versions: int = 20
     plan_max_affected_days: int = 2
     weather_provider: WeatherProviderMode = WeatherProviderMode.MOCK
+    qweather_api_host: str = ""
+    qweather_token: str | None = field(default=None, repr=False)
+    weather_fallback_provider: str = "none"
     weather_cache_ttl_seconds: int = 1_800
     weather_stale_max_seconds: int = 21_600
     weather_max_events: int = 50
@@ -101,8 +119,33 @@ class Settings:
     checkpoint_backend: CheckpointBackend = CheckpointBackend.MEMORY
     checkpoint_sqlite_path: str = ".data/travel-agent-checkpoints.sqlite3"
     plan_sqlite_path: str = ".data/travel-agent-plans.sqlite3"
+    plan_store_backend: RunStoreBackend = RunStoreBackend.MEMORY
     run_store_backend: RunStoreBackend = RunStoreBackend.MEMORY
     run_sqlite_path: str = ".data/travel-agent-runs.sqlite3"
+    memory_store_backend: RunStoreBackend = RunStoreBackend.MEMORY
+    memory_sqlite_path: str = ".data/travel-agent-memory.sqlite3"
+    database_url: str = ""
+    memory_context_max_tokens: int = 1_200
+    memory_context_max_characters: int = 4_800
+    agent_mode: AgentMode = AgentMode.SINGLE_GRAPH
+    agent_max_handoffs: int = 8
+    dev_identity_enabled: bool = True
+    dev_tenant_id: str = "local"
+    dev_user_id: str = "demo"
+    mcp_allowed_hosts: tuple[str, ...] = (
+        "127.0.0.1:*",
+        "localhost:*",
+        "[::1]:*",
+        "testserver",
+        "api:*",
+    )
+    mcp_allowed_origins: tuple[str, ...] = (
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+    )
+    async_execution_backend: AsyncExecutionBackend = AsyncExecutionBackend.LOCAL
+    redis_url: str = "redis://localhost:6379/0"
     run_budget_profile: str = "default-v1"
     run_max_graph_steps: int = 120
     run_max_tool_calls: int = 160
@@ -126,6 +169,10 @@ class Settings:
         settings = cls(
             provider=ProviderMode(source.get("TRAVEL_PROVIDER", "mock").strip().lower()),
             amap_api_key=source.get("AMAP_API_KEY", "").strip() or None,
+            baidu_api_key=source.get("BAIDU_MAP_AK", "").strip() or None,
+            map_fallback_provider=source.get(
+                "MAP_FALLBACK_PROVIDER", "none"
+            ).strip().lower(),
             tool_timeout_seconds=float(source.get("TOOL_TIMEOUT_SECONDS", "5")),
             tool_max_attempts=int(source.get("TOOL_MAX_ATTEMPTS", "3")),
             tool_backoff_base_seconds=float(
@@ -227,6 +274,11 @@ class Settings:
             weather_provider=WeatherProviderMode(
                 source.get("WEATHER_PROVIDER", "mock").strip().lower()
             ),
+            qweather_api_host=source.get("QWEATHER_API_HOST", "").strip().rstrip("/"),
+            qweather_token=source.get("QWEATHER_TOKEN", "").strip() or None,
+            weather_fallback_provider=source.get(
+                "WEATHER_FALLBACK_PROVIDER", "none"
+            ).strip().lower(),
             weather_cache_ttl_seconds=int(
                 source.get("WEATHER_CACHE_TTL_SECONDS", "1800")
             ),
@@ -261,11 +313,57 @@ class Settings:
             plan_sqlite_path=source.get(
                 "PLAN_SQLITE_PATH", ".data/travel-agent-plans.sqlite3"
             ).strip(),
+            plan_store_backend=RunStoreBackend(
+                source.get(
+                    "PLAN_STORE_BACKEND", source.get("CHECKPOINT_BACKEND", "memory")
+                ).strip().lower()
+            ),
             run_store_backend=RunStoreBackend(
                 source.get("RUN_STORE_BACKEND", "memory").strip().lower()
             ),
             run_sqlite_path=source.get(
                 "RUN_SQLITE_PATH", ".data/travel-agent-runs.sqlite3"
+            ).strip(),
+            memory_store_backend=RunStoreBackend(
+                source.get("MEMORY_STORE_BACKEND", "memory").strip().lower()
+            ),
+            memory_sqlite_path=source.get(
+                "MEMORY_SQLITE_PATH", ".data/travel-agent-memory.sqlite3"
+            ).strip(),
+            database_url=source.get("DATABASE_URL", "").strip(),
+            memory_context_max_tokens=int(
+                source.get("MEMORY_CONTEXT_MAX_TOKENS", "1200")
+            ),
+            memory_context_max_characters=int(
+                source.get("MEMORY_CONTEXT_MAX_CHARACTERS", "4800")
+            ),
+            agent_mode=AgentMode(
+                source.get("AGENT_MODE", "single_graph").strip().lower()
+            ),
+            agent_max_handoffs=int(source.get("AGENT_MAX_HANDOFFS", "8")),
+            dev_identity_enabled=_parse_bool(
+                source.get("DEV_IDENTITY_ENABLED", "true"),
+                name="DEV_IDENTITY_ENABLED",
+            ),
+            dev_tenant_id=source.get("DEV_TENANT_ID", "local").strip(),
+            dev_user_id=source.get("DEV_USER_ID", "demo").strip(),
+            mcp_allowed_hosts=_parse_csv(
+                source.get(
+                    "MCP_ALLOWED_HOSTS",
+                    "127.0.0.1:*,localhost:*,[::1]:*,testserver,api:*",
+                )
+            ),
+            mcp_allowed_origins=_parse_csv(
+                source.get(
+                    "MCP_ALLOWED_ORIGINS",
+                    "http://127.0.0.1:*,http://localhost:*,http://[::1]:*",
+                )
+            ),
+            async_execution_backend=AsyncExecutionBackend(
+                source.get("ASYNC_EXECUTION_BACKEND", "local").strip().lower()
+            ),
+            redis_url=source.get(
+                "REDIS_URL", "redis://localhost:6379/0"
             ).strip(),
             run_budget_profile=source.get(
                 "RUN_BUDGET_PROFILE", "default-v1"
@@ -310,8 +408,34 @@ class Settings:
     def validate(self) -> None:
         if self.provider is ProviderMode.AMAP and not self.amap_api_key:
             raise ValueError("AMAP_API_KEY is required when TRAVEL_PROVIDER=amap")
+        if self.provider is ProviderMode.BAIDU and not self.baidu_api_key:
+            raise ValueError("BAIDU_MAP_AK is required when TRAVEL_PROVIDER=baidu")
+        if self.map_fallback_provider not in {"none", "baidu"}:
+            raise ValueError("MAP_FALLBACK_PROVIDER must be none or baidu")
+        if self.map_fallback_provider == "baidu" and not self.baidu_api_key:
+            raise ValueError(
+                "BAIDU_MAP_AK is required when MAP_FALLBACK_PROVIDER=baidu"
+            )
         if self.weather_provider is WeatherProviderMode.AMAP and not self.amap_api_key:
             raise ValueError("AMAP_API_KEY is required when WEATHER_PROVIDER=amap")
+        if self.weather_provider is WeatherProviderMode.QWEATHER and (
+            not self.qweather_api_host or not self.qweather_token
+        ):
+            raise ValueError(
+                "QWEATHER_API_HOST and QWEATHER_TOKEN are required when "
+                "WEATHER_PROVIDER=qweather"
+            )
+        if self.weather_fallback_provider not in {"none", "qweather"}:
+            raise ValueError(
+                "WEATHER_FALLBACK_PROVIDER must be none or qweather"
+            )
+        if self.weather_fallback_provider == "qweather" and (
+            not self.qweather_api_host or not self.qweather_token
+        ):
+            raise ValueError(
+                "QWEATHER_API_HOST and QWEATHER_TOKEN are required when "
+                "WEATHER_FALLBACK_PROVIDER=qweather"
+            )
         if self.tool_timeout_seconds <= 0:
             raise ValueError("TOOL_TIMEOUT_SECONDS must be positive")
         if self.tool_max_attempts < 1:
@@ -441,10 +565,47 @@ class Settings:
             raise ValueError(
                 "CHECKPOINT_SQLITE_PATH is required when CHECKPOINT_BACKEND=sqlite"
             )
-        if self.checkpoint_backend is CheckpointBackend.SQLITE and not self.plan_sqlite_path:
-            raise ValueError("PLAN_SQLITE_PATH is required when CHECKPOINT_BACKEND=sqlite")
+        if self.plan_store_backend is RunStoreBackend.SQLITE and not self.plan_sqlite_path:
+            raise ValueError("PLAN_SQLITE_PATH is required when PLAN_STORE_BACKEND=sqlite")
         if self.run_store_backend is RunStoreBackend.SQLITE and not self.run_sqlite_path:
             raise ValueError("RUN_SQLITE_PATH is required when RUN_STORE_BACKEND=sqlite")
+        if (
+            self.memory_store_backend is RunStoreBackend.SQLITE
+            and not self.memory_sqlite_path
+        ):
+            raise ValueError(
+                "MEMORY_SQLITE_PATH is required when MEMORY_STORE_BACKEND=sqlite"
+            )
+        if (
+            RunStoreBackend.POSTGRES
+            in {
+                self.plan_store_backend,
+                self.run_store_backend,
+                self.memory_store_backend,
+            }
+            and not self.database_url
+        ):
+            raise ValueError("DATABASE_URL is required for PostgreSQL repositories")
+        if not 32 <= self.memory_context_max_tokens <= 100_000:
+            raise ValueError(
+                "MEMORY_CONTEXT_MAX_TOKENS must be between 32 and 100000"
+            )
+        if not 128 <= self.memory_context_max_characters <= 400_000:
+            raise ValueError(
+                "MEMORY_CONTEXT_MAX_CHARACTERS must be between 128 and 400000"
+            )
+        if not 1 <= self.agent_max_handoffs <= 100:
+            raise ValueError("AGENT_MAX_HANDOFFS must be between 1 and 100")
+        if self.dev_identity_enabled and (
+            not self.dev_tenant_id or not self.dev_user_id
+        ):
+            raise ValueError(
+                "DEV_TENANT_ID and DEV_USER_ID are required when dev identity is enabled"
+            )
+        if not self.mcp_allowed_hosts:
+            raise ValueError("MCP_ALLOWED_HOSTS must contain at least one host")
+        if self.async_execution_backend is AsyncExecutionBackend.REDIS and not self.redis_url:
+            raise ValueError("REDIS_URL is required when ASYNC_EXECUTION_BACKEND=redis")
         if not self.run_budget_profile:
             raise ValueError("RUN_BUDGET_PROFILE must not be blank")
         if not 32 <= self.trace_attribute_max_chars <= 2048:
@@ -518,3 +679,7 @@ def _parse_bool(value: str, *, name: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean")
+
+
+def _parse_csv(value: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in value.split(",") if item.strip())

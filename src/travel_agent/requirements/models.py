@@ -16,6 +16,7 @@ from travel_agent.domain.models import (
     PlanningResponse,
     TripSpec,
 )
+from travel_agent.memory.models import PreferenceContext
 
 
 class RequirementProviderMode(StrEnum):
@@ -291,4 +292,6 @@ class NaturalPlanningResponse(BaseModel):
     can_resume: bool = False
     interrupt: ClarificationInterrupt | None = None
     planning: PlanningResponse | None = None
+    preference_context: PreferenceContext | None = None
+    personalized_fields: list[str] = Field(default_factory=list)
     message: str | None = None

@@ -10,6 +10,10 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
+from travel_agent.agents.context import CriticContext, PlannerContext, ReplannerContext
+from travel_agent.agents.contracts import HandoffReason
+from travel_agent.agents.orchestrator import SpecialistExecutor
+from travel_agent.config import AgentMode
 from travel_agent.domain.models import (
     PlanCandidate,
     PlanningRequest,
@@ -92,6 +96,7 @@ from travel_agent.planning.search_plan import build_search_plan as create_search
 from travel_agent.planning.validator import validate_candidate
 from travel_agent.tools.errors import ToolUnavailableError
 from travel_agent.tools.gateway import ToolGateway
+from travel_agent.memory.models import AgentRole
 
 
 logger = logging.getLogger(__name__)
@@ -410,18 +415,40 @@ def build_workflow(
     critic_policy: CriticPolicy = CriticPolicy(),
     evidence_budget: EvidenceBudget = EvidenceBudget(),
     evaluation_overrides: PlanningEvaluationOverrides | None = None,
+    agent_mode: AgentMode = AgentMode.SINGLE_GRAPH,
+    specialist_executor: SpecialistExecutor | None = None,
 ) -> CompiledStateGraph:
     """构建只通过注入 ToolGateway 获取外部事实的异步规划图。"""
 
     eval_overrides = evaluation_overrides or PlanningEvaluationOverrides()
+    use_specialists = agent_mode is not AgentMode.SINGLE_GRAPH
+    specialists = specialist_executor or SpecialistExecutor()
 
-    def build_search_plan(state: TravelState) -> dict:
+    async def build_search_plan(state: TravelState) -> dict:
         _log_node_started(state, "build_search_plan")
-        queries = create_search_plan(
-            state["trip"],
-            per_query_limit=policy.poi_query_limit,
+        context = PlannerContext(
+            trip=state["trip"],
+            poi_query_limit=policy.poi_query_limit,
             max_queries=policy.poi_max_queries,
         )
+        if use_specialists:
+            queries, _ = await specialists.invoke(
+                role=AgentRole.PLANNER,
+                reason=HandoffReason.PLAN,
+                context=context,
+                expected_output_schema="list[POISearchQuery]",
+                operation=lambda: create_search_plan(
+                    context.trip,
+                    per_query_limit=context.poi_query_limit,
+                    max_queries=context.max_queries,
+                ),
+            )
+        else:
+            queries = create_search_plan(
+                context.trip,
+                per_query_limit=context.poi_query_limit,
+                max_queries=context.max_queries,
+            )
         logger.info(
             "search_plan.created | thread_id=%s query_count=%s priorities=%s",
             state["thread_id"],
@@ -988,7 +1015,7 @@ def build_workflow(
             "status": "violations_analyzed",
         }
 
-    def create_repair_plan(state: TravelState) -> dict:
+    async def create_repair_plan(state: TravelState) -> dict:
         _log_node_started(state, "build_repair_plan")
         target_id = state["repair_target_candidate_id"]
         candidate = next(
@@ -1005,18 +1032,43 @@ def build_workflow(
         report = state["critic_report"]
         if report is None:
             raise RuntimeError("repair plan requires critic report")
-        plan, terminal_reason = build_repair_plan(
-            state["trip"],
-            candidate,
-            draft,
-            state["planning_pois"],
-            report,
+        context = ReplannerContext(
+            trip=state["trip"],
+            candidate=candidate,
+            draft=draft,
+            planning_pois=tuple(state["planning_pois"]),
+            critic_report=report,
             repair_round=next_round,
+            previous_action_fingerprints=frozenset(
+                attempt.action_fingerprint for attempt in state["repair_history"]
+            ),
         )
-        if plan is not None and any(
-            attempt.action_fingerprint == plan.action_fingerprint
-            for attempt in state["repair_history"]
-        ):
+        if use_specialists:
+            repair_result, _ = await specialists.invoke(
+                role=AgentRole.REPLANNER,
+                reason=HandoffReason.HARD_REPAIR,
+                context=context,
+                expected_output_schema="tuple[RepairPlan | None, str | None]",
+                operation=lambda: build_repair_plan(
+                    context.trip,
+                    context.candidate,
+                    context.draft,
+                    list(context.planning_pois),
+                    context.critic_report,
+                    repair_round=context.repair_round,
+                ),
+            )
+            plan, terminal_reason = repair_result
+        else:
+            plan, terminal_reason = build_repair_plan(
+                context.trip,
+                context.candidate,
+                context.draft,
+                list(context.planning_pois),
+                context.critic_report,
+                repair_round=context.repair_round,
+            )
+        if plan is not None and plan.action_fingerprint in context.previous_action_fingerprints:
             terminal_reason = "repeated_repair_action"
             plan = None
         logger.info(
@@ -1268,11 +1320,30 @@ def build_workflow(
             grounding_feedback=tuple(state["critic_grounding_errors"]),
         )
         try:
-            result = await critic_gateway.critique(
-                request,
-                thread_id=state["thread_id"],
-                grounding_attempt=semantic_attempt,
+            context = CriticContext(
+                request=request,
+                candidate_ids=tuple(
+                    digest.candidate_id for digest in state["critic_evidence_digests"]
+                ),
             )
+            if use_specialists:
+                result, _ = await specialists.invoke(
+                    role=AgentRole.CRITIC,
+                    reason=HandoffReason.SOFT_CRITIQUE,
+                    context=context,
+                    expected_output_schema="SoftCriticResult",
+                    operation=lambda: critic_gateway.critique(
+                        context.request,
+                        thread_id=state["thread_id"],
+                        grounding_attempt=semantic_attempt,
+                    ),
+                )
+            else:
+                result = await critic_gateway.critique(
+                    context.request,
+                    thread_id=state["thread_id"],
+                    grounding_attempt=semantic_attempt,
+                )
         except ExecutionBudgetExceeded:
             record_degradation("soft_critic_budget_exhausted")
             summary = CriticExecutionSummary(

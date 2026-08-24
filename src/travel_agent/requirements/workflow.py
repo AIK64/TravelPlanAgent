@@ -54,6 +54,9 @@ from travel_agent.requirements.validation import (
     assemble_trip_spec as create_trip_spec,
     validate_requirement as check_requirement,
 )
+from travel_agent.identity.models import Principal
+from travel_agent.memory.models import AgentRole, PreferenceContext
+from travel_agent.memory.service import PreferenceMemoryService
 from travel_agent.tools.errors import ToolUnavailableError
 from travel_agent.tools.gateway import ToolGateway
 
@@ -76,6 +79,13 @@ _REQUIREMENT_CHECKPOINT_ALLOWED_TYPES = (
     ("travel_agent.requirements.models", "RequirementModelStatus"),
     ("travel_agent.requirements.models", "RequirementOperation"),
     ("travel_agent.requirements.models", "RequirementPatch"),
+    ("travel_agent.memory.models", "AgentRole"),
+    ("travel_agent.memory.models", "ContextManifest"),
+    ("travel_agent.memory.models", "MemoryCategory"),
+    ("travel_agent.memory.models", "MemoryConflict"),
+    ("travel_agent.memory.models", "MemorySource"),
+    ("travel_agent.memory.models", "PreferenceContext"),
+    ("travel_agent.memory.models", "PreferenceSummary"),
 )
 
 
@@ -110,6 +120,7 @@ def build_requirement_workflow(
     requirement_gateway: RequirementGateway,
     tool_gateway: ToolGateway,
     planning_workflow: CompiledStateGraph,
+    memory_service: PreferenceMemoryService | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
     """构建可中断、可恢复的需求澄清与规划流程。"""
@@ -467,6 +478,54 @@ def build_requirement_workflow(
         _log_node(state, "completed", "assemble_trip_spec", "trip_assembled")
         return {"trip": trip, "status": "trip_assembled"}
 
+    async def retrieve_preferences(state: RequirementState) -> dict:
+        _log_node(state, "started", "retrieve_relevant_preferences", state["status"])
+        trip = state["trip"]
+        draft = state["requirement_draft"]
+        assert trip is not None
+        assert draft is not None
+        assert memory_service is not None
+        context = await memory_service.context_for_trip(
+            Principal(
+                tenant_id=state["tenant_id"],
+                user_id=state["user_id"],
+                scopes=frozenset({"preferences:read"}),
+            ),
+            trip=trip,
+            draft=draft,
+            agent_role=AgentRole.PLANNER,
+        )
+        personalized = memory_service.apply_to_trip(
+            trip,
+            draft=draft,
+            context=context,
+        )
+        changed = [
+            field
+            for field in ("pace", "mobility", "interests", "avoid")
+            if getattr(personalized, field) != getattr(trip, field)
+        ]
+        logger.info(
+            "memory.applied | thread_id=%s context_id=%s selected=%s "
+            "personalized_fields=%s",
+            state["thread_id"],
+            context.manifest.context_id,
+            len(context.summaries),
+            ",".join(changed) or "none",
+        )
+        _log_node(
+            state,
+            "completed",
+            "retrieve_relevant_preferences",
+            "preferences_composed",
+        )
+        return {
+            "trip": personalized,
+            "preference_context": context,
+            "personalized_fields": changed,
+            "status": "preferences_composed",
+        }
+
     async def execute_planning(state: RequirementState) -> dict:
         _log_node(state, "started", "execute_planning", state["status"])
         trip = state["trip"]
@@ -504,6 +563,8 @@ def build_requirement_workflow(
     add_node("apply_clarification_patch", apply_clarification_patch)
     add_node("clarification_exhausted", clarification_exhausted, terminal=True)
     add_node("assemble_trip_spec", assemble_trip_spec)
+    if memory_service is not None:
+        add_node("retrieve_relevant_preferences", retrieve_preferences)
     add_node("execute_planning", execute_planning, terminal=True)
     builder.add_edge(START, "execution_budget_guard")
     builder.add_edge("execution_budget_guard", "parse_requirement")
@@ -532,7 +593,11 @@ def build_requirement_workflow(
         ),
     )
     builder.add_edge("clarification_exhausted", END)
-    builder.add_edge("assemble_trip_spec", "execute_planning")
+    if memory_service is None:
+        builder.add_edge("assemble_trip_spec", "execute_planning")
+    else:
+        builder.add_edge("assemble_trip_spec", "retrieve_relevant_preferences")
+        builder.add_edge("retrieve_relevant_preferences", "execute_planning")
     builder.add_edge("execute_planning", END)
     resolved_checkpointer = checkpointer or ObservedCheckpointSaver(
         InMemorySaver(serde=requirement_checkpoint_serializer())
@@ -543,9 +608,14 @@ def build_requirement_workflow(
 def initial_requirement_state(
     request: NaturalPlanningRequest,
     thread_id: str,
+    *,
+    tenant_id: str = "local",
+    user_id: str = "demo",
 ) -> RequirementState:
     return {
         "thread_id": thread_id,
+        "tenant_id": tenant_id,
+        "user_id": user_id,
         "natural_request": request,
         "requirement_draft": None,
         "requirement_issues": [],
@@ -566,6 +636,8 @@ def initial_requirement_state(
         "llm_summaries": [],
         "tool_summaries": [],
         "trip": None,
+        "preference_context": None,
+        "personalized_fields": [],
         "planning_response": None,
         "status": "started",
         "message": None,
@@ -601,6 +673,8 @@ def response_from_requirement_state(
         can_resume=interrupt_view is not None,
         interrupt=interrupt_view,
         planning=state["planning_response"],
+        preference_context=state["preference_context"],
+        personalized_fields=state["personalized_fields"],
         message=state["message"],
     )
 
@@ -610,6 +684,8 @@ async def run_natural_planning(
     request: NaturalPlanningRequest,
     *,
     thread_id: str | None = None,
+    tenant_id: str = "local",
+    user_id: str = "demo",
 ) -> NaturalPlanningResponse:
     run_thread_id = thread_id or str(uuid4())
     started = perf_counter()
@@ -624,7 +700,12 @@ async def run_natural_planning(
     )
     try:
         result = await workflow.ainvoke(
-            initial_requirement_state(request, run_thread_id),
+            initial_requirement_state(
+                request,
+                run_thread_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            ),
             config=_graph_config(run_thread_id),
         )
     except Exception:
@@ -638,10 +719,16 @@ async def resume_natural_planning(
     request: ClarificationResumeRequest,
     *,
     thread_id: str,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
 ) -> NaturalPlanningResponse:
     config = _graph_config(thread_id)
     snapshot = await workflow.aget_state(config)
     if not snapshot.values:
+        raise ClarificationThreadNotFoundError(thread_id=thread_id)
+    if tenant_id is not None and snapshot.values.get("tenant_id") != tenant_id:
+        raise ClarificationThreadNotFoundError(thread_id=thread_id)
+    if user_id is not None and snapshot.values.get("user_id") != user_id:
         raise ClarificationThreadNotFoundError(thread_id=thread_id)
     interruptions = tuple(
         interruption

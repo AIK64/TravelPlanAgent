@@ -23,6 +23,7 @@ class RunStatus(StrEnum):
     INTERRUPTED = "interrupted"
     REPLAYED = "replayed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class RunTerminalReason(StrEnum):
@@ -41,6 +42,7 @@ class RunTerminalReason(StrEnum):
     CHECKPOINT_FAILURE = "checkpoint_failure"
     REPOSITORY_FAILURE = "repository_failure"
     INVALID_INTERNAL_STATE = "invalid_internal_state"
+    USER_CANCELLED = "user_cancelled"
 
 
 class TraceStatus(StrEnum):
@@ -54,6 +56,7 @@ class TraceEventType(StrEnum):
     RUN_INTERRUPTED = "run.interrupted"
     RUN_FAILED = "run.failed"
     RUN_REPLAYED = "run.replayed"
+    RUN_CANCELLED = "run.cancelled"
     NODE_STARTED = "node.started"
     NODE_COMPLETED = "node.completed"
     NODE_FAILED = "node.failed"
@@ -86,6 +89,22 @@ class TraceEventType(StrEnum):
     BUDGET_UPDATED = "budget.updated"
     BUDGET_EXCEEDED = "budget.exceeded"
     DEGRADATION_APPLIED = "degradation.applied"
+    MEMORY_NAMESPACE_RESOLVED = "memory.namespace_resolved"
+    MEMORY_RETRIEVE_STARTED = "memory.retrieve_started"
+    MEMORY_RETRIEVE_COMPLETED = "memory.retrieve_completed"
+    MEMORY_CONFLICT_DETECTED = "memory.conflict_detected"
+    CONTEXT_COMPOSED = "context.composed"
+    MEMORY_PROPOSAL_CREATED = "memory.proposal_created"
+    MEMORY_CONFIRMATION_REQUIRED = "memory.confirmation_required"
+    MEMORY_PERSISTED = "memory.persisted"
+    MEMORY_REVOKED = "memory.revoked"
+    AGENT_HANDOFF_STARTED = "agent.handoff_started"
+    AGENT_HANDOFF_COMPLETED = "agent.handoff_completed"
+    AGENT_HANDOFF_REJECTED = "agent.handoff_rejected"
+    PROVIDER_ATTEMPT_STARTED = "provider.attempt_started"
+    PROVIDER_ATTEMPT_COMPLETED = "provider.attempt_completed"
+    PROVIDER_FALLBACK_SELECTED = "provider.fallback_selected"
+    PROVIDER_CHAIN_EXHAUSTED = "provider.chain_exhausted"
 
 
 class ExecutionBudget(BaseModel):
@@ -189,6 +208,8 @@ class AgentRunRecord(BaseModel):
     ended_at: datetime | None = None
     elapsed_ms: int | None = Field(default=None, ge=0)
     config_fingerprint: str
+    tenant_id: str = "local"
+    user_id: str = "demo"
 
 
 class TracePage(BaseModel):

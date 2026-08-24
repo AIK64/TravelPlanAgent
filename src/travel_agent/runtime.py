@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 from langgraph.graph.state import CompiledStateGraph
 
+from travel_agent.agents.orchestrator import SpecialistExecutor
 from travel_agent.config import (
     CriticProviderMode,
     EditProviderMode,
@@ -69,6 +70,16 @@ from travel_agent.requirements.models import (
     NaturalPlanningResponse,
     RequirementProviderMode,
 )
+from travel_agent.tools.providers.baidu import (
+    BaiduMapClient,
+    BaiduPOIProvider,
+    BaiduRouteProvider,
+)
+from travel_agent.tools.providers.chain import (
+    POIProviderChain,
+    RouteProviderChain,
+    WeatherProviderChain,
+)
 from travel_agent.requirements.protocols import RequirementModel
 from travel_agent.requirements.providers.mock import MockRequirementModel
 from travel_agent.requirements.providers.openai import OpenAIRequirementModel
@@ -82,6 +93,13 @@ from travel_agent.weather.gateway import WeatherToolGateway, build_weather_gatew
 from travel_agent.weather.protocols import WeatherProvider
 from travel_agent.weather.providers.amap import AMapWeatherProvider
 from travel_agent.weather.providers.mock import MockWeatherProvider
+from travel_agent.weather.providers.qweather import QWeatherProvider
+from travel_agent.identity.models import Principal
+from travel_agent.memory.repository import (
+    PreferenceRepository,
+    open_preference_repository,
+)
+from travel_agent.memory.service import PreferenceMemoryService
 
 
 @dataclass(slots=True)
@@ -93,6 +111,7 @@ class PlanningRuntime:
     gateway: ToolGateway
     workflow: CompiledStateGraph
     client: httpx.AsyncClient | None
+    auxiliary_client: httpx.AsyncClient | None = None
     weather_provider: WeatherProvider | None = None
     weather_gateway: WeatherToolGateway | None = None
     requirement_model: RequirementModel | None = None
@@ -113,6 +132,10 @@ class PlanningRuntime:
     run_repository: RunRepository | None = None
     run_coordinator: RunCoordinator | None = None
     run_repository_context: Any | None = field(default=None, repr=False)
+    preference_repository: PreferenceRepository | None = None
+    preference_service: PreferenceMemoryService | None = None
+    preference_repository_context: Any | None = field(default=None, repr=False)
+    specialist_executor: SpecialistExecutor | None = None
     resume_locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -128,12 +151,15 @@ class PlanningRuntime:
         model_client: Any | None = None
         critic_model_client: Any | None = None
         edit_model_client: Any | None = None
+        auxiliary_client: httpx.AsyncClient | None = None
         checkpoint_context: Any | None = None
         repository_context: Any | None = None
         run_repository_context: Any | None = None
+        preference_repository_context: Any | None = None
         checkpoint_entered = False
         repository_entered = False
         run_repository_entered = False
+        preference_repository_entered = False
         try:
             amap_client: AMapClient | None = None
             if (
@@ -147,13 +173,37 @@ class PlanningRuntime:
                     api_key=settings.amap_api_key,
                     timeout_seconds=settings.tool_timeout_seconds,
                 )
+            baidu_client: BaiduMapClient | None = None
+            if (
+                settings.provider is ProviderMode.BAIDU
+                or settings.map_fallback_provider == "baidu"
+            ):
+                auxiliary_client = httpx.AsyncClient(
+                    timeout=settings.tool_timeout_seconds
+                )
+                assert settings.baidu_api_key is not None
+                baidu_client = BaiduMapClient(
+                    auxiliary_client, settings.baidu_api_key
+                )
             if settings.provider is ProviderMode.MOCK:
                 poi_provider: POIProvider = MockPOIProvider()
                 route_provider: RouteProvider = MockRouteProvider()
-            else:
+            elif settings.provider is ProviderMode.AMAP:
                 assert amap_client is not None
                 poi_provider = AMapPOIProvider(amap_client)
                 route_provider = AMapRouteProvider(amap_client)
+            else:
+                assert baidu_client is not None
+                poi_provider = BaiduPOIProvider(baidu_client)
+                route_provider = BaiduRouteProvider(baidu_client)
+            if settings.map_fallback_provider == "baidu":
+                assert baidu_client is not None
+                poi_provider = POIProviderChain(
+                    (poi_provider, BaiduPOIProvider(baidu_client))
+                )
+                route_provider = RouteProviderChain(
+                    (route_provider, BaiduRouteProvider(baidu_client))
+                )
 
             gateway = build_gateway(
                 settings,
@@ -163,9 +213,36 @@ class PlanningRuntime:
             )
             if settings.weather_provider is WeatherProviderMode.MOCK:
                 weather_provider: WeatherProvider = MockWeatherProvider()
-            else:
+            elif settings.weather_provider is WeatherProviderMode.AMAP:
                 assert amap_client is not None
                 weather_provider = AMapWeatherProvider(amap_client)
+            else:
+                if auxiliary_client is None:
+                    auxiliary_client = httpx.AsyncClient(
+                        timeout=settings.tool_timeout_seconds
+                    )
+                assert settings.qweather_token is not None
+                weather_provider = QWeatherProvider(
+                    auxiliary_client,
+                    api_host=settings.qweather_api_host,
+                    token=settings.qweather_token,
+                )
+            if settings.weather_fallback_provider == "qweather":
+                if auxiliary_client is None:
+                    auxiliary_client = httpx.AsyncClient(
+                        timeout=settings.tool_timeout_seconds
+                    )
+                assert settings.qweather_token is not None
+                weather_provider = WeatherProviderChain(
+                    (
+                        weather_provider,
+                        QWeatherProvider(
+                            auxiliary_client,
+                            api_host=settings.qweather_api_host,
+                            token=settings.qweather_token,
+                        ),
+                    )
+                )
             weather_gateway = build_weather_gateway(settings, weather_provider)
             defaults = POIDefaultPolicy(settings.unknown_fact_policy)
             policy = PlanningPolicy(
@@ -242,6 +319,9 @@ class PlanningRuntime:
                 max_soft_replan_rounds=settings.max_soft_replan_rounds,
                 grounding_max_attempts=settings.critic_grounding_max_attempts,
             )
+            specialist_executor = SpecialistExecutor(
+                max_handoffs=settings.agent_max_handoffs
+            )
             workflow = build_workflow(
                 gateway,
                 defaults,
@@ -253,6 +333,8 @@ class PlanningRuntime:
                     max_input_chars=settings.critic_max_input_chars
                 ),
                 evaluation_overrides=evaluation_overrides,
+                agent_mode=settings.agent_mode,
+                specialist_executor=specialist_executor,
             )
             if settings.requirement_provider is RequirementProviderMode.MOCK:
                 requirement_model: RequirementModel = MockRequirementModel()
@@ -300,6 +382,20 @@ class PlanningRuntime:
                 base_delay_seconds=settings.requirement_backoff_base_seconds,
                 max_delay_seconds=settings.requirement_max_backoff_seconds,
             )
+            preference_repository_context = open_preference_repository(
+                backend=settings.memory_store_backend.value,
+                sqlite_path=settings.memory_sqlite_path,
+                database_url=settings.database_url,
+            )
+            preference_repository = (
+                await preference_repository_context.__aenter__()
+            )
+            preference_repository_entered = True
+            preference_service = PreferenceMemoryService(
+                preference_repository,
+                context_max_tokens=settings.memory_context_max_tokens,
+                context_max_characters=settings.memory_context_max_characters,
+            )
             checkpoint_context = open_requirement_checkpointer(settings)
             requirement_checkpointer = await checkpoint_context.__aenter__()
             checkpoint_entered = True
@@ -307,6 +403,7 @@ class PlanningRuntime:
                 requirement_gateway=requirement_gateway,
                 tool_gateway=gateway,
                 planning_workflow=workflow,
+                memory_service=preference_service,
                 checkpointer=requirement_checkpointer,
             )
             if settings.edit_provider is EditProviderMode.MOCK:
@@ -352,9 +449,16 @@ class PlanningRuntime:
                 timeout_seconds=settings.edit_timeout_seconds,
                 max_attempts=settings.edit_max_attempts,
             )
+            plan_store_backend = (
+                settings.checkpoint_backend.value
+                if settings.plan_store_backend.value == "memory"
+                and settings.checkpoint_backend.value == "sqlite"
+                else settings.plan_store_backend.value
+            )
             repository_context = open_plan_repository(
-                backend=settings.checkpoint_backend.value,
+                backend=plan_store_backend,
                 sqlite_path=settings.plan_sqlite_path,
+                database_url=settings.database_url,
             )
             plan_repository = await repository_context.__aenter__()
             repository_entered = True
@@ -391,6 +495,7 @@ class PlanningRuntime:
             run_repository_context = open_run_repository(
                 backend=settings.run_store_backend.value,
                 sqlite_path=settings.run_sqlite_path,
+                database_url=settings.database_url,
             )
             run_repository = await run_repository_context.__aenter__()
             run_repository_entered = True
@@ -405,6 +510,8 @@ class PlanningRuntime:
                     "critic_provider": settings.critic_provider.value,
                     "edit_provider": settings.edit_provider.value,
                     "weather_provider": settings.weather_provider.value,
+                    "agent_mode": settings.agent_mode.value,
+                    "memory_store": settings.memory_store_backend.value,
                 },
             )
             return cls(
@@ -413,6 +520,7 @@ class PlanningRuntime:
                 gateway=gateway,
                 workflow=workflow,
                 client=client,
+                auxiliary_client=auxiliary_client,
                 weather_provider=weather_provider,
                 weather_gateway=weather_gateway,
                 requirement_model=requirement_model,
@@ -433,12 +541,21 @@ class PlanningRuntime:
                 run_repository=run_repository,
                 run_coordinator=run_coordinator,
                 run_repository_context=run_repository_context,
+                preference_repository=preference_repository,
+                preference_service=preference_service,
+                preference_repository_context=preference_repository_context,
+                specialist_executor=specialist_executor,
             )
         except BaseException:
             if run_repository_context is not None and run_repository_entered:
                 await run_repository_context.__aexit__(None, None, None)
             if repository_context is not None and repository_entered:
                 await repository_context.__aexit__(None, None, None)
+            if (
+                preference_repository_context is not None
+                and preference_repository_entered
+            ):
+                await preference_repository_context.__aexit__(None, None, None)
             if checkpoint_context is not None and checkpoint_entered:
                 await checkpoint_context.__aexit__(None, None, None)
             if model_client is not None:
@@ -456,6 +573,8 @@ class PlanningRuntime:
                 await edit_model_client.close()
             if client is not None:
                 await client.aclose()
+            if auxiliary_client is not None:
+                await auxiliary_client.aclose()
             raise
 
     async def close(self) -> None:
@@ -474,10 +593,14 @@ class PlanningRuntime:
             await self.edit_model_client.close()
         if self.client is not None:
             await self.client.aclose()
+        if self.auxiliary_client is not None:
+            await self.auxiliary_client.aclose()
         if self.run_repository_context is not None:
             await self.run_repository_context.__aexit__(None, None, None)
         if self.repository_context is not None:
             await self.repository_context.__aexit__(None, None, None)
+        if self.preference_repository_context is not None:
+            await self.preference_repository_context.__aexit__(None, None, None)
         if self.checkpoint_context is not None:
             await self.checkpoint_context.__aexit__(None, None, None)
 
@@ -495,6 +618,9 @@ class PlanningRuntime:
         thread_id: str,
         fault_plan: FaultPlan | None = None,
         budget: ExecutionBudget | None = None,
+        run_id: str | None = None,
+        principal: Principal | None = None,
+        precreated: bool = False,
     ) -> ExecutionResult[PlanningResponse]:
         call = lambda: run_planning(self.workflow, request, thread_id=thread_id)
         if self.run_coordinator is None:
@@ -505,17 +631,43 @@ class PlanningRuntime:
             thread_id=thread_id,
             fault_plan=fault_plan,
             budget=budget,
+            run_id=run_id,
+            tenant_id=(principal.tenant_id if principal else "local"),
+            user_id=(principal.user_id if principal else "demo"),
+            precreated=precreated,
+        )
+
+    async def reserve_plan_run(
+        self,
+        *,
+        run_id: str,
+        thread_id: str,
+        principal: Principal,
+        request_id: str | None = None,
+    ) -> AgentRunRecord:
+        if self.run_coordinator is None:
+            raise RuntimeError("run coordinator is not configured")
+        return await self.run_coordinator.reserve(
+            RunKind.STRUCTURED_PLAN,
+            run_id=run_id,
+            thread_id=thread_id,
+            request_id=request_id,
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
         )
 
     async def plan_from_text(
         self,
         request: NaturalPlanningRequest,
         thread_id: str,
+        principal: Principal | None = None,
     ) -> NaturalPlanningResponse:
         if self.requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
         return (
-            await self.execute_plan_from_text(request, thread_id=thread_id)
+            await self.execute_plan_from_text(
+                request, thread_id=thread_id, principal=principal
+            )
         ).payload
 
     async def execute_plan_from_text(
@@ -523,13 +675,19 @@ class PlanningRuntime:
         request: NaturalPlanningRequest,
         *,
         thread_id: str,
+        principal: Principal | None = None,
         fault_plan: FaultPlan | None = None,
         budget: ExecutionBudget | None = None,
     ) -> ExecutionResult[NaturalPlanningResponse]:
         if self.requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
+        identity = principal or Principal(tenant_id="local", user_id="demo")
         call = lambda: run_natural_planning(
-            self.requirement_workflow, request, thread_id=thread_id
+            self.requirement_workflow,
+            request,
+            thread_id=thread_id,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
         )
         if self.run_coordinator is None:
             return ExecutionResult(payload=await call(), run=None)
@@ -545,11 +703,14 @@ class PlanningRuntime:
         self,
         request: ClarificationResumeRequest,
         thread_id: str,
+        principal: Principal | None = None,
     ) -> NaturalPlanningResponse:
         if self.requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
         return (
-            await self.execute_resume_from_text(request, thread_id=thread_id)
+            await self.execute_resume_from_text(
+                request, thread_id=thread_id, principal=principal
+            )
         ).payload
 
     async def execute_resume_from_text(
@@ -557,16 +718,22 @@ class PlanningRuntime:
         request: ClarificationResumeRequest,
         *,
         thread_id: str,
+        principal: Principal | None = None,
         fault_plan: FaultPlan | None = None,
     ) -> ExecutionResult[NaturalPlanningResponse]:
         if self.requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
+        identity = principal or Principal(tenant_id="local", user_id="demo")
 
         async def call() -> NaturalPlanningResponse:
             lock = self.resume_locks.setdefault(thread_id, asyncio.Lock())
             async with lock:
                 return await resume_natural_planning(
-                    self.requirement_workflow, request, thread_id=thread_id
+                    self.requirement_workflow,
+                    request,
+                    thread_id=thread_id,
+                    tenant_id=identity.tenant_id,
+                    user_id=identity.user_id,
                 )
 
         if self.run_coordinator is None:
@@ -579,6 +746,8 @@ class PlanningRuntime:
             causation_id=request.interrupt_id,
             parent_run_id=await self._latest_run_id(thread_id=thread_id),
             fault_plan=fault_plan,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
         )
 
     async def create_plan_session(
@@ -596,10 +765,17 @@ class PlanningRuntime:
         *,
         session_id: str,
         fault_plan: FaultPlan | None = None,
+        principal: Principal | None = None,
     ) -> ExecutionResult[PlanSessionResponse]:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
-        call = lambda: self.lifecycle_service.create(request, session_id=session_id)
+        identity = principal or Principal(tenant_id="local", user_id="demo")
+        call = lambda: self.lifecycle_service.create(
+            request,
+            session_id=session_id,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
+        )
         if self.run_coordinator is None:
             return ExecutionResult(payload=await call(), run=None)
         return await self.run_coordinator.execute(
@@ -608,16 +784,22 @@ class PlanningRuntime:
             session_id=session_id,
             thread_id=f"planning:{session_id}",
             fault_plan=fault_plan,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
         )
 
     async def create_plan_session_from_text(
-        self, request: NaturalPlanningRequest, *, session_id: str
+        self,
+        request: NaturalPlanningRequest,
+        *,
+        session_id: str,
+        principal: Principal | None = None,
     ) -> PlanSessionResponse:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
         return (
             await self.execute_create_plan_session_from_text(
-                request, session_id=session_id
+                request, session_id=session_id, principal=principal
             )
         ).payload
 
@@ -626,12 +808,17 @@ class PlanningRuntime:
         request: NaturalPlanningRequest,
         *,
         session_id: str,
+        principal: Principal | None = None,
         fault_plan: FaultPlan | None = None,
     ) -> ExecutionResult[PlanSessionResponse]:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
+        identity = principal or Principal(tenant_id="local", user_id="demo")
         call = lambda: self.lifecycle_service.create_from_text(
-            request, session_id=session_id
+            request,
+            session_id=session_id,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
         )
         if self.run_coordinator is None:
             return ExecutionResult(payload=await call(), run=None)
@@ -641,6 +828,8 @@ class PlanningRuntime:
             session_id=session_id,
             thread_id=f"intake:{session_id}",
             fault_plan=fault_plan,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
         )
 
     async def resume_plan_session(
@@ -658,10 +847,12 @@ class PlanningRuntime:
         *,
         session_id: str,
         fault_plan: FaultPlan | None = None,
+        principal: Principal | None = None,
     ) -> ExecutionResult[PlanSessionResponse]:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
         call = lambda: self.lifecycle_service.resume(session_id, request)
+        identity = principal or Principal(tenant_id="local", user_id="demo")
         if self.run_coordinator is None:
             return ExecutionResult(payload=await call(), run=None)
         return await self.run_coordinator.execute(
@@ -673,6 +864,8 @@ class PlanningRuntime:
             causation_id=request.interrupt_id,
             parent_run_id=await self._latest_run_id(session_id=session_id),
             fault_plan=fault_plan,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
         )
 
     async def get_plan_session(self, *, session_id: str) -> PlanSessionResponse:
@@ -710,10 +903,12 @@ class PlanningRuntime:
         *,
         session_id: str,
         fault_plan: FaultPlan | None = None,
+        principal: Principal | None = None,
     ) -> ExecutionResult[PlanSessionResponse]:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
         call = lambda: self.lifecycle_service.refresh_weather(session_id, request)
+        identity = principal or Principal(tenant_id="local", user_id="demo")
         if self.run_coordinator is None:
             return ExecutionResult(payload=await call(), run=None)
         return await self.run_coordinator.execute(
@@ -724,6 +919,8 @@ class PlanningRuntime:
             request_id=str(request.request_id),
             parent_run_id=await self._latest_run_id(session_id=session_id),
             fault_plan=fault_plan,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
         )
 
     async def get_plan_weather(self, *, session_id: str) -> WeatherStateView:

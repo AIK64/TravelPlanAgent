@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from typing import Annotated
+import inspect
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Query, Response
 
 from travel_agent import __version__
-from travel_agent.api.dependencies import get_runtime
+from travel_agent.api.dependencies import (
+    get_application_service,
+    get_principal,
+    get_runtime,
+)
+from travel_agent.application.service import TravelApplicationService
+from travel_agent.identity.models import Principal
 from travel_agent.domain.models import PlanningRequest, PlanningResponse
 from travel_agent.domain.lifecycle_models import (
     LifecycleResumeRequest,
@@ -41,6 +48,7 @@ async def create_plan(
     request: PlanningRequest,
     response: Response,
     runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
 ) -> PlanningResponse:
     thread_id = str(uuid4())
     return await _execute_with_run(
@@ -50,6 +58,7 @@ async def create_plan(
         response,
         request,
         thread_id=thread_id,
+        principal=principal,
     )
 
 
@@ -62,6 +71,7 @@ async def create_plan_from_text(
     request: NaturalPlanningRequest,
     response: Response,
     runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
 ) -> NaturalPlanningResponse:
     thread_id = str(uuid4())
     return await _execute_with_run(
@@ -71,6 +81,7 @@ async def create_plan_from_text(
         response,
         request,
         thread_id=thread_id,
+        principal=principal,
     )
 
 
@@ -84,6 +95,7 @@ async def resume_plan_from_text(
     request: ClarificationResumeRequest,
     response: Response,
     runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
 ) -> NaturalPlanningResponse:
     return await _execute_with_run(
         runtime,
@@ -92,6 +104,7 @@ async def resume_plan_from_text(
         response,
         request,
         thread_id=thread_id,
+        principal=principal,
     )
 
 
@@ -104,6 +117,7 @@ async def create_plan_session(
     request: PlanningRequest,
     response: Response,
     runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
 ) -> PlanSessionResponse:
     session_id = str(uuid4())
     return await _execute_with_run(
@@ -113,6 +127,7 @@ async def create_plan_session(
         response,
         request,
         session_id=session_id,
+        principal=principal,
     )
 
 
@@ -125,6 +140,7 @@ async def create_plan_session_from_text(
     request: NaturalPlanningRequest,
     response: Response,
     runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
 ) -> PlanSessionResponse:
     return await _execute_with_run(
         runtime,
@@ -133,6 +149,7 @@ async def create_plan_session_from_text(
         response,
         request,
         session_id=str(uuid4()),
+        principal=principal,
     )
 
 
@@ -145,16 +162,14 @@ async def resume_plan_session(
     session_id: str,
     request: LifecycleResumeRequest,
     response: Response,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ) -> PlanSessionResponse:
-    return await _execute_with_run(
-        runtime,
-        "execute_resume_plan_session",
-        "resume_plan_session",
-        response,
-        request,
-        session_id=session_id,
+    result = await service.execute_resume_plan_session(
+        session_id, request, principal=principal
     )
+    _apply_run_headers(response, result)
+    return result.payload
 
 
 @router.get(
@@ -164,9 +179,10 @@ async def resume_plan_session(
 )
 async def get_plan_session(
     session_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ) -> PlanSessionResponse:
-    return await runtime.get_plan_session(session_id=session_id)
+    return await service.get_plan_session(session_id, principal=principal)
 
 
 @router.get(
@@ -176,9 +192,10 @@ async def get_plan_session(
 )
 async def get_plan_versions(
     session_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ):
-    return await runtime.get_plan_versions(session_id=session_id)
+    return await service.get_plan_versions(session_id, principal=principal)
 
 
 @router.get(
@@ -189,10 +206,11 @@ async def get_plan_versions(
 async def get_plan_version(
     session_id: str,
     version_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ):
-    return await runtime.get_plan_version(
-        session_id=session_id, version_id=version_id
+    return await service.get_plan_version(
+        session_id, version_id, principal=principal
     )
 
 
@@ -205,10 +223,11 @@ async def get_plan_diff(
     session_id: str,
     from_id: str,
     to_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ):
-    return await runtime.get_plan_diff(
-        session_id=session_id, from_id=from_id, to_id=to_id
+    return await service.get_plan_diff(
+        session_id, from_id, to_id, principal=principal
     )
 
 
@@ -221,16 +240,14 @@ async def refresh_plan_weather(
     session_id: str,
     request: WeatherRefreshRequest,
     response: Response,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ) -> PlanSessionResponse:
-    return await _execute_with_run(
-        runtime,
-        "execute_refresh_plan_weather",
-        "refresh_plan_weather",
-        response,
-        request,
-        session_id=session_id,
+    result = await service.refresh_plan_weather(
+        session_id, request, principal=principal
     )
+    _apply_run_headers(response, result)
+    return result.payload
 
 
 @router.get(
@@ -240,9 +257,10 @@ async def refresh_plan_weather(
 )
 async def get_plan_weather(
     session_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ) -> WeatherStateView:
-    return await runtime.get_plan_weather(session_id=session_id)
+    return await service.get_plan_weather(session_id, principal=principal)
 
 
 @router.get(
@@ -252,9 +270,10 @@ async def get_plan_weather(
 )
 async def get_plan_weather_events(
     session_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ):
-    return await runtime.get_plan_weather_events(session_id=session_id)
+    return await service.get_plan_weather_events(session_id, principal=principal)
 
 
 @router.get(
@@ -265,10 +284,11 @@ async def get_plan_weather_events(
 async def get_plan_weather_event(
     session_id: str,
     event_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ):
-    return await runtime.get_plan_weather_event(
-        session_id=session_id, event_id=event_id
+    return await service.get_plan_weather_event(
+        session_id, event_id, principal=principal
     )
 
 
@@ -279,9 +299,10 @@ async def get_plan_weather_event(
 )
 async def get_agent_run(
     run_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
 ) -> AgentRunRecord:
-    return await runtime.get_agent_run(run_id)
+    return await service.get_run(run_id, principal=principal)
 
 
 @router.get(
@@ -291,12 +312,16 @@ async def get_agent_run(
 )
 async def get_agent_trace(
     run_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
     after_sequence: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> TracePage:
-    events = await runtime.get_agent_trace(
-        run_id, after_sequence=after_sequence, limit=limit
+    events = await service.get_trace(
+        run_id,
+        principal=principal,
+        after_sequence=after_sequence,
+        limit=limit,
     )
     return TracePage(
         run_id=run_id,
@@ -312,10 +337,13 @@ async def get_agent_trace(
 )
 async def get_session_runs(
     session_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
     limit: int = Query(default=50, ge=1, le=100),
 ):
-    return await runtime.get_session_runs(session_id, limit=limit)
+    return await service.get_session_runs(
+        session_id, principal=principal, limit=limit
+    )
 
 
 @router.get(
@@ -325,10 +353,13 @@ async def get_session_runs(
 )
 async def get_thread_runs(
     thread_id: str,
-    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+    principal: Annotated[Principal, Depends(get_principal)],
+    service: Annotated[TravelApplicationService, Depends(get_application_service)],
     limit: int = Query(default=50, ge=1, le=100),
 ):
-    return await runtime.get_thread_runs(thread_id, limit=limit)
+    return await service.get_thread_runs(
+        thread_id, principal=principal, limit=limit
+    )
 
 
 async def _execute_with_run(
@@ -340,12 +371,24 @@ async def _execute_with_run(
     **kwargs,
 ):
     execute = getattr(runtime, execute_method, None)
+    target = execute or getattr(runtime, legacy_method)
+    parameters = inspect.signature(target).parameters.values()
+    accepts_kwargs = any(
+        item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters
+    )
+    if not accepts_kwargs:
+        accepted = {item.name for item in parameters}
+        kwargs = {key: value for key, value in kwargs.items() if key in accepted}
     if execute is None:
-        return await getattr(runtime, legacy_method)(*args, **kwargs)
-    result = await execute(*args, **kwargs)
+        return await target(*args, **kwargs)
+    result = await target(*args, **kwargs)
+    _apply_run_headers(response, result)
+    return result.payload
+
+
+def _apply_run_headers(response: Response, result: object) -> None:
     run = getattr(result, "run", None)
     if run is not None:
         response.headers["X-Agent-Run-Id"] = run.run_id
         response.headers["X-Agent-Trace-Status"] = run.trace_status.value
-    return result.payload
 

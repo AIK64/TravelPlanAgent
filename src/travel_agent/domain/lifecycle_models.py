@@ -315,6 +315,8 @@ class PlanSessionRecord(BaseModel):
     lifecycle_thread_id: str
     intake_thread_id: str | None = None
     status: PlanSessionStatus
+    tenant_id: str = "local"
+    user_id: str = "demo"
     session_revision: int = Field(default=0, ge=0)
     snapshot: PlanningSnapshot | None = None
     active_version_id: str | None = None

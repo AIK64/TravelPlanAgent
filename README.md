@@ -1,8 +1,8 @@
 # Constraint-Aware Travel Agent
 
-面向中国城市旅行场景的约束感知规划 Agent。v1.0 把 Requirement、Planning、Lifecycle/HITL 与 Weather Replanning 纳入统一 `AgentRun → ExecutionBudget → Trace → Benchmark → Release Gate`：每次执行都有独立 Run、共享预算、强类型安全轨迹、明确失败分类和可重复评测证据。
+面向中国城市旅行场景的约束感知规划 Agent。v1.2 在 v1.0 的 Requirement、Planning、Lifecycle/HITL 与 Weather Replanning 基线上，加入长期 Preference Memory、上下文裁剪、进程内 Specialist Handoff、真实 Provider Failover、Travel MCP、异步 Run/SSE、核心演示前端与生产部署适配。核心仍是显式 `Plan → Tool Use → Validate/Critic → Replan` Agent Loop，而不是地图或前端工程堆叠。
 
-## 当前进度：v1.0.0
+## 当前进度：v1.2.0
 
 ```text
 Natural Language
@@ -96,11 +96,15 @@ Natural Language
 - 刷新、天气状态和事件查询 API；Provider 失败返回 503 并保留 Active Version，不会被伪装成 `infeasible` 或天气良好。
 - 30 条固定天气 Fixture；当前离线 Mock 基线 Event F1、Impact Exact Match、锁与未影响日保持率均为 100%，路线复用率为 66.41%。
 
-当前边界：天气刷新由客户端显式触发，不包含定时任务、推送、空气质量、分钟级降水或备用天气 Provider；计划编辑最多包含三个原子动作、影响两个日期。当前路线矩阵不是 OTA 级全量交通规划，SQLite 只用于单机演示；长期 Memory 属于 v1.1，MCP、备用 Provider、完整前端和生产化属于 v1.2。
+当前边界：不实现 OTA 库存或交易，不把 Agent 拆成分布式自治服务；Specialist 是进程内强类型 Handoff，用于 Planner/Critic/Replanner 上下文隔离，Orchestrator 仍拥有唯一路由和终止权。真实 Provider Live Smoke、Docker 全栈演练与 LLM 软评测需要调用者自行提供凭证，默认测试不会产生外部费用。
+
+本机最终门禁收集 565 项测试，563 项通过，2 项真实 Provider Live Smoke 因未显式启用而跳过；statement + branch 综合覆盖率为 90.0177%。前端 `npm run build` 通过。当前环境没有 Docker CLI，因此 Compose 仅完成代码、配置和 Repository/Queue Contract 验证，尚未在本机做容器级 Smoke。
 
 ## 学习入口
 
-- 后续开发以 [v0.9 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md) 为准；v1.0 已完成核心 Agent，v1.1 增加 Preference Memory，v1.2 完成 MCP 与平台化。
+- 从 [v1.2 实现与使用指南](docs/v1.1-v1.2/implementation.md) 查看 Memory、Specialist、异步 API、MCP、Baidu/QWeather、前端、Worker 与生产部署的实际入口。
+- 后续开发以 [v1.1 → v1.2 最终开发入口](docs/v1.1-v1.2/README.md) 为准；[统一设计报告](docs/v1.1-v1.2/design.md) 和 [需求追踪矩阵](docs/v1.1-v1.2/requirements-traceability.md) 已冻结一次连续实现、两个内部 Gate、最终发布 v1.2.0 的范围。
+- 历史版本边界和共同守则见 [v0.9 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md)。
 - 从 [v1.0 实现文档](docs/v1.0/README.md) 查看 Run/Trace API、预算、DeepSeek/地图配置、发布门禁和消融结果；完整取舍见 [设计报告](docs/v1.0/design.md)。
 - 从 [v0.9 天气事件驱动局部重规划文档](docs/v0.9/README.md) 查看配置、API、Graph、失败语义和实际离线评测结果；完整取舍见 [设计报告](docs/v0.9/design.md)。
 - 从 [v0.8 计划生命周期 HITL 文档](docs/v0.8/README.md) 查看会话 API、DeepSeek 编辑配置、Graph、失败语义和评测；完整取舍见 [设计报告](docs/v0.8/design.md)。

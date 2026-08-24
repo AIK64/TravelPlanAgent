@@ -1,0 +1,89 @@
+name: travel-agent
+
+x-app-env: &app-env
+  APP_ENV: production
+  DEV_IDENTITY_ENABLED: "false"
+  CHECKPOINT_BACKEND: sqlite
+  CHECKPOINT_SQLITE_PATH: /app/.data/checkpoints.sqlite3
+  PLAN_STORE_BACKEND: postgres
+  RUN_STORE_BACKEND: postgres
+  MEMORY_STORE_BACKEND: postgres
+  DATABASE_URL: postgresql://travel_agent:${POSTGRES_PASSWORD:-travel_agent_dev}@postgres:5432/travel_agent
+  ASYNC_EXECUTION_BACKEND: redis
+  REDIS_URL: redis://redis:6379/0
+  AGENT_MODE: specialist_subagents
+  REQUIREMENT_PROVIDER: ${REQUIREMENT_PROVIDER:-mock}
+  CRITIC_PROVIDER: ${CRITIC_PROVIDER:-mock}
+  EDIT_PROVIDER: ${EDIT_PROVIDER:-mock}
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+  DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+  DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}
+  TRAVEL_PROVIDER: ${TRAVEL_PROVIDER:-mock}
+  AMAP_API_KEY: ${AMAP_API_KEY:-}
+  BAIDU_MAP_AK: ${BAIDU_MAP_AK:-}
+  MAP_FALLBACK_PROVIDER: ${MAP_FALLBACK_PROVIDER:-none}
+  WEATHER_PROVIDER: ${WEATHER_PROVIDER:-mock}
+  QWEATHER_API_HOST: ${QWEATHER_API_HOST:-}
+  QWEATHER_TOKEN: ${QWEATHER_TOKEN:-}
+  WEATHER_FALLBACK_PROVIDER: ${WEATHER_FALLBACK_PROVIDER:-none}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: travel_agent
+      POSTGRES_USER: travel_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-travel_agent_dev}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/database/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U travel_agent -d travel_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    environment: *app-env
+    volumes: ["checkpoint-data:/app/.data"]
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["travel-agent-worker"]
+    environment: *app-env
+    volumes: ["checkpoint-data:/app/.data"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        VITE_AMAP_JS_KEY: ${VITE_AMAP_JS_KEY:-}
+        VITE_AMAP_JS_SECURITY_CODE: ${VITE_AMAP_JS_SECURITY_CODE:-}
+    ports: ["8080:80"]
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  checkpoint-data:

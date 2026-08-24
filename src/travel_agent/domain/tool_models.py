@@ -19,6 +19,7 @@ T = TypeVar("T")
 class ProviderMode(StrEnum):
     MOCK = "mock"
     AMAP = "amap"
+    BAIDU = "baidu"
 
 
 class UnknownFactPolicy(StrEnum):

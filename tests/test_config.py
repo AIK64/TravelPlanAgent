@@ -305,3 +305,94 @@ def test_deepseek_critic_requires_independent_explicit_model():
 def test_disabled_critic_requires_no_model_key():
     settings = Settings.from_env({"CRITIC_PROVIDER": "disabled"})
     assert settings.critic_provider is CriticProviderMode.DISABLED
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"TRAVEL_PROVIDER": "baidu"}, "BAIDU_MAP_AK"),
+        ({"MAP_FALLBACK_PROVIDER": "mock"}, "MAP_FALLBACK_PROVIDER"),
+        ({"MAP_FALLBACK_PROVIDER": "baidu"}, "BAIDU_MAP_AK"),
+        ({"WEATHER_PROVIDER": "qweather"}, "QWEATHER"),
+        ({"WEATHER_FALLBACK_PROVIDER": "mock"}, "WEATHER_FALLBACK_PROVIDER"),
+        ({"WEATHER_FALLBACK_PROVIDER": "qweather"}, "QWEATHER"),
+        (
+            {"CRITIC_PROVIDER": "openai", "CRITIC_MODEL": "critic-v1"},
+            "OPENAI_API_KEY",
+        ),
+        (
+            {
+                "CRITIC_PROVIDER": "openai",
+                "OPENAI_API_KEY": "key",
+                "CRITIC_MODEL": "",
+            },
+            "CRITIC_MODEL",
+        ),
+        (
+            {
+                "CRITIC_PROVIDER": "deepseek",
+                "DEEPSEEK_API_KEY": "key",
+                "CRITIC_MODEL": "deepseek-chat",
+            },
+            "retired alias",
+        ),
+        (
+            {
+                "EDIT_PROVIDER": "openai",
+                "OPENAI_API_KEY": "key",
+                "EDIT_MODEL": "",
+            },
+            "EDIT_MODEL",
+        ),
+        (
+            {
+                "EDIT_PROVIDER": "deepseek",
+                "DEEPSEEK_API_KEY": "key",
+                "EDIT_MODEL": "",
+            },
+            "EDIT_MODEL",
+        ),
+        (
+            {
+                "EDIT_PROVIDER": "deepseek",
+                "DEEPSEEK_API_KEY": "key",
+                "EDIT_MODEL": "deepseek-reasoner",
+            },
+            "retired alias",
+        ),
+        ({"EDIT_TIMEOUT_SECONDS": "0"}, "EDIT_TIMEOUT_SECONDS"),
+        ({"EDIT_MAX_ATTEMPTS": "0"}, "EDIT_MAX_ATTEMPTS"),
+        ({"EDIT_MAX_OUTPUT_TOKENS": "0"}, "EDIT_MAX_OUTPUT_TOKENS"),
+        ({"PLAN_MAX_VERSIONS": "0"}, "PLAN_MAX_VERSIONS"),
+        (
+            {"PLAN_STORE_BACKEND": "sqlite", "PLAN_SQLITE_PATH": " "},
+            "PLAN_SQLITE_PATH",
+        ),
+        (
+            {"RUN_STORE_BACKEND": "sqlite", "RUN_SQLITE_PATH": " "},
+            "RUN_SQLITE_PATH",
+        ),
+        (
+            {"MEMORY_STORE_BACKEND": "sqlite", "MEMORY_SQLITE_PATH": " "},
+            "MEMORY_SQLITE_PATH",
+        ),
+        ({"RUN_STORE_BACKEND": "postgres"}, "DATABASE_URL"),
+        ({"MEMORY_CONTEXT_MAX_TOKENS": "1"}, "MEMORY_CONTEXT_MAX_TOKENS"),
+        (
+            {"MEMORY_CONTEXT_MAX_CHARACTERS": "1"},
+            "MEMORY_CONTEXT_MAX_CHARACTERS",
+        ),
+        ({"AGENT_MAX_HANDOFFS": "0"}, "AGENT_MAX_HANDOFFS"),
+        ({"DEV_TENANT_ID": " "}, "DEV_TENANT_ID"),
+        ({"MCP_ALLOWED_HOSTS": " "}, "MCP_ALLOWED_HOSTS"),
+        (
+            {"ASYNC_EXECUTION_BACKEND": "redis", "REDIS_URL": " "},
+            "REDIS_URL",
+        ),
+        ({"RUN_BUDGET_PROFILE": " "}, "RUN_BUDGET_PROFILE"),
+        ({"TRACE_ATTRIBUTE_MAX_CHARS": "1"}, "TRACE_ATTRIBUTE_MAX_CHARS"),
+    ],
+)
+def test_v1_2_production_configuration_fails_closed(env, expected):
+    with pytest.raises(ValueError, match=expected):
+        Settings.from_env(env)

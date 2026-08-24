@@ -4,6 +4,7 @@ import logging
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from travel_agent.application.errors import ApplicationError
 
 from travel_agent.tools.errors import ToolUnavailableError
 from travel_agent.requirements.errors import RequirementUnavailableError
@@ -19,6 +20,12 @@ from travel_agent.lifecycle.errors import (
 )
 from travel_agent.weather.errors import WeatherUnavailableError
 from travel_agent.execution.errors import ExecutionBudgetExceeded, RunNotFoundError
+from travel_agent.memory.errors import (
+    MemoryConflictError,
+    MemoryForbiddenError,
+    MemoryNotFoundError,
+    MemoryPolicyError,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -194,3 +201,42 @@ async def run_not_found_exception_handler(
     _request: Request, error: RunNotFoundError
 ) -> UTF8JSONResponse:
     return UTF8JSONResponse(status_code=404, content={"detail": error.safe_detail()})
+
+
+async def memory_not_found_exception_handler(
+    _request: Request, error: MemoryNotFoundError
+) -> UTF8JSONResponse:
+    return UTF8JSONResponse(status_code=404, content={"detail": error.safe_detail()})
+
+
+async def memory_conflict_exception_handler(
+    _request: Request, error: MemoryConflictError
+) -> UTF8JSONResponse:
+    return UTF8JSONResponse(status_code=409, content={"detail": error.safe_detail()})
+
+
+async def memory_policy_exception_handler(
+    _request: Request, error: MemoryPolicyError
+) -> UTF8JSONResponse:
+    return UTF8JSONResponse(status_code=422, content={"detail": error.safe_detail()})
+
+
+async def memory_forbidden_exception_handler(
+    _request: Request, error: MemoryForbiddenError
+) -> UTF8JSONResponse:
+    return UTF8JSONResponse(status_code=403, content={"detail": error.safe_detail()})
+async def application_exception_handler(_, error: ApplicationError) -> JSONResponse:
+    status_code = {
+        "not_found": 404,
+        "forbidden": 403,
+        "conflict": 409,
+    }.get(error.code, 422)
+    return UTF8JSONResponse(
+        status_code=status_code,
+        content={
+            "code": error.code,
+            "message": str(error),
+            "retryable": error.retryable,
+            "details": error.details,
+        },
+    )

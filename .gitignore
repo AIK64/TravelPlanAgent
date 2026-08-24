@@ -13,3 +13,5 @@ build/
 .worktrees/
 .data/
 reports/
+node_modules/
+*.tsbuildinfo

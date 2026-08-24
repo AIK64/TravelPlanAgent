@@ -82,9 +82,11 @@ class WeatherLocation(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     city_name: str = Field(min_length=1, max_length=100)
-    adcode: str = Field(pattern=r"^\d{6}$")
+    adcode: str = Field(pattern=r"^\d{6,12}$")
     timezone: str = "Asia/Shanghai"
     provider: str
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    latitude: float | None = Field(default=None, ge=-90, le=90)
 
 
 class DailyWeather(BaseModel):

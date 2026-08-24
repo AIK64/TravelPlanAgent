@@ -45,6 +45,7 @@ RUNTIME_OWNED_FIELDS = {
     "gateway",
     "workflow",
     "client",
+    "auxiliary_client",
     "weather_provider",
     "weather_gateway",
     "requirement_model",
@@ -65,6 +66,10 @@ RUNTIME_OWNED_FIELDS = {
     "run_repository",
     "run_coordinator",
     "run_repository_context",
+    "preference_repository",
+    "preference_service",
+    "preference_repository_context",
+    "specialist_executor",
     "resume_locks",
 }
 
@@ -104,7 +109,7 @@ def test_openapi_version_matches_package_version(client):
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
-    assert __version__ == "1.0.0"
+    assert __version__ == "1.2.0"
     assert response.json()["info"]["version"] == __version__
 
 
@@ -304,8 +309,20 @@ def test_requirement_model_failure_returns_503_with_safe_detail(monkeypatch):
 
 
 def test_weather_failure_returns_503_without_exposing_provider_payload():
+    class LocalPlanRepository:
+        async def get(self, _session_id):
+            return type(
+                "OwnedPlan",
+                (),
+                {"tenant_id": "local", "user_id": "demo"},
+            )()
+
     class FailedWeatherRuntime:
-        async def refresh_plan_weather(self, _request, *, session_id):
+        plan_repository = LocalPlanRepository()
+
+        async def execute_refresh_plan_weather(
+            self, _request, *, session_id, principal=None
+        ):
             result = ToolResult[object].failed(
                 provider="amap",
                 error=ToolErrorInfo(

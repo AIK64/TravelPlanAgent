@@ -274,14 +274,20 @@ class SQLiteRunRepository:
 
 @asynccontextmanager
 async def open_run_repository(
-    *, backend: str, sqlite_path: str
+    *, backend: str, sqlite_path: str, database_url: str = ""
 ) -> AsyncIterator[RunRepository]:
     repository: RunRepository
-    repository = (
-        SQLiteRunRepository(sqlite_path)
-        if backend == "sqlite"
-        else InMemoryRunRepository()
-    )
+    if backend == "postgres":
+        from travel_agent.infrastructure.postgres import (
+            PostgresRunRepository,
+            create_postgres_pool,
+        )
+
+        repository = PostgresRunRepository(await create_postgres_pool(database_url))
+    elif backend == "sqlite":
+        repository = SQLiteRunRepository(sqlite_path)
+    else:
+        repository = InMemoryRunRepository()
     try:
         yield repository
     finally:

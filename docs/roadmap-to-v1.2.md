@@ -1,7 +1,7 @@
 # Travel Agent v0.9 → v1.2 迭代路线
 
 > 状态：当前唯一权威版本路线  
-> 当前基线：v1.0.0（已完成）
+> 当前基线：v1.2.0（实现候选；外部 Live/容器演练待运行者提供环境）
 > 决策日期：2026-08-24
 
 ## 1. 路线决策
@@ -12,7 +12,7 @@
 2. `v1.1` 增加 Preference Memory、上下文裁剪、跨会话个性化及 Memory 消融实验。
 3. `v1.2` 增加 Travel MCP Server、备用 Provider、完整前端和生产化部署。
 
-v1.0 已完成，核心 Agent 发布所需的统一 Run、预算、Trace、故障注入、Benchmark、Baseline/消融和发布门禁均已落地。完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
+v1.0、v1.1 与 v1.2 主干代码均已落地：核心 Agent、Preference Memory、Context Projection、Specialist Handoff、MCP、Provider Chain、异步 Run、前端主界面和部署适配已经集成。真实 DeepSeek/地图/天气 Live Smoke 与 Docker 全栈演练仍必须在具备凭证和容器环境的机器上单独执行，不能由 Mock 结果代替。
 
 多 Agent 不作为强制版本目标。只有当某项职责确实需要独立推理上下文、独立决策循环或独立运行预算，并且消融实验能证明它优于单 Graph/Subgraph，才允许升级为 Agent。地图查询、时间计算、约束验证、缓存和 Provider 适配器始终是工具或确定性服务，不为“多 Agent”标签进行包装。
 
@@ -48,8 +48,8 @@ v1.0 应能稳定演示以下轨迹：
 | v0.8（已完成） | 计划生命周期 HITL | `Select/Change → Interrupt → Impact → LocalReplan → Version` | 锁定项不变、V1/V2 Diff、重启恢复 |
 | v0.9（已完成） | 天气事件驱动重规划 | `WeatherEvent → ImpactAnalyzer → LocalReplan` | 事件幂等性、affected-days 保持率、故障语义 |
 | v1.0（已完成） | 评测驱动的核心 Agent 发布 | 统一 ExecutionBudget、Trace 和回归门禁 | 120 次发布工作流、180 次消融、故障注入 |
-| v1.1 | 长期 Preference Memory | `Retrieve → ComposeContext → Plan → Propose → Confirm → Persist` | 跨会话测试、上下文预算、Memory 消融 |
-| v1.2 | MCP 与平台化 | MCP/API 共用 Application Service；生产存储和部署 | MCP Contract、Failover、E2E、安全与部署验证 |
+| v1.1（已完成） | 长期 Preference Memory | `Retrieve → ComposeContext → Plan → Propose → Confirm → Persist` | 跨会话测试、上下文预算、Memory 消融 |
+| v1.2（实现候选） | MCP 与平台化 | MCP/API 共用 Application Service；生产存储和部署 | MCP Contract、Failover、安全测试已通过；外部部署演练待执行 |
 
 版本必须按依赖顺序推进。允许在当前版本内提前建立下一版本所需的 Protocol，但不把下一版本能力混入当前验收指标。
 
@@ -505,7 +505,13 @@ MCP 工具具有明确输入输出 Schema、权限、错误码、幂等规则、
 
 ## 15. 当前下一步
 
-当前下一迭代进入 v1.1：Preference Memory、上下文裁剪、跨会话个性化及 Memory 消融。v1.0 已完成已有 Requirement、Planning、Repair、Critic、Lifecycle 和 Weather 循环的 ExecutionBudget、Trace Schema、故障注入、综合 Benchmark、Baseline 与发布门禁。
+当前开发按“一次连续实现、两个内部 Gate、最终发布 v1.2.0”推进。冻结后的完整设计见 [v1.1 → v1.2 最终开发入口](v1.1-v1.2/README.md)、[统一设计报告](v1.1-v1.2/design.md) 和 [需求追踪矩阵](v1.1-v1.2/requirements-traceability.md)。
+
+v1.1 Gate 完成 Preference Memory、上下文裁剪、跨会话个性化，以及用于上下文隔离的进程内 Planner/Critic/Replanner Specialist Subagent 实验。Orchestrator 保持唯一状态归并和终止权，Specialist 只通过强类型 Handoff 返回结构化结果；single_graph 始终保留为 Baseline，Subagent 只有通过消融门禁才成为生产默认。
+
+v1.2 Gate 完成共享 Application Service、Travel MCP Server、真实备用地图/天气 Provider、完整 Agent 交互前端、PostgreSQL/Redis/Worker/OpenTelemetry 和生产部署演练。API、MCP 和后台任务不得复制 Graph 或领域逻辑。
+
+v1.0 已完成已有 Requirement、Planning、Repair、Critic、Lifecycle 和 Weather 循环的 ExecutionBudget、Trace Schema、故障注入、综合 Benchmark、Baseline 与发布门禁。
 
 v0.9 的稳定 `ChangeEvent`、risk/event fingerprint、affected-days、终止原因和天气 Tool 轨迹已经纳入 v1.0 统一 Run，天气循环未被重写。
 
@@ -518,4 +524,4 @@ Unified Agent Run
   → Regression Gate + Interview Evidence
 ```
 
-v1.1 开发不得削弱 v1.0 已有的用户锁、Hard Validator、Grounding Gate、统一预算、Trace、局部性守卫或版本提交语义；MCP 与前端仍留在 v1.2。
+连续开发不得削弱 v1.0 已有的用户锁、Hard Validator、Grounding Gate、统一预算、Trace、局部性守卫或版本提交语义。MCP 与完整前端仍属于 v1.2 Gate，不提前复制业务逻辑。

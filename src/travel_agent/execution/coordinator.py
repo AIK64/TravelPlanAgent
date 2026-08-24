@@ -8,6 +8,7 @@ import json
 import logging
 from typing import Generic, TypeVar
 from uuid import uuid4
+import asyncio
 
 from travel_agent.execution.budget import ExecutionLedger
 from travel_agent.execution.context import RunContext, bind_run_context
@@ -70,9 +71,12 @@ class RunCoordinator:
         causation_id: str | None = None,
         fault_plan: FaultPlan | None = None,
         budget: ExecutionBudget | None = None,
+        run_id: str | None = None,
+        tenant_id: str = "local",
+        user_id: str = "demo",
+        precreated: bool = False,
     ) -> ExecutionResult[T]:
-        run_id = str(uuid4())
-        started = datetime.now(timezone.utc)
+        run_id = run_id or str(uuid4())
         active_budget = budget or self.budget
         previous = None
         if request_id:
@@ -81,21 +85,26 @@ class RunCoordinator:
                 session_id=session_id,
                 thread_id=thread_id,
             )
-        record = AgentRunRecord(
-            run_id=run_id,
-            run_kind=kind,
-            status=RunStatus.RUNNING,
-            thread_id=thread_id,
-            session_id=session_id,
-            request_id=request_id,
-            parent_run_id=parent_run_id,
-            replay_of_run_id=previous.run_id if previous else None,
-            causation_id=causation_id,
-            budget=active_budget,
-            started_at=started,
-            config_fingerprint=self.config_fingerprint,
-        )
-        await self.repository.create(record)
+        if precreated:
+            record = await self.repository.get(run_id)
+            if record.status is not RunStatus.RUNNING:
+                raise ValueError("precreated run is not in running status")
+            active_budget = record.budget
+        else:
+            record = self.new_record(
+                kind,
+                run_id=run_id,
+                thread_id=thread_id,
+                session_id=session_id,
+                request_id=request_id,
+                parent_run_id=parent_run_id,
+                replay_of_run_id=previous.run_id if previous else None,
+                causation_id=causation_id,
+                budget=active_budget,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+            await self.repository.create(record)
         ledger = ExecutionLedger(run_id, active_budget)
         trace = TraceRecorder(
             run_id,
@@ -148,9 +157,10 @@ class RunCoordinator:
                         "limit": error.limit,
                     },
                 )
+            cancelled = isinstance(error, asyncio.CancelledError)
             trace.record(
-                TraceEventType.RUN_FAILED,
-                status="failed",
+                TraceEventType.RUN_CANCELLED if cancelled else TraceEventType.RUN_FAILED,
+                status="cancelled" if cancelled else "failed",
                 terminal=True,
                 attributes={"terminal_reason": reason.value},
             )
@@ -158,7 +168,7 @@ class RunCoordinator:
                 record,
                 ledger=ledger,
                 trace=trace,
-                status=RunStatus.FAILED,
+                status=RunStatus.CANCELLED if cancelled else RunStatus.FAILED,
                 reason=reason,
             )
             await self._persist(failed, trace)
@@ -201,6 +211,63 @@ class RunCoordinator:
             completed.elapsed_ms,
         )
         return ExecutionResult(payload=payload, run=completed)
+
+    def new_record(
+        self,
+        kind: RunKind,
+        *,
+        run_id: str,
+        thread_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        parent_run_id: str | None = None,
+        replay_of_run_id: str | None = None,
+        causation_id: str | None = None,
+        budget: ExecutionBudget | None = None,
+        tenant_id: str = "local",
+        user_id: str = "demo",
+    ) -> AgentRunRecord:
+        return AgentRunRecord(
+            run_id=run_id,
+            run_kind=kind,
+            status=RunStatus.RUNNING,
+            thread_id=thread_id,
+            session_id=session_id,
+            request_id=request_id,
+            parent_run_id=parent_run_id,
+            replay_of_run_id=replay_of_run_id,
+            causation_id=causation_id,
+            budget=budget or self.budget,
+            started_at=datetime.now(timezone.utc),
+            config_fingerprint=self.config_fingerprint,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+
+    async def reserve(
+        self,
+        kind: RunKind,
+        *,
+        run_id: str,
+        thread_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        budget: ExecutionBudget | None = None,
+        tenant_id: str = "local",
+        user_id: str = "demo",
+    ) -> AgentRunRecord:
+        record = self.new_record(
+            kind,
+            run_id=run_id,
+            thread_id=thread_id,
+            session_id=session_id,
+            request_id=request_id,
+            budget=budget,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        await self.repository.create(record)
+        return record
 
     def _final_record(
         self,
@@ -256,6 +323,8 @@ def classify_payload(payload: object) -> tuple[RunStatus, RunTerminalReason]:
 
 
 def classify_error(error: BaseException) -> RunTerminalReason:
+    if isinstance(error, asyncio.CancelledError):
+        return RunTerminalReason.USER_CANCELLED
     if isinstance(error, ExecutionBudgetExceeded):
         return (
             RunTerminalReason.DEADLINE_EXCEEDED
