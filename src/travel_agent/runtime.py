@@ -7,7 +7,12 @@ from typing import Any
 import httpx
 from langgraph.graph.state import CompiledStateGraph
 
-from travel_agent.config import CriticProviderMode, EditProviderMode, Settings
+from travel_agent.config import (
+    CriticProviderMode,
+    EditProviderMode,
+    Settings,
+    WeatherProviderMode,
+)
 from travel_agent.critique.evidence import EvidenceBudget
 from travel_agent.critique.gateway import CriticGateway
 from travel_agent.critique.protocols import CriticModel
@@ -19,6 +24,11 @@ from travel_agent.domain.models import PlanningRequest, PlanningResponse
 from travel_agent.domain.lifecycle_models import (
     LifecycleResumeRequest,
     PlanSessionResponse,
+)
+from travel_agent.domain.weather_models import (
+    WeatherEventView,
+    WeatherRefreshRequest,
+    WeatherStateView,
 )
 from travel_agent.domain.optimization_models import OptimizationBudget
 from travel_agent.domain.tool_models import ProviderMode
@@ -58,6 +68,10 @@ from travel_agent.requirements.workflow import (
     resume_natural_planning,
     run_natural_planning,
 )
+from travel_agent.weather.gateway import WeatherToolGateway, build_weather_gateway
+from travel_agent.weather.protocols import WeatherProvider
+from travel_agent.weather.providers.amap import AMapWeatherProvider
+from travel_agent.weather.providers.mock import MockWeatherProvider
 
 
 @dataclass(slots=True)
@@ -69,6 +83,8 @@ class PlanningRuntime:
     gateway: ToolGateway
     workflow: CompiledStateGraph
     client: httpx.AsyncClient | None
+    weather_provider: WeatherProvider | None = None
+    weather_gateway: WeatherToolGateway | None = None
     requirement_model: RequirementModel | None = None
     requirement_gateway: RequirementGateway | None = None
     requirement_workflow: CompiledStateGraph | None = None
@@ -98,10 +114,11 @@ class PlanningRuntime:
         checkpoint_entered = False
         repository_entered = False
         try:
-            if settings.provider is ProviderMode.MOCK:
-                poi_provider: POIProvider = MockPOIProvider()
-                route_provider: RouteProvider = MockRouteProvider()
-            else:
+            amap_client: AMapClient | None = None
+            if (
+                settings.provider is ProviderMode.AMAP
+                or settings.weather_provider is WeatherProviderMode.AMAP
+            ):
                 assert settings.amap_api_key is not None
                 client = httpx.AsyncClient(base_url="https://restapi.amap.com")
                 amap_client = AMapClient(
@@ -109,10 +126,21 @@ class PlanningRuntime:
                     api_key=settings.amap_api_key,
                     timeout_seconds=settings.tool_timeout_seconds,
                 )
+            if settings.provider is ProviderMode.MOCK:
+                poi_provider: POIProvider = MockPOIProvider()
+                route_provider: RouteProvider = MockRouteProvider()
+            else:
+                assert amap_client is not None
                 poi_provider = AMapPOIProvider(amap_client)
                 route_provider = AMapRouteProvider(amap_client)
 
             gateway = build_gateway(settings, poi_provider, route_provider)
+            if settings.weather_provider is WeatherProviderMode.MOCK:
+                weather_provider: WeatherProvider = MockWeatherProvider()
+            else:
+                assert amap_client is not None
+                weather_provider = AMapWeatherProvider(amap_client)
+            weather_gateway = build_weather_gateway(settings, weather_provider)
             defaults = POIDefaultPolicy(settings.unknown_fact_policy)
             policy = PlanningPolicy(
                 poi_query_limit=settings.poi_query_limit,
@@ -317,6 +345,13 @@ class PlanningRuntime:
                 ),
                 max_affected_days=settings.plan_max_affected_days,
                 max_versions=settings.plan_max_versions,
+                weather_gateway=weather_gateway,
+                weather_max_events=settings.weather_max_events,
+                weather_max_poi_searches=settings.weather_max_poi_searches,
+                weather_max_alternatives=settings.weather_max_alternatives,
+                weather_exposure_min_confidence=(
+                    settings.weather_exposure_min_confidence
+                ),
                 checkpointer=requirement_checkpointer,
             )
             lifecycle_service = PlanLifecycleService(
@@ -324,6 +359,7 @@ class PlanningRuntime:
                 planning_workflow=workflow,
                 lifecycle_workflow=lifecycle_workflow,
                 requirement_workflow=requirement_workflow,
+                weather_stale_max_seconds=settings.weather_stale_max_seconds,
             )
             return cls(
                 poi_provider=poi_provider,
@@ -331,6 +367,8 @@ class PlanningRuntime:
                 gateway=gateway,
                 workflow=workflow,
                 client=client,
+                weather_provider=weather_provider,
+                weather_gateway=weather_gateway,
                 requirement_model=requirement_model,
                 requirement_gateway=requirement_gateway,
                 requirement_workflow=requirement_workflow,
@@ -467,3 +505,29 @@ class PlanningRuntime:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
         return await self.lifecycle_service.diff(session_id, from_id, to_id)
+
+    async def refresh_plan_weather(
+        self, request: WeatherRefreshRequest, *, session_id: str
+    ) -> PlanSessionResponse:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.refresh_weather(session_id, request)
+
+    async def get_plan_weather(self, *, session_id: str) -> WeatherStateView:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.weather(session_id)
+
+    async def get_plan_weather_events(
+        self, *, session_id: str
+    ) -> tuple[WeatherEventView, ...]:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.weather_events(session_id)
+
+    async def get_plan_weather_event(
+        self, *, session_id: str, event_id: str
+    ) -> WeatherEventView:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        return await self.lifecycle_service.weather_event(session_id, event_id)

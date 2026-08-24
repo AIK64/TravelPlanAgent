@@ -16,6 +16,7 @@ from travel_agent.api.errors import (
     lifecycle_action_exception_handler,
     lifecycle_conflict_exception_handler,
     lifecycle_not_found_exception_handler,
+    weather_unavailable_exception_handler,
 )
 from travel_agent.api.routes import router
 from travel_agent.config import Settings
@@ -33,6 +34,7 @@ from travel_agent.lifecycle.errors import (
     LifecycleConflictError,
     LifecycleNotFoundError,
 )
+from travel_agent.weather.errors import WeatherUnavailableError
 
 
 RuntimeFactory = Callable[[Settings], Awaitable[PlanningRuntime]]
@@ -90,6 +92,9 @@ def create_app(
     )
     app.add_exception_handler(
         LifecycleActionError, lifecycle_action_exception_handler
+    )
+    app.add_exception_handler(
+        WeatherUnavailableError, weather_unavailable_exception_handler
     )
     app.include_router(router)
     return app

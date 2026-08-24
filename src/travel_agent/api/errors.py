@@ -17,6 +17,7 @@ from travel_agent.lifecycle.errors import (
     LifecycleConflictError,
     LifecycleNotFoundError,
 )
+from travel_agent.weather.errors import WeatherUnavailableError
 
 
 logger = logging.getLogger(__name__)
@@ -124,3 +125,20 @@ async def lifecycle_action_exception_handler(
 ) -> UTF8JSONResponse:
     status_code = 409 if error.code in {"lock_conflict"} else 422
     return UTF8JSONResponse(status_code=status_code, content={"detail": error.safe_detail()})
+
+
+async def weather_unavailable_exception_handler(
+    _request: Request, error: WeatherUnavailableError
+) -> UTF8JSONResponse:
+    detail = error.safe_detail()
+    logger.error(
+        "api.weather_unavailable session_id=%s provider=%s operation=%s "
+        "category=%s code=%s retryable=%s",
+        detail["session_id"],
+        detail["provider"],
+        detail["operation"],
+        detail["category"],
+        detail["code"],
+        detail["retryable"],
+    )
+    return UTF8JSONResponse(status_code=503, content={"detail": detail})

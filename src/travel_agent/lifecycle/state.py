@@ -12,6 +12,14 @@ class PlanLifecycleState(TypedDict):
     edit_patch: dict | None
     edit_summary: dict | None
     impact_result: dict | None
+    weather_location: dict | None
+    weather_snapshot: dict | None
+    weather_risks: list[dict] | None
+    weather_event: dict | None
+    weather_impact: dict | None
+    weather_repair_plan: dict | None
+    weather_alternatives: list[dict] | None
+    weather_decision: str | None
     clarification_round: int
     approval_token: str | None
     message: str | None

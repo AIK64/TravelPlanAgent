@@ -389,3 +389,166 @@ def test_bad_approval_token_does_not_commit_version(client):
         f"/api/v1/plan-sessions/{created['session_id']}/versions"
     ).json()
     assert [item["version_id"] for item in versions] == ["V1"]
+
+
+def test_weather_refresh_builds_preview_and_requires_approval(client):
+    created = _create(client)
+    selected = _resume(
+        client, created, {"revision": 0}, {"kind": "accept_recommendation"}
+    ).json()
+
+    weather_request_id = str(uuid4())
+    refreshed = client.post(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/refresh",
+        json={
+            "request_id": weather_request_id,
+            "expected_active_version_id": "V1",
+            "expected_session_revision": 1,
+        },
+    )
+
+    assert refreshed.status_code == 200
+    preview = refreshed.json()
+    assert preview["status"] == "awaiting_change_approval", preview[
+        "pending_preview"
+    ]["hard_validation"]
+    assert preview["active_version"]["version_id"] == "V1"
+    assert preview["pending_preview"]["change_trigger"]["source"] == "weather"
+    assert preview["pending_preview"]["change_trigger"]["event_id"]
+    assert preview["interrupt"]["payload"]["change_source"] == "weather"
+    assert preview["weather"]["monitor"]["last_outcome"] == "preview_created"
+
+    replayed = client.post(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/refresh",
+        json={
+            "request_id": weather_request_id,
+            "expected_active_version_id": "V1",
+            "expected_session_revision": 1,
+        },
+    )
+    assert replayed.status_code == 200
+    assert replayed.json()["session_revision"] == preview["session_revision"]
+    assert (
+        replayed.json()["pending_preview"]["preview_id"]
+        == preview["pending_preview"]["preview_id"]
+    )
+
+    weather = client.get(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather"
+    )
+    assert weather.status_code == 200
+    assert weather.json()["latest_snapshot"]["snapshot_id"]
+    event_id = preview["pending_preview"]["change_trigger"]["event_id"]
+    event = client.get(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/events/{event_id}"
+    )
+    assert event.status_code == 200
+    assert event.json()["receipt"]["status"] == "preview_created"
+    missing_event = client.get(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/events/missing"
+    )
+    assert missing_event.status_code == 422
+    assert missing_event.json()["detail"]["code"] == "weather_event_not_found"
+
+    approved = _resume(
+        client,
+        preview,
+        {"active_version_id": "V1", "revision": preview["session_revision"]},
+        {
+            "kind": "approve_preview",
+            "preview_id": preview["pending_preview"]["preview_id"],
+            "approval_token": preview["interrupt"]["payload"]["approval_token"],
+        },
+    )
+    assert approved.status_code == 200
+    body = approved.json()
+    assert body["active_version"]["version_id"] == "V2"
+    assert body["active_version"]["change_trigger"]["source"] == "weather"
+
+    events = client.get(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/events"
+    )
+    assert events.status_code == 200
+    assert events.json()[0]["receipt"]["status"] == "approved"
+
+    unchanged = client.post(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/refresh",
+        json={
+            "request_id": str(uuid4()),
+            "expected_active_version_id": "V2",
+            "expected_session_revision": body["session_revision"],
+        },
+    )
+    assert unchanged.status_code == 200
+    unchanged_body = unchanged.json()
+    assert unchanged_body["active_version"]["version_id"] == "V2"
+    assert unchanged_body["pending_preview"]["preview_id"] == "P1"
+    assert unchanged_body["pending_preview"]["status"] == "approved"
+    assert unchanged_body["weather"]["monitor"]["last_outcome"] == "no_change"
+    assert len(
+        client.get(
+            f"/api/v1/plan-sessions/{created['session_id']}/weather/events"
+        ).json()
+    ) == 1
+
+
+def test_weather_lock_conflict_requires_attention_and_can_be_dismissed(client):
+    created = _create(client)
+    selected = _resume(
+        client, created, {"revision": 0}, {"kind": "accept_recommendation"}
+    ).json()
+    locked = _resume(
+        client,
+        selected,
+        {"active_version_id": "V1", "revision": 1},
+        {"kind": "lock", "lock_kind": "day", "target_id": "2026-10-02"},
+    ).json()
+    refreshed = client.post(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/refresh",
+        json={
+            "request_id": str(uuid4()),
+            "expected_active_version_id": "V1",
+            "expected_session_revision": 2,
+        },
+    )
+    assert refreshed.status_code == 200
+    body = refreshed.json()
+    assert body["active_version"]["version_id"] == "V1"
+    assert body["pending_preview"] is None
+    assert body["weather"]["monitor"]["last_outcome"] == "needs_user_attention"
+    event_id = body["weather"]["monitor"]["attention_event_id"]
+    assert event_id
+
+    dismissed = _resume(
+        client,
+        body,
+        {"active_version_id": "V1", "revision": body["session_revision"]},
+        {"kind": "dismiss_weather_event", "event_id": event_id},
+    )
+    assert dismissed.status_code == 200
+    assert dismissed.json()["weather"]["monitor"]["attention_event_id"] is None
+
+
+def test_weather_refresh_requires_an_active_version(client):
+    created = _create(client)
+    initial_weather = client.get(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather"
+    )
+    assert initial_weather.status_code == 200
+    assert initial_weather.json()["monitor"]["availability"] == "unavailable"
+
+    missing_revision = client.post(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/refresh",
+        json={"request_id": str(uuid4())},
+    )
+    assert missing_revision.status_code == 422
+
+    refreshed = client.post(
+        f"/api/v1/plan-sessions/{created['session_id']}/weather/refresh",
+        json={
+            "request_id": str(uuid4()),
+            "expected_session_revision": 0,
+        },
+    )
+    assert refreshed.status_code == 409
+    assert refreshed.json()["detail"]["code"] == "invalid_lifecycle_state"

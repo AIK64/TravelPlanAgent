@@ -1,7 +1,7 @@
-# Travel Agent v0.8 → v1.2 迭代路线
+# Travel Agent v0.9 → v1.2 迭代路线
 
 > 状态：当前唯一权威版本路线  
-> 当前基线：v0.8.0（已完成）
+> 当前基线：v0.9.0（已完成）
 > 决策日期：2026-08-24
 
 ## 1. 路线决策
@@ -12,7 +12,7 @@
 2. `v1.1` 增加 Preference Memory、上下文裁剪、跨会话个性化及 Memory 消融实验。
 3. `v1.2` 增加 Travel MCP Server、备用 Provider、完整前端和生产化部署。
 
-v0.8 已完成。从当前 v0.8.0 到 v1.0 还需两个迭代：`v0.9` 和 `v1.0`。完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
+v0.9 已完成。从当前 v0.9.0 到核心 Agent 发布还需 `v1.0` 一个迭代；完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
 
 多 Agent 不作为强制版本目标。只有当某项职责确实需要独立推理上下文、独立决策循环或独立运行预算，并且消融实验能证明它优于单 Graph/Subgraph，才允许升级为 Agent。地图查询、时间计算、约束验证、缓存和 Provider 适配器始终是工具或确定性服务，不为“多 Agent”标签进行包装。
 
@@ -46,7 +46,7 @@ v1.0 应能稳定演示以下轨迹：
 | v0.6（已完成） | 约束优化与真实路线质量 | `BuildProblem → Optimize → Materialize → Validate` | 路线效率、求解终止、优化器消融 |
 | v0.7（已完成） | Grounded LLM Soft Critic | `HardValidate → SoftCritic → EvidenceGuard → QualityGate` | Grounding 准确率、软约束评测、Provider 降级轨迹 |
 | v0.8（已完成） | 计划生命周期 HITL | `Select/Change → Interrupt → Impact → LocalReplan → Version` | 锁定项不变、V1/V2 Diff、重启恢复 |
-| v0.9 | 天气事件驱动重规划 | `WeatherEvent → ImpactAnalyzer → LocalReplan` | 事件幂等性、affected-days 保持率、故障语义 |
+| v0.9（已完成） | 天气事件驱动重规划 | `WeatherEvent → ImpactAnalyzer → LocalReplan` | 事件幂等性、affected-days 保持率、故障语义 |
 | v1.0 | 评测驱动的核心 Agent 发布 | 统一 ExecutionBudget、Trace 和回归门禁 | 100+ Benchmark、Baseline、消融、故障注入 |
 | v1.1 | 长期 Preference Memory | `Retrieve → ComposeContext → Plan → Propose → Confirm → Persist` | 跨会话测试、上下文预算、Memory 消融 |
 | v1.2 | MCP 与平台化 | MCP/API 共用 Application Service；生产存储和部署 | MCP Contract、Failover、E2E、安全与部署验证 |
@@ -256,22 +256,29 @@ await_user_action
 
 ## 8. v0.9：天气事件驱动重规划
 
+使用方法和实际结果见 [v0.9 天气事件驱动局部重规划文档](v0.9/README.md)，完整实现规格见 [设计报告](v0.9/design.md)。
+
 ### 8.1 Agent 能力
 
 接入标准化天气工具，把外部环境变化转换为 `ChangeEvent`，通过影响分析复用 v0.5/v0.8 的局部重规划能力。
 
 ### 8.2 State、Node、Edge
 
-新增 `WeatherSnapshot`、`ChangeEvent`、`EventFingerprint` 和扩展后的 `ImpactResult`。
+新增 `WeatherSnapshot`、`DailyWeatherRisk`、`ChangeEvent`、`WeatherImpactResult` 和稳定的 Snapshot/Event Fingerprint。
 
 ```text
-ingest_weather_event
-  → deduplicate_event
-  → analyze_event_impact
+refresh_weather
+  → resolve_weather_location
+  → fetch_weather_snapshot
+  → classify_weather_risks
+  → derive_and_deduplicate_event
+  → analyze_weather_impact
   → build_weather_repair_plan
-  → local_replan
-  → global_validate
-  → persist_new_version
+  → local_replan_and_route_delta
+  → hard_validate_and_locality_guard
+  → persist_preview
+  → HITL approve/reject
+  → commit Plan V(n+1)
 ```
 
 ### 8.3 Tool Use 与边界
@@ -280,10 +287,17 @@ ingest_weather_event
 - 天气不可用不能伪装成“天气良好”，应保留旧事实并标注 stale/unavailable。
 - 只允许天气事件修改受影响的户外活动和相邻路线；用户锁定项仍需 HITL。
 - 事件使用稳定 Fingerprint 去重，避免重复生成计划版本。
+- v0.9 只提供显式刷新 API；定时调度、推送、备用天气 Provider 和生产事件总线延后。
 
 ### 8.4 Trace 与验收
 
-Benchmark 覆盖降雨、高温、天气恢复、重复事件、Provider 超时和无可替换室内活动。验收重点是事件幂等、影响范围正确、未受影响日期保持和工具失败语义。
+Benchmark 至少包含 30 条 Fixture，覆盖降雨、温度、强风、雪冰、天气恢复、重复事件、锁、Provider 超时、未知/未覆盖日期和无可替换室内活动。锁定项与未影响日期保持率、已提交计划硬约束满足率和有界终止率必须为 100%；重复 Event 创建新版本数和错误重规划数必须为 0。
+
+### 8.5 实现与验收结果
+
+已完成 Mock/AMap Weather Provider、可靠 Gateway、版本化风险策略、Snapshot/Event Fingerprint、三层幂等、天气 Impact/Repair、HITL Attention、Preview 审批、查询 API 和 SQLite 重启恢复。Provider Failure 保留 Active Version，并与业务不可行、数据未覆盖和无计划影响保持不同终止语义。
+
+2026-08-24 本机全 Mock 验收全量测试通过，2 项 Live Smoke 跳过，总覆盖率 90.98%。30 条 `weather-fixture-v1` 的 Risk Accuracy、Event F1、Event Deduplication、Impact Exact Match、锁定对象保持、未影响日期保持、Preview/Commit 正确率、失败分类和有界终止均为 100%，硬约束回归率和错误重规划率为 0%，标注路线复用率为 66.41%。固定 Fixture 用于离线代码与策略回归，不代表真实高德预报准确率或线上 Agent 成功率。
 
 ## 9. v1.0：评测驱动的核心 Agent 发布
 
@@ -487,16 +501,17 @@ MCP 工具具有明确输入输出 Schema、权限、错误码、幂等规则、
 
 ## 15. 当前下一步
 
-当前下一迭代进入 v0.9：天气事件驱动重规划。下一版设计应以标准化 `WeatherSnapshot`、稳定 `ChangeEvent`、事件幂等和 affected-days Impact Analysis 为核心，并复用 v0.8 的锁、Preview、审批、局部重规划和版本 Diff。
+当前下一迭代进入 v1.0：评测驱动的核心 Agent 发布。下一版不再横向增加业务功能，而是统一已有 Requirement、Planning、Repair、Critic、Lifecycle 和 Weather 循环的 ExecutionBudget、Trace Schema、故障注入、100+ 综合 Benchmark、Baseline 与发布门禁。
+
+v0.9 的稳定 `ChangeEvent`、risk/event fingerprint、affected-days、终止原因和天气 Tool 轨迹将直接纳入 v1.0 统一 Run，而不重写天气循环。
 
 ```text
-Active Plan Version
-  → Weather Tool / ChangeEvent
-  → Event Deduplication
-  → Impact Analysis / Lock Conflict
-  → Local Replan
-  → Hard Validate / Soft Critic
-  → Preview / Approval / New Version
+Unified Agent Run
+  → Shared ExecutionBudget
+  → Node / Tool / Decision Trace
+  → Fault Injection + 100+ Benchmark
+  → Baseline / Ablation Comparison
+  → Regression Gate + Interview Evidence
 ```
 
-在 v0.9 验收完成前，不提前实现 Memory、MCP 或前端；天气事件也不得绕过用户锁、Hard Validator、Grounding Gate、局部性守卫或版本提交语义。
+在 v1.0 验收完成前，不提前实现 Memory、MCP 或前端；统一评测层不得改变现有用户锁、Hard Validator、Grounding Gate、局部性守卫或版本提交语义。

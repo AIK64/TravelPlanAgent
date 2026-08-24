@@ -21,7 +21,12 @@ from travel_agent.edits.providers.deepseek import DeepSeekEditModel
 from travel_agent.edits.providers.mock import MockEditModel
 from travel_agent.edits.providers.openai import OpenAIEditModel
 from travel_agent.domain.models import PlanningResponse
-from travel_agent.domain.tool_models import ProviderMode
+from travel_agent.domain.tool_models import (
+    ProviderMode,
+    ToolErrorCategory,
+    ToolErrorInfo,
+    ToolResult,
+)
 from travel_agent.runtime import PlanningRuntime
 from travel_agent.requirements.errors import (
     RequirementErrorCategory,
@@ -31,6 +36,7 @@ from travel_agent.requirements.providers.openai import OpenAIRequirementModel
 from travel_agent.requirements.providers.deepseek import DeepSeekRequirementModel
 from travel_agent.tools.providers.amap import AMapPOIProvider, AMapRouteProvider
 from travel_agent.tools.providers.mock import MockPOIProvider, MockRouteProvider
+from travel_agent.weather.errors import WeatherUnavailableError
 
 
 RUNTIME_OWNED_FIELDS = {
@@ -39,6 +45,8 @@ RUNTIME_OWNED_FIELDS = {
     "gateway",
     "workflow",
     "client",
+    "weather_provider",
+    "weather_gateway",
     "requirement_model",
     "requirement_gateway",
     "requirement_workflow",
@@ -93,7 +101,7 @@ def test_openapi_version_matches_package_version(client):
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
-    assert __version__ == "0.8.0"
+    assert __version__ == "0.9.0"
     assert response.json()["info"]["version"] == __version__
 
 
@@ -259,6 +267,54 @@ def test_requirement_model_failure_returns_503_with_safe_detail(monkeypatch):
             "retryable": True,
             "thread_id": "model-failed",
             "message": "需求解析服务暂时超时",
+        }
+    }
+
+
+def test_weather_failure_returns_503_without_exposing_provider_payload():
+    class FailedWeatherRuntime:
+        async def refresh_plan_weather(self, _request, *, session_id):
+            result = ToolResult[object].failed(
+                provider="amap",
+                error=ToolErrorInfo(
+                    category=ToolErrorCategory.UPSTREAM_UNAVAILABLE,
+                    code="weather_upstream_unavailable",
+                    operation="weather.get_forecast",
+                    retryable=True,
+                    safe_message="天气服务暂时不可用",
+                ),
+                attempt_count=3,
+            )
+            raise WeatherUnavailableError.from_result(result, session_id=session_id)
+
+        async def close(self):
+            return None
+
+    async def runtime_factory(_settings):
+        return FailedWeatherRuntime()
+
+    application = create_app(
+        Settings.from_env({}), runtime_factory=runtime_factory
+    )
+    with TestClient(application) as test_client:
+        response = test_client.post(
+            "/api/v1/plan-sessions/weather-failed/weather/refresh",
+            json={
+                "request_id": "e90bc26b-2ab0-4fe6-b733-df8f04081a14",
+                "expected_session_revision": 0,
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "session_id": "weather-failed",
+            "provider": "amap",
+            "operation": "weather.get_forecast",
+            "category": "upstream_unavailable",
+            "code": "weather_upstream_unavailable",
+            "retryable": True,
+            "message": "天气服务暂时不可用",
         }
     }
 

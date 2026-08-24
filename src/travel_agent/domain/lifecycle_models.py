@@ -19,6 +19,15 @@ from travel_agent.domain.models import (
     ValidationResult,
 )
 from travel_agent.domain.tool_models import RouteResult, ToolExecutionSummary
+from travel_agent.domain.weather_models import (
+    ChangeEvent,
+    DailyWeatherRisk,
+    DismissWeatherEventAction,
+    RefreshWeatherAction,
+    WeatherMonitorState,
+    WeatherSnapshot,
+    WeatherStateView,
+)
 from travel_agent.planning.drafts import CandidateDraft
 
 
@@ -63,6 +72,21 @@ class PreviewStatus(StrEnum):
     REJECTED = "rejected"
     STALE = "stale"
     INVALID = "invalid"
+
+
+class ChangeSource(StrEnum):
+    USER = "user"
+    WEATHER = "weather"
+
+
+class PlanChangeTrigger(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    source: ChangeSource
+    request_id: str
+    event_id: str | None = None
+    snapshot_id: str | None = None
+    policy_version: str | None = None
 
 
 class PlanLock(BaseModel):
@@ -249,6 +273,7 @@ class PlanVersion(BaseModel):
     planning_pois: tuple[PlanningPOI, ...]
     route_results: dict[str, RouteResult]
     plan_fingerprint: str
+    change_trigger: PlanChangeTrigger | None = None
     critic_status: CriticStatus = CriticStatus.NOT_RUN
     created_at: datetime = Field(default_factory=utcnow)
 
@@ -270,6 +295,7 @@ class PlanPreview(BaseModel):
     critic_summary: CriticExecutionSummary | None = None
     soft_critique: SoftCritique | None = None
     approval_token_hash: str
+    change_trigger: PlanChangeTrigger | None = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -281,6 +307,7 @@ class ActionReceipt(BaseModel):
     resulting_revision: int = Field(ge=0)
     resulting_version_id: str | None = None
     resulting_preview_id: str | None = None
+    resulting_event_id: str | None = None
 
 
 class PlanSessionRecord(BaseModel):
@@ -296,6 +323,10 @@ class PlanSessionRecord(BaseModel):
     previews: dict[str, PlanPreview] = Field(default_factory=dict)
     locks: dict[str, PlanLock] = Field(default_factory=dict)
     receipts: dict[str, ActionReceipt] = Field(default_factory=dict)
+    weather_monitor: WeatherMonitorState = Field(default_factory=WeatherMonitorState)
+    weather_snapshots: dict[str, WeatherSnapshot] = Field(default_factory=dict)
+    weather_risks: dict[str, tuple[DailyWeatherRisk, ...]] = Field(default_factory=dict)
+    weather_events: dict[str, ChangeEvent] = Field(default_factory=dict)
     external_interrupt: dict | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -364,7 +395,9 @@ LifecycleAction = Annotated[
     | ApprovalAction
     | RejectAction
     | RequirementClarificationAction
-    | EditClarificationAction,
+    | EditClarificationAction
+    | RefreshWeatherAction
+    | DismissWeatherEventAction,
     Field(discriminator="kind"),
 ]
 
@@ -392,4 +425,5 @@ class PlanSessionResponse(BaseModel):
     locks: tuple[PlanLock, ...] = ()
     allowed_actions: tuple[str, ...] = ()
     interrupt: LifecycleInterrupt | None = None
+    weather: WeatherStateView | None = None
     message: str | None = None

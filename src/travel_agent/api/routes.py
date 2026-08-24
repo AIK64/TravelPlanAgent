@@ -15,6 +15,11 @@ from travel_agent.domain.lifecycle_models import (
     PlanVersion,
 )
 from travel_agent.runtime import PlanningRuntime
+from travel_agent.domain.weather_models import (
+    WeatherEventView,
+    WeatherRefreshRequest,
+    WeatherStateView,
+)
 from travel_agent.requirements.models import (
     ClarificationResumeRequest,
     NaturalPlanningRequest,
@@ -154,5 +159,57 @@ async def get_plan_diff(
 ):
     return await runtime.get_plan_diff(
         session_id=session_id, from_id=from_id, to_id=to_id
+    )
+
+
+@router.post(
+    "/api/v1/plan-sessions/{session_id}/weather/refresh",
+    response_model=PlanSessionResponse,
+    tags=["weather-lifecycle"],
+)
+async def refresh_plan_weather(
+    session_id: str,
+    request: WeatherRefreshRequest,
+    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+) -> PlanSessionResponse:
+    return await runtime.refresh_plan_weather(request, session_id=session_id)
+
+
+@router.get(
+    "/api/v1/plan-sessions/{session_id}/weather",
+    response_model=WeatherStateView,
+    tags=["weather-lifecycle"],
+)
+async def get_plan_weather(
+    session_id: str,
+    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+) -> WeatherStateView:
+    return await runtime.get_plan_weather(session_id=session_id)
+
+
+@router.get(
+    "/api/v1/plan-sessions/{session_id}/weather/events",
+    response_model=list[WeatherEventView],
+    tags=["weather-lifecycle"],
+)
+async def get_plan_weather_events(
+    session_id: str,
+    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+):
+    return await runtime.get_plan_weather_events(session_id=session_id)
+
+
+@router.get(
+    "/api/v1/plan-sessions/{session_id}/weather/events/{event_id}",
+    response_model=WeatherEventView,
+    tags=["weather-lifecycle"],
+)
+async def get_plan_weather_event(
+    session_id: str,
+    event_id: str,
+    runtime: Annotated[PlanningRuntime, Depends(get_runtime)],
+):
+    return await runtime.get_plan_weather_event(
+        session_id=session_id, event_id=event_id
     )
 

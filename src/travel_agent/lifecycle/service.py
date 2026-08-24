@@ -15,6 +15,12 @@ from travel_agent.domain.lifecycle_models import (
     PlanSessionStatus,
 )
 from travel_agent.domain.models import PlanningRequest
+from travel_agent.domain.weather_models import (
+    RefreshWeatherAction,
+    WeatherEventView,
+    WeatherRefreshRequest,
+    WeatherStateView,
+)
 from travel_agent.graph.workflow import run_planning
 from travel_agent.lifecycle.errors import LifecycleActionError, LifecycleConflictError
 from travel_agent.lifecycle.repository import PlanRepository
@@ -28,6 +34,7 @@ from travel_agent.requirements.models import (
     NaturalPlanningRequest,
 )
 from travel_agent.requirements.workflow import resume_natural_planning, run_natural_planning
+from travel_agent.weather.persistence import weather_state_view
 
 
 class PlanLifecycleService:
@@ -38,11 +45,13 @@ class PlanLifecycleService:
         planning_workflow: CompiledStateGraph,
         lifecycle_workflow: CompiledStateGraph,
         requirement_workflow: CompiledStateGraph | None,
+        weather_stale_max_seconds: int = 21_600,
     ) -> None:
         self._repository = repository
         self._planning_workflow = planning_workflow
         self._lifecycle_workflow = lifecycle_workflow
         self._requirement_workflow = requirement_workflow
+        self._weather_stale_max_seconds = weather_stale_max_seconds
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def create(
@@ -68,7 +77,10 @@ class PlanLifecycleService:
         )
         await self._repository.create(session)
         return await start_lifecycle(
-            self._lifecycle_workflow, self._repository, session
+            self._lifecycle_workflow,
+            self._repository,
+            session,
+            weather_stale_max_seconds=self._weather_stale_max_seconds,
         )
 
     async def create_from_text(
@@ -94,7 +106,11 @@ class PlanLifecycleService:
                 ),
             )
             await self._repository.create(session)
-            return response_from_session(session, message=response.message)
+            return response_from_session(
+                session,
+                message=response.message,
+                weather_stale_max_seconds=self._weather_stale_max_seconds,
+            )
         if response.status != "completed" or response.planning is None:
             raise LifecycleActionError(
                 resolved_id,
@@ -111,7 +127,10 @@ class PlanLifecycleService:
         )
         await self._repository.create(session)
         return await start_lifecycle(
-            self._lifecycle_workflow, self._repository, session
+            self._lifecycle_workflow,
+            self._repository,
+            session,
+            weather_stale_max_seconds=self._weather_stale_max_seconds,
         )
 
     async def resume(
@@ -123,12 +142,16 @@ class PlanLifecycleService:
             receipt = session.receipts.get(str(request.request_id))
             if receipt is not None:
                 if session.status is PlanSessionStatus.NEEDS_REQUIREMENT_CLARIFICATION:
-                    return response_from_session(session)
+                    return response_from_session(
+                        session,
+                        weather_stale_max_seconds=self._weather_stale_max_seconds,
+                    )
                 return await resume_lifecycle(
                     self._lifecycle_workflow,
                     self._repository,
                     request,
                     session_id=session_id,
+                    weather_stale_max_seconds=self._weather_stale_max_seconds,
                 )
             if session.status is PlanSessionStatus.NEEDS_REQUIREMENT_CLARIFICATION:
                 return await self._resume_requirement(session, request)
@@ -137,12 +160,16 @@ class PlanLifecycleService:
                 self._repository,
                 request,
                 session_id=session_id,
+                weather_stale_max_seconds=self._weather_stale_max_seconds,
             )
 
     async def get(self, session_id: str) -> PlanSessionResponse:
         session = await self._repository.get(session_id)
         if session.external_interrupt is not None:
-            return response_from_session(session)
+            return response_from_session(
+                session,
+                weather_stale_max_seconds=self._weather_stale_max_seconds,
+            )
         snapshot = await self._lifecycle_workflow.aget_state(
             {"configurable": {"thread_id": session.lifecycle_thread_id}}
         )
@@ -151,7 +178,62 @@ class PlanLifecycleService:
             for task in snapshot.tasks
             for value in getattr(task, "interrupts", ())
         )
-        return response_from_session(session, interruptions=interruptions)
+        return response_from_session(
+            session,
+            interruptions=interruptions,
+            weather_stale_max_seconds=self._weather_stale_max_seconds,
+        )
+
+    async def refresh_weather(
+        self, session_id: str, request: WeatherRefreshRequest
+    ) -> PlanSessionResponse:
+        current = await self.get(session_id)
+        if current.interrupt is None:
+            raise LifecycleConflictError(session_id, code="weather_refresh_not_resumable")
+        return await self.resume(
+            session_id,
+            LifecycleResumeRequest(
+                interrupt_id=current.interrupt.id,
+                request_id=request.request_id,
+                expected_active_version_id=request.expected_active_version_id,
+                expected_session_revision=request.expected_session_revision,
+                action=RefreshWeatherAction(),
+            ),
+        )
+
+    async def weather(self, session_id: str) -> WeatherStateView:
+        session = await self._repository.get(session_id)
+        return weather_state_view(
+            session, stale_max_seconds=self._weather_stale_max_seconds
+        )
+
+    async def weather_events(self, session_id: str) -> tuple[WeatherEventView, ...]:
+        session = await self._repository.get(session_id)
+        return tuple(
+            WeatherEventView(
+                event=event,
+                receipt=session.weather_monitor.event_receipts.get(event.event_id),
+            )
+            for event in sorted(
+                session.weather_events.values(),
+                key=lambda item: item.created_at,
+                reverse=True,
+            )
+        )
+
+    async def weather_event(
+        self, session_id: str, event_id: str
+    ) -> WeatherEventView:
+        session = await self._repository.get(session_id)
+        event = session.weather_events.get(event_id)
+        if event is None:
+            raise LifecycleActionError(
+                session_id, "weather_event_not_found", "天气事件不存在"
+            )
+        return WeatherEventView(
+            event=event,
+            receipt=session.weather_monitor.event_receipts.get(event_id),
+        )
 
     async def versions(self, session_id: str):
         session = await self._repository.get(session_id)
@@ -219,7 +301,11 @@ class PlanLifecycleService:
                 else None
             )
             await self._repository.save(session, expected_revision=previous)
-            return response_from_session(session, message=response.message)
+            return response_from_session(
+                session,
+                message=response.message,
+                weather_stale_max_seconds=self._weather_stale_max_seconds,
+            )
         if response.status != "completed" or response.planning is None:
             raise LifecycleActionError(
                 session.session_id,
@@ -231,7 +317,10 @@ class PlanLifecycleService:
         session.external_interrupt = None
         await self._repository.save(session, expected_revision=previous)
         return await start_lifecycle(
-            self._lifecycle_workflow, self._repository, session
+            self._lifecycle_workflow,
+            self._repository,
+            session,
+            weather_stale_max_seconds=self._weather_stale_max_seconds,
         )
 
     async def _planning_snapshot(self, thread_id: str) -> PlanningSnapshot:

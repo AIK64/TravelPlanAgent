@@ -30,6 +30,11 @@ class EditProviderMode(StrEnum):
     DEEPSEEK = "deepseek"
 
 
+class WeatherProviderMode(StrEnum):
+    MOCK = "mock"
+    AMAP = "amap"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     provider: ProviderMode = ProviderMode.MOCK
@@ -77,6 +82,13 @@ class Settings:
     edit_max_output_tokens: int = 1_200
     plan_max_versions: int = 20
     plan_max_affected_days: int = 2
+    weather_provider: WeatherProviderMode = WeatherProviderMode.MOCK
+    weather_cache_ttl_seconds: int = 1_800
+    weather_stale_max_seconds: int = 21_600
+    weather_max_events: int = 50
+    weather_max_poi_searches: int = 4
+    weather_max_alternatives: int = 6
+    weather_exposure_min_confidence: float = 0.8
     deepseek_api_key: str | None = field(default=None, repr=False)
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = ""
@@ -188,6 +200,25 @@ class Settings:
             plan_max_affected_days=int(
                 source.get("PLAN_MAX_AFFECTED_DAYS", "2")
             ),
+            weather_provider=WeatherProviderMode(
+                source.get("WEATHER_PROVIDER", "mock").strip().lower()
+            ),
+            weather_cache_ttl_seconds=int(
+                source.get("WEATHER_CACHE_TTL_SECONDS", "1800")
+            ),
+            weather_stale_max_seconds=int(
+                source.get("WEATHER_STALE_MAX_SECONDS", "21600")
+            ),
+            weather_max_events=int(source.get("WEATHER_MAX_EVENTS", "50")),
+            weather_max_poi_searches=int(
+                source.get("WEATHER_MAX_POI_SEARCHES", "4")
+            ),
+            weather_max_alternatives=int(
+                source.get("WEATHER_MAX_ALTERNATIVES", "6")
+            ),
+            weather_exposure_min_confidence=float(
+                source.get("WEATHER_EXPOSURE_MIN_CONFIDENCE", "0.8")
+            ),
             deepseek_api_key=source.get("DEEPSEEK_API_KEY", "").strip() or None,
             deepseek_base_url=source.get(
                 "DEEPSEEK_BASE_URL",
@@ -213,6 +244,8 @@ class Settings:
     def validate(self) -> None:
         if self.provider is ProviderMode.AMAP and not self.amap_api_key:
             raise ValueError("AMAP_API_KEY is required when TRAVEL_PROVIDER=amap")
+        if self.weather_provider is WeatherProviderMode.AMAP and not self.amap_api_key:
+            raise ValueError("AMAP_API_KEY is required when WEATHER_PROVIDER=amap")
         if self.tool_timeout_seconds <= 0:
             raise ValueError("TOOL_TIMEOUT_SECONDS must be positive")
         if self.tool_max_attempts < 1:
@@ -319,6 +352,22 @@ class Settings:
             raise ValueError("PLAN_MAX_VERSIONS must be between 1 and 100")
         if not 1 <= self.plan_max_affected_days <= 7:
             raise ValueError("PLAN_MAX_AFFECTED_DAYS must be between 1 and 7")
+        if self.weather_cache_ttl_seconds < 1:
+            raise ValueError("WEATHER_CACHE_TTL_SECONDS must be positive")
+        if self.weather_stale_max_seconds <= self.weather_cache_ttl_seconds:
+            raise ValueError(
+                "WEATHER_STALE_MAX_SECONDS must exceed WEATHER_CACHE_TTL_SECONDS"
+            )
+        if not 1 <= self.weather_max_events <= 500:
+            raise ValueError("WEATHER_MAX_EVENTS must be between 1 and 500")
+        if not 1 <= self.weather_max_poi_searches <= 10:
+            raise ValueError("WEATHER_MAX_POI_SEARCHES must be between 1 and 10")
+        if not 1 <= self.weather_max_alternatives <= 20:
+            raise ValueError("WEATHER_MAX_ALTERNATIVES must be between 1 and 20")
+        if not 0 < self.weather_exposure_min_confidence <= 1:
+            raise ValueError(
+                "WEATHER_EXPOSURE_MIN_CONFIDENCE must be in the interval (0, 1]"
+            )
         if (
             self.checkpoint_backend is CheckpointBackend.SQLITE
             and not self.checkpoint_sqlite_path

@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from travel_agent.config import CheckpointBackend, CriticProviderMode, Settings
+from travel_agent.config import (
+    CheckpointBackend,
+    CriticProviderMode,
+    Settings,
+    WeatherProviderMode,
+)
 from travel_agent.domain.tool_models import ProviderMode
 from travel_agent.requirements.models import RequirementProviderMode
 
@@ -14,6 +19,7 @@ def test_settings_default_to_mock():
     assert settings.provider is ProviderMode.MOCK
     assert settings.requirement_provider is RequirementProviderMode.MOCK
     assert settings.critic_provider is CriticProviderMode.MOCK
+    assert settings.weather_provider is WeatherProviderMode.MOCK
     assert settings.requirement_model == "mock-requirement-v1"
     assert settings.requirement_max_attempts == 2
     assert settings.tool_max_attempts == 3
@@ -40,6 +46,34 @@ def test_amap_accepts_non_empty_key():
 
     assert settings.provider is ProviderMode.AMAP
     assert settings.amap_api_key == "test-key"
+
+
+def test_amap_weather_requires_key_and_is_independent_from_map_provider():
+    with pytest.raises(ValueError, match="AMAP_API_KEY"):
+        Settings.from_env({"WEATHER_PROVIDER": "amap"})
+
+    settings = Settings.from_env(
+        {"WEATHER_PROVIDER": "amap", "AMAP_API_KEY": "weather-key"}
+    )
+    assert settings.weather_provider is WeatherProviderMode.AMAP
+    assert settings.provider is ProviderMode.MOCK
+    assert "weather-key" not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("WEATHER_CACHE_TTL_SECONDS", "0"),
+        ("WEATHER_STALE_MAX_SECONDS", "1800"),
+        ("WEATHER_MAX_EVENTS", "0"),
+        ("WEATHER_MAX_POI_SEARCHES", "11"),
+        ("WEATHER_MAX_ALTERNATIVES", "21"),
+        ("WEATHER_EXPOSURE_MIN_CONFIDENCE", "0"),
+    ],
+)
+def test_invalid_weather_settings_are_rejected(name, value):
+    with pytest.raises(ValueError):
+        Settings.from_env({name: value})
 
 
 def test_settings_repr_does_not_expose_amap_api_key():

@@ -1,8 +1,8 @@
 # Constraint-Aware Travel Agent
 
-面向中国城市旅行场景的约束感知规划 Agent。v0.8 在 Grounded LLM Soft Critic 之后加入可恢复的计划生命周期：用户选择候选形成 V1，锁定日期或项目，用结构化或自然语言方式编辑；Agent 经 Impact Analysis、增量 Tool Use、Hard Validator、Soft Critic 和局部性守卫生成 Preview，只有用户批准后才提交 V2。
+面向中国城市旅行场景的约束感知规划 Agent。v0.9 在可恢复计划生命周期上加入天气事件驱动的局部重规划：Agent 把标准化天气快照转换为风险和 ChangeEvent，识别受影响的户外活动，在锁、`must_visit` 和局部预算内生成 Preview，仍然只有用户批准后才提交新版本。
 
-## 当前进度：v0.8.0
+## 当前进度：v0.9.0
 
 ```text
 Natural Language
@@ -26,6 +26,13 @@ Natural Language
   → Approval Interrupt
       ├─ approve → CAS Commit V2 → Continue
       └─ reject  → Keep V1 → Continue
+  → Weather Refresh
+      → Resolve Location → Fetch Snapshot → Deterministic Risk Policy
+      → Derive / Deduplicate ChangeEvent → Exposure / Impact Analysis
+          ├─ no change / recovered / no impact → Persist Outcome
+          ├─ lock / unknown / no safe repair → HITL Attention
+          └─ bounded repair → Indoor POI Search → Route Delta
+                             → Hard Validate → Preview → Approval
 ```
 
 已完成：
@@ -69,12 +76,21 @@ Natural Language
 - Preview/Commit 两阶段、Approval Token、Repository CAS、request ID 幂等和旧 Interrupt/Version/Revision 409。
 - 内存/SQLite Plan Repository；SQLite 模式已覆盖候选选择 Interrupt 的服务重启恢复。
 - 15 条离线 Lifecycle Fixture 及实际 API/轨迹测试，覆盖锁定保持、未影响日期保持、Diff、审批、幂等和有界终止。
+- 独立 `WeatherProvider` Protocol、Mock/AMap Adapter 和带缓存、超时、重试、并发限制、结构化失败语义的 `WeatherToolGateway`。
+- Graph 可见的 `resolve_weather_location → fetch_weather_snapshot → classify_weather_risks → derive_weather_event → deduplicate_weather_event → analyze_weather_impact → build_weather_repair_plan` 路径。
+- 版本化 `weather-risk-v1` 确定性策略、稳定 Snapshot/Event Fingerprint 和 request/snapshot/event 三层幂等；供应商 `reporttime` 不会制造重复事件。
+- 室内/户外/混合/未知暴露分类；锁或未知数据进入 HITL，`must_visit` 只允许移到低风险日期，不会被天气 Repair 删除。
+- 天气 Preview 携带 `event_id`、`snapshot_id` 和策略版本；审批后证据进入 Plan Version，恢复事件不会自动回滚用户计划。
+- 最近两个天气快照、最多 50 个事件及 Receipt 持久化；SQLite 重启后可继续查看事件并批准原 Preview。
+- 刷新、天气状态和事件查询 API；Provider 失败返回 503 并保留 Active Version，不会被伪装成 `infeasible` 或天气良好。
+- 30 条固定天气 Fixture；当前离线 Mock 基线 Event F1、Impact Exact Match、锁与未影响日保持率均为 100%，路线复用率为 66.41%。
 
-当前边界：计划编辑最多包含三个原子动作、影响两个日期，TripSpec 硬约束变化要求创建新计划；当前路线矩阵不是 OTA 级全量交通规划。SQLite 只用于单机演示；天气事件、长期 Memory、MCP、完整前端和生产化分别属于后续版本。
+当前边界：天气刷新由客户端显式触发，不包含定时任务、推送、空气质量、分钟级降水或备用天气 Provider；计划编辑最多包含三个原子动作、影响两个日期。当前路线矩阵不是 OTA 级全量交通规划，SQLite 只用于单机演示；统一评测治理、长期 Memory、MCP、完整前端和生产化属于后续版本。
 
 ## 学习入口
 
 - 后续开发以 [v0.6 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md) 为准；v1.0 完成核心 Agent，v1.1 增加 Preference Memory，v1.2 完成 MCP 与平台化。
+- 从 [v0.9 天气事件驱动局部重规划文档](docs/v0.9/README.md) 查看配置、API、Graph、失败语义和实际离线评测结果；完整取舍见 [设计报告](docs/v0.9/design.md)。
 - 从 [v0.8 计划生命周期 HITL 文档](docs/v0.8/README.md) 查看会话 API、DeepSeek 编辑配置、Graph、失败语义和评测；完整取舍见 [设计报告](docs/v0.8/design.md)。
 - 从 [v0.7 Grounded LLM Soft Critic 文档](docs/v0.7/README.md) 查看当前实现、配置、Graph、失败语义与评测；完整设计见 [设计报告](docs/v0.7/design.md)。
 - 从 [v0.6 约束优化与真实路线文档](docs/v0.6/README.md) 查看当前 Graph、求解预算、降级语义与消融 Benchmark。
@@ -95,6 +111,7 @@ python -m venv .venv
 $env:TRAVEL_PROVIDER = "mock"
 $env:REQUIREMENT_PROVIDER = "mock"
 $env:CRITIC_PROVIDER = "mock"
+$env:WEATHER_PROVIDER = "mock"
 $env:APP_LOG_LEVEL = "INFO"
 .\.venv\Scripts\python.exe -m uvicorn travel_agent.app:app --reload
 ```
@@ -182,7 +199,7 @@ $env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
 也可设置 `CRITIC_PROVIDER=openai` 并提供 `OPENAI_API_KEY` 与独立 `CRITIC_MODEL`。设置 `CRITIC_PROVIDER=disabled` 会完全跳过模型，但仍按硬约束和确定性指标交付。真实 Critic 失败不会回退 Mock。
 
-AMap 模式沿用 v0.2 的显式配置：设置 `TRAVEL_PROVIDER=amap` 与本机 `AMAP_API_KEY`。AMap 失败同样不会回退 Mock，也不会伪装成业务 `infeasible`。
+AMap 模式沿用 v0.2 的显式配置：地图 POI/路线使用 `TRAVEL_PROVIDER=amap`，天气使用独立的 `WEATHER_PROVIDER=amap`，两者都复用仅保存在本机的 `AMAP_API_KEY`，可以分别启用。AMap 失败不会回退 Mock，也不会伪装成业务 `infeasible`。
 
 v0.6 默认同时请求驾车路线和阈值内的步行路线。`MAX_WALKING_LEG_METERS` 控制单段允许步行的最大距离；`USE_REAL_WALKING_ROUTES=false` 仅用于消融实验，会恢复历史估算语义，不建议用于最终计划。
 
@@ -196,6 +213,8 @@ v0.6 默认同时请求驾车路线和阈值内的步行路线。`MAX_WALKING_LE
 .\.venv\Scripts\python.exe scripts\evaluate_local_repair.py
 .\.venv\Scripts\python.exe scripts\evaluate_optimization.py
 .\.venv\Scripts\python.exe scripts\evaluate_soft_critic.py
+.\.venv\Scripts\python.exe scripts\evaluate_plan_lifecycle.py
+.\.venv\Scripts\python.exe scripts\evaluate_weather_replanning.py
 .\.venv\Scripts\python.exe -m pytest --cov=travel_agent --cov-report=term-missing
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m pip check
