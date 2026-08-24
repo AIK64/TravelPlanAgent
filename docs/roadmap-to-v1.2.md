@@ -1,7 +1,7 @@
 # Travel Agent v0.9 → v1.2 迭代路线
 
 > 状态：当前唯一权威版本路线  
-> 当前基线：v0.9.0（已完成）
+> 当前基线：v1.0.0（已完成）
 > 决策日期：2026-08-24
 
 ## 1. 路线决策
@@ -12,7 +12,7 @@
 2. `v1.1` 增加 Preference Memory、上下文裁剪、跨会话个性化及 Memory 消融实验。
 3. `v1.2` 增加 Travel MCP Server、备用 Provider、完整前端和生产化部署。
 
-v0.9 已完成。从当前 v0.9.0 到核心 Agent 发布还需 `v1.0` 一个迭代；完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
+v1.0 已完成，核心 Agent 发布所需的统一 Run、预算、Trace、故障注入、Benchmark、Baseline/消融和发布门禁均已落地。完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
 
 多 Agent 不作为强制版本目标。只有当某项职责确实需要独立推理上下文、独立决策循环或独立运行预算，并且消融实验能证明它优于单 Graph/Subgraph，才允许升级为 Agent。地图查询、时间计算、约束验证、缓存和 Provider 适配器始终是工具或确定性服务，不为“多 Agent”标签进行包装。
 
@@ -47,7 +47,7 @@ v1.0 应能稳定演示以下轨迹：
 | v0.7（已完成） | Grounded LLM Soft Critic | `HardValidate → SoftCritic → EvidenceGuard → QualityGate` | Grounding 准确率、软约束评测、Provider 降级轨迹 |
 | v0.8（已完成） | 计划生命周期 HITL | `Select/Change → Interrupt → Impact → LocalReplan → Version` | 锁定项不变、V1/V2 Diff、重启恢复 |
 | v0.9（已完成） | 天气事件驱动重规划 | `WeatherEvent → ImpactAnalyzer → LocalReplan` | 事件幂等性、affected-days 保持率、故障语义 |
-| v1.0 | 评测驱动的核心 Agent 发布 | 统一 ExecutionBudget、Trace 和回归门禁 | 100+ Benchmark、Baseline、消融、故障注入 |
+| v1.0（已完成） | 评测驱动的核心 Agent 发布 | 统一 ExecutionBudget、Trace 和回归门禁 | 120 次发布工作流、180 次消融、故障注入 |
 | v1.1 | 长期 Preference Memory | `Retrieve → ComposeContext → Plan → Propose → Confirm → Persist` | 跨会话测试、上下文预算、Memory 消融 |
 | v1.2 | MCP 与平台化 | MCP/API 共用 Application Service；生产存储和部署 | MCP Contract、Failover、E2E、安全与部署验证 |
 
@@ -305,6 +305,8 @@ Benchmark 至少包含 30 条 Fixture，覆盖降雨、温度、强风、雪冰�
 
 v1.0 不再横向扩充业务功能，而是把已有循环纳入统一执行预算、轨迹评测和回归门禁，使系统行为可以复现、解释和量化。
 
+详细的 Run 边界、Budget/Trace Schema、Graph 接入点、统一 Benchmark、故障注入、发布门禁和分阶段实施计划见 [v1.0 设计报告](v1.0/design.md)；使用方式与实际结果见 [v1.0 实现文档](v1.0/README.md)。
+
 ### 9.2 运行治理
 
 统一 `ExecutionBudget`：
@@ -337,6 +339,8 @@ v1.0 不再横向扩充业务功能，而是把已有循环纳入统一执行预
 - 关键节点、工具调用和修复决策具有可关联 Trace。
 - Benchmark、命令、数据集版本和报告可以在全 Mock 模式重复运行。
 - README 可以用真实报告展示完整系统与 Baseline/消融差异。
+
+实施结果：120 次 Mock 发布工作流和 180 次隔离消融工作流门禁均已通过；全量测试 `462 passed, 2 skipped`，Branch Coverage `90.19%`。Mock Token 与费用保持 unknown，结果不作为真实 LLM 或地图线上质量声明。
 
 ## 10. v1.1：Preference Memory 与上下文管理
 
@@ -501,9 +505,9 @@ MCP 工具具有明确输入输出 Schema、权限、错误码、幂等规则、
 
 ## 15. 当前下一步
 
-当前下一迭代进入 v1.0：评测驱动的核心 Agent 发布。下一版不再横向增加业务功能，而是统一已有 Requirement、Planning、Repair、Critic、Lifecycle 和 Weather 循环的 ExecutionBudget、Trace Schema、故障注入、100+ 综合 Benchmark、Baseline 与发布门禁。
+当前下一迭代进入 v1.1：Preference Memory、上下文裁剪、跨会话个性化及 Memory 消融。v1.0 已完成已有 Requirement、Planning、Repair、Critic、Lifecycle 和 Weather 循环的 ExecutionBudget、Trace Schema、故障注入、综合 Benchmark、Baseline 与发布门禁。
 
-v0.9 的稳定 `ChangeEvent`、risk/event fingerprint、affected-days、终止原因和天气 Tool 轨迹将直接纳入 v1.0 统一 Run，而不重写天气循环。
+v0.9 的稳定 `ChangeEvent`、risk/event fingerprint、affected-days、终止原因和天气 Tool 轨迹已经纳入 v1.0 统一 Run，天气循环未被重写。
 
 ```text
 Unified Agent Run
@@ -514,4 +518,4 @@ Unified Agent Run
   → Regression Gate + Interview Evidence
 ```
 
-在 v1.0 验收完成前，不提前实现 Memory、MCP 或前端；统一评测层不得改变现有用户锁、Hard Validator、Grounding Gate、局部性守卫或版本提交语义。
+v1.1 开发不得削弱 v1.0 已有的用户锁、Hard Validator、Grounding Gate、统一预算、Trace、局部性守卫或版本提交语义；MCP 与前端仍留在 v1.2。

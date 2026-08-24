@@ -18,6 +18,7 @@ from travel_agent.lifecycle.errors import (
     LifecycleNotFoundError,
 )
 from travel_agent.weather.errors import WeatherUnavailableError
+from travel_agent.execution.errors import ExecutionBudgetExceeded, RunNotFoundError
 
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,11 @@ logger = logging.getLogger(__name__)
 
 class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
+
+
+def _run_headers(error: BaseException) -> dict[str, str] | None:
+    run_id = getattr(error, "agent_run_id", None) or getattr(error, "run_id", None)
+    return {"X-Agent-Run-Id": str(run_id)} if run_id else None
 
 
 async def tool_unavailable_exception_handler(
@@ -46,6 +52,7 @@ async def tool_unavailable_exception_handler(
     return UTF8JSONResponse(
         status_code=503,
         content={"detail": detail},
+        headers=_run_headers(error),
     )
 
 
@@ -65,7 +72,9 @@ async def requirement_unavailable_exception_handler(
         detail["retryable"],
         exc_info=(type(error), error, error.__traceback__),
     )
-    return UTF8JSONResponse(status_code=503, content={"detail": detail})
+    return UTF8JSONResponse(
+        status_code=503, content={"detail": detail}, headers=_run_headers(error)
+    )
 
 
 async def clarification_not_found_exception_handler(
@@ -78,7 +87,9 @@ async def clarification_not_found_exception_handler(
         detail["thread_id"],
         detail["code"],
     )
-    return UTF8JSONResponse(status_code=404, content={"detail": detail})
+    return UTF8JSONResponse(
+        status_code=404, content={"detail": detail}, headers=_run_headers(error)
+    )
 
 
 async def clarification_conflict_exception_handler(
@@ -91,7 +102,9 @@ async def clarification_conflict_exception_handler(
         detail["thread_id"],
         detail["code"],
     )
-    return UTF8JSONResponse(status_code=409, content={"detail": detail})
+    return UTF8JSONResponse(
+        status_code=409, content={"detail": detail}, headers=_run_headers(error)
+    )
 
 
 async def edit_unavailable_exception_handler(
@@ -105,26 +118,40 @@ async def edit_unavailable_exception_handler(
         detail["model"],
         detail["code"],
     )
-    return UTF8JSONResponse(status_code=503, content={"detail": detail})
+    return UTF8JSONResponse(
+        status_code=503, content={"detail": detail}, headers=_run_headers(error)
+    )
 
 
 async def lifecycle_not_found_exception_handler(
     _request: Request, error: LifecycleNotFoundError
 ) -> UTF8JSONResponse:
-    return UTF8JSONResponse(status_code=404, content={"detail": error.safe_detail()})
+    return UTF8JSONResponse(
+        status_code=404,
+        content={"detail": error.safe_detail()},
+        headers=_run_headers(error),
+    )
 
 
 async def lifecycle_conflict_exception_handler(
     _request: Request, error: LifecycleConflictError
 ) -> UTF8JSONResponse:
-    return UTF8JSONResponse(status_code=409, content={"detail": error.safe_detail()})
+    return UTF8JSONResponse(
+        status_code=409,
+        content={"detail": error.safe_detail()},
+        headers=_run_headers(error),
+    )
 
 
 async def lifecycle_action_exception_handler(
     _request: Request, error: LifecycleActionError
 ) -> UTF8JSONResponse:
     status_code = 409 if error.code in {"lock_conflict"} else 422
-    return UTF8JSONResponse(status_code=status_code, content={"detail": error.safe_detail()})
+    return UTF8JSONResponse(
+        status_code=status_code,
+        content={"detail": error.safe_detail()},
+        headers=_run_headers(error),
+    )
 
 
 async def weather_unavailable_exception_handler(
@@ -141,4 +168,29 @@ async def weather_unavailable_exception_handler(
         detail["code"],
         detail["retryable"],
     )
-    return UTF8JSONResponse(status_code=503, content={"detail": detail})
+    return UTF8JSONResponse(
+        status_code=503, content={"detail": detail}, headers=_run_headers(error)
+    )
+
+
+async def execution_budget_exception_handler(
+    _request: Request, error: ExecutionBudgetExceeded
+) -> UTF8JSONResponse:
+    logger.warning(
+        "api.execution_budget_exhausted run_id=%s limit=%s used=%s maximum=%s",
+        error.run_id,
+        error.limit,
+        error.used,
+        error.maximum,
+    )
+    return UTF8JSONResponse(
+        status_code=503,
+        content={"detail": error.safe_detail()},
+        headers=_run_headers(error),
+    )
+
+
+async def run_not_found_exception_handler(
+    _request: Request, error: RunNotFoundError
+) -> UTF8JSONResponse:
+    return UTF8JSONResponse(status_code=404, content={"detail": error.safe_detail()})

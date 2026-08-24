@@ -62,6 +62,9 @@ RUNTIME_OWNED_FIELDS = {
     "lifecycle_service",
     "checkpoint_context",
     "repository_context",
+    "run_repository",
+    "run_coordinator",
+    "run_repository_context",
     "resume_locks",
 }
 
@@ -101,7 +104,7 @@ def test_openapi_version_matches_package_version(client):
     response = client.get("/openapi.json")
 
     assert response.status_code == 200
-    assert __version__ == "0.9.0"
+    assert __version__ == "1.0.0"
     assert response.json()["info"]["version"] == __version__
 
 
@@ -117,6 +120,35 @@ def test_create_plan(client, hangzhou_trip):
     body = response.json()
     assert body["status"] == "completed"
     assert body["selected_plan"]["validation"]["valid"] is True
+
+
+def test_agent_run_header_and_trace_api_are_correlated(client, hangzhou_trip):
+    response = client.post(
+        "/api/v1/plans",
+        json={"trip": hangzhou_trip.model_dump(mode="json")},
+    )
+    run_id = response.headers["x-agent-run-id"]
+
+    run = client.get(f"/api/v1/runs/{run_id}")
+    trace = client.get(f"/api/v1/runs/{run_id}/trace?limit=500")
+
+    assert response.headers["x-agent-trace-status"] == "complete"
+    assert run.status_code == 200
+    assert run.json()["run_id"] == run_id
+    assert run.json()["status"] == "completed"
+    events = trace.json()["events"]
+    assert events[0]["event_type"] == "run.started"
+    assert events[-1]["event_type"] == "run.completed"
+    serialized = str(events)
+    assert "approval_token" not in serialized.casefold()
+    assert "api_key" not in serialized.casefold()
+
+
+def test_missing_agent_run_returns_safe_404(client):
+    response = client.get("/api/v1/runs/missing-run")
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "agent_run_not_found"
 
 
 def test_create_plan_from_complete_natural_language(client):

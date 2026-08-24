@@ -9,6 +9,8 @@ from typing import Protocol
 
 from travel_agent.domain.lifecycle_models import PlanSessionRecord, utcnow
 from travel_agent.lifecycle.errors import LifecycleConflictError, LifecycleNotFoundError
+from travel_agent.execution.context import match_fault, record_repository
+from travel_agent.execution.faults import FaultMode, FaultPoint
 
 
 class PlanRepository(Protocol):
@@ -26,21 +28,27 @@ class InMemoryPlanRepository:
         self._lock = asyncio.Lock()
 
     async def create(self, session: PlanSessionRecord) -> None:
+        _inject_repository_fault("create")
         async with self._lock:
             if session.session_id in self._sessions:
                 raise LifecycleConflictError(session.session_id)
             self._sessions[session.session_id] = session.model_copy(deep=True)
+        record_repository("create", status="success")
 
     async def get(self, session_id: str) -> PlanSessionRecord:
+        _inject_repository_fault("get")
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 raise LifecycleNotFoundError(session_id)
-            return session.model_copy(deep=True)
+            result = session.model_copy(deep=True)
+        record_repository("get", status="success")
+        return result
 
     async def save(
         self, session: PlanSessionRecord, *, expected_revision: int
     ) -> None:
+        _inject_repository_fault("save")
         async with self._lock:
             current = self._sessions.get(session.session_id)
             if current is None:
@@ -52,6 +60,7 @@ class InMemoryPlanRepository:
                 )
             session.updated_at = utcnow()
             self._sessions[session.session_id] = session.model_copy(deep=True)
+        record_repository("save", status="success")
 
     async def close(self) -> None:
         return None
@@ -72,6 +81,7 @@ class SQLitePlanRepository:
         self._lock = asyncio.Lock()
 
     async def create(self, session: PlanSessionRecord) -> None:
+        _inject_repository_fault("create")
         async with self._lock:
             try:
                 self._connection.execute(
@@ -81,19 +91,24 @@ class SQLitePlanRepository:
                 self._connection.commit()
             except sqlite3.IntegrityError:
                 raise LifecycleConflictError(session.session_id) from None
+        record_repository("create", status="success")
 
     async def get(self, session_id: str) -> PlanSessionRecord:
+        _inject_repository_fault("get")
         async with self._lock:
             row = self._connection.execute(
                 "SELECT payload FROM plan_sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
         if row is None:
             raise LifecycleNotFoundError(session_id)
-        return PlanSessionRecord.model_validate_json(row[0])
+        result = PlanSessionRecord.model_validate_json(row[0])
+        record_repository("get", status="success")
+        return result
 
     async def save(
         self, session: PlanSessionRecord, *, expected_revision: int
     ) -> None:
+        _inject_repository_fault("save")
         async with self._lock:
             session.updated_at = utcnow()
             cursor = self._connection.execute(
@@ -114,7 +129,11 @@ class SQLitePlanRepository:
                 ).fetchone()
                 if exists is None:
                     raise LifecycleNotFoundError(session.session_id)
+                record_repository(
+                    "cas_conflict", status="conflict", code="stale_revision"
+                )
                 raise LifecycleConflictError(session.session_id, code="stale_revision")
+        record_repository("save", status="success")
 
     async def close(self) -> None:
         async with self._lock:
@@ -135,3 +154,20 @@ async def open_plan_repository(
     finally:
         await repository.close()
 
+
+class PlanRepositoryInjectedError(RuntimeError):
+    pass
+
+
+def _inject_repository_fault(operation: str) -> None:
+    mode = match_fault(
+        FaultPoint.PLAN_REPOSITORY, operation=operation, attempt=1
+    )
+    if mode in {
+        FaultMode.WRITE_FAILURE,
+        FaultMode.CONNECTION_ERROR,
+        FaultMode.TIMEOUT,
+    }:
+        raise PlanRepositoryInjectedError(
+            f"injected plan repository failure: {mode.value}"
+        )

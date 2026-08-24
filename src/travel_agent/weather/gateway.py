@@ -16,9 +16,20 @@ from travel_agent.domain.tool_models import (
 from travel_agent.domain.weather_models import WeatherForecast, WeatherLocation
 from travel_agent.tools.cache import AsyncTTLCache
 from travel_agent.tools.errors import ToolRetryExhausted
+from travel_agent.tools.errors import ToolProviderError
 from travel_agent.tools.retry import RetryEvent, RetryPolicy
 from travel_agent.weather.protocols import WeatherProvider
 from travel_agent.config import Settings
+from travel_agent.execution.context import (
+    begin_tool,
+    begin_tool_attempt,
+    effective_timeout,
+    finish_tool,
+    match_fault,
+    tool_retry,
+)
+from travel_agent.execution.faults import FaultPoint
+from travel_agent.tools.gateway import _injected_tool_error
 
 
 T = TypeVar("T")
@@ -39,6 +50,7 @@ class WeatherToolGateway:
         semaphore: asyncio.Semaphore,
         location_cache_ttl_seconds: int = 86_400,
         forecast_cache_ttl_seconds: int = 1_800,
+        timeout_seconds: float = 5.0,
         utcnow: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._provider = provider
@@ -47,6 +59,7 @@ class WeatherToolGateway:
         self._semaphore = semaphore
         self._location_ttl = location_cache_ttl_seconds
         self._forecast_ttl = forecast_cache_ttl_seconds
+        self._timeout_seconds = timeout_seconds
         self._utcnow = utcnow
 
     async def resolve_location(
@@ -92,6 +105,9 @@ class WeatherToolGateway:
         call: Callable[[], Awaitable[T]],
     ) -> ToolResult[T]:
         provider = self._provider.name
+        parent_event_id = begin_tool(
+            operation, provider=provider, thread_id=context.thread_id
+        )
         logger.info(
             "weather.tool.started | thread_id=%s provider=%s operation=%s",
             context.thread_id,
@@ -101,16 +117,37 @@ class WeatherToolGateway:
 
         async def load() -> ToolResult[T]:
             started = perf_counter()
+            attempt = 0
 
             async def one_attempt() -> T:
+                nonlocal attempt
+                attempt += 1
+                begin_tool_attempt(
+                    operation,
+                    provider=provider,
+                    attempt=attempt,
+                    parent_event_id=parent_event_id,
+                )
+                injected = match_fault(
+                    FaultPoint.WEATHER_PROVIDER,
+                    operation=operation,
+                    attempt=attempt,
+                )
+                if injected is not None:
+                    raise _injected_tool_error(injected, operation)
                 async with self._semaphore:
-                    return await call()
+                    try:
+                        return await asyncio.wait_for(
+                            call(), timeout=effective_timeout(self._timeout_seconds)
+                        )
+                    except TimeoutError as error:
+                        raise ToolProviderError.timeout(operation) from error
 
             try:
                 outcome = await self._retry.execute(
                     one_attempt,
                     on_retry=lambda event: self._log_retry(
-                        event, context, provider, operation
+                        event, context, provider, operation, parent_event_id
                     ),
                 )
             except ToolRetryExhausted as exhausted:
@@ -167,6 +204,16 @@ class WeatherToolGateway:
                 result.error.retryable,
                 result.attempt_count,
             )
+        finish_tool(
+            operation,
+            provider=provider,
+            status=result.status.value,
+            cache_hit=result.cache_hit,
+            attempt_count=result.attempt_count,
+            elapsed_ms=result.elapsed_ms,
+            error_code=result.error.code if result.error is not None else None,
+            parent_event_id=parent_event_id,
+        )
         return result
 
     async def _log_retry(
@@ -175,6 +222,7 @@ class WeatherToolGateway:
         context: ToolCallContext,
         provider: str,
         operation: str,
+        parent_event_id: str | None = None,
     ) -> None:
         logger.info(
             "weather.tool.retry_scheduled | thread_id=%s provider=%s "
@@ -188,6 +236,14 @@ class WeatherToolGateway:
             round(event.delay_seconds, 3),
             event.error.category.value,
             event.error.code,
+        )
+        tool_retry(
+            operation,
+            provider=provider,
+            attempt=event.attempt,
+            category=event.error.category.value,
+            code=event.error.code,
+            parent_event_id=parent_event_id,
         )
 
 
@@ -204,4 +260,5 @@ def build_weather_gateway(
         ),
         semaphore=asyncio.Semaphore(settings.tool_max_concurrency),
         forecast_cache_ttl_seconds=settings.weather_cache_ttl_seconds,
+        timeout_seconds=settings.tool_timeout_seconds,
     )

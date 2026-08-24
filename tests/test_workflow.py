@@ -136,7 +136,8 @@ def test_graph_exposes_tool_use_and_replan_nodes(mock_workflow):
         "explain_selection",
     } <= node_names
     assert {
-        ("__start__", "build_search_plan"),
+        ("__start__", "execution_budget_guard"),
+        ("execution_budget_guard", "build_search_plan"),
         ("build_search_plan", "load_pois"),
         ("load_pois", "resolve_poi_facts"),
         ("resolve_poi_facts", "build_route_matrix"),

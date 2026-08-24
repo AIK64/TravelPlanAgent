@@ -19,6 +19,12 @@ from travel_agent.domain.tool_models import (
     ToolStatus,
 )
 from travel_agent.graph.workflow import _CHECKPOINT_ALLOWED_TYPES, run_planning
+from travel_agent.execution.checkpoints import ObservedCheckpointSaver
+from travel_agent.execution.instrumentation import (
+    execution_budget_guard,
+    instrument_node,
+    instrument_route,
+)
 from travel_agent.requirements.anchors import (
     AnchorRole,
     build_anchor_search_plan,
@@ -481,34 +487,55 @@ def build_requirement_workflow(
         }
 
     builder = StateGraph(RequirementState)
-    builder.add_node("parse_requirement", parse_requirement)
-    builder.add_node("validate_requirement", validate_requirement)
-    builder.add_node("resolve_anchors", resolve_anchors)
-    builder.add_node("evaluate_anchors", evaluate_anchors)
-    builder.add_node("request_clarification", request_clarification)
-    builder.add_node("await_clarification", await_clarification)
-    builder.add_node("parse_clarification_patch", parse_clarification_patch)
-    builder.add_node("apply_clarification_patch", apply_clarification_patch)
-    builder.add_node("clarification_exhausted", clarification_exhausted)
-    builder.add_node("assemble_trip_spec", assemble_trip_spec)
-    builder.add_node("execute_planning", execute_planning)
-    builder.add_edge(START, "parse_requirement")
+
+    def add_node(name: str, function, *, terminal: bool = False) -> None:
+        builder.add_node(
+            name, instrument_node("requirements", name, function, terminal=terminal)
+        )
+
+    add_node("execution_budget_guard", execution_budget_guard)
+    add_node("parse_requirement", parse_requirement)
+    add_node("validate_requirement", validate_requirement)
+    add_node("resolve_anchors", resolve_anchors)
+    add_node("evaluate_anchors", evaluate_anchors)
+    add_node("request_clarification", request_clarification)
+    add_node("await_clarification", await_clarification, terminal=True)
+    add_node("parse_clarification_patch", parse_clarification_patch)
+    add_node("apply_clarification_patch", apply_clarification_patch)
+    add_node("clarification_exhausted", clarification_exhausted, terminal=True)
+    add_node("assemble_trip_spec", assemble_trip_spec)
+    add_node("execute_planning", execute_planning, terminal=True)
+    builder.add_edge(START, "execution_budget_guard")
+    builder.add_edge("execution_budget_guard", "parse_requirement")
     builder.add_edge("parse_requirement", "validate_requirement")
-    builder.add_conditional_edges("validate_requirement", route_requirement)
+    builder.add_conditional_edges(
+        "validate_requirement",
+        instrument_route("requirements", "validate_requirement", route_requirement),
+    )
     builder.add_edge("resolve_anchors", "evaluate_anchors")
-    builder.add_conditional_edges("evaluate_anchors", route_anchors)
+    builder.add_conditional_edges(
+        "evaluate_anchors",
+        instrument_route("requirements", "evaluate_anchors", route_anchors),
+    )
     builder.add_conditional_edges(
         "request_clarification",
-        route_clarification_request,
+        instrument_route(
+            "requirements", "request_clarification", route_clarification_request
+        ),
     )
     builder.add_edge("await_clarification", "parse_clarification_patch")
     builder.add_edge("parse_clarification_patch", "apply_clarification_patch")
-    builder.add_conditional_edges("apply_clarification_patch", route_after_patch)
+    builder.add_conditional_edges(
+        "apply_clarification_patch",
+        instrument_route(
+            "requirements", "apply_clarification_patch", route_after_patch
+        ),
+    )
     builder.add_edge("clarification_exhausted", END)
     builder.add_edge("assemble_trip_spec", "execute_planning")
     builder.add_edge("execute_planning", END)
-    resolved_checkpointer = checkpointer or InMemorySaver(
-        serde=requirement_checkpoint_serializer()
+    resolved_checkpointer = checkpointer or ObservedCheckpointSaver(
+        InMemorySaver(serde=requirement_checkpoint_serializer())
     )
     return builder.compile(checkpointer=resolved_checkpointer)
 

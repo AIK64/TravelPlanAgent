@@ -25,6 +25,15 @@ from travel_agent.requirements.prompts import (
     REQUIREMENT_PROMPT_VERSION,
 )
 from travel_agent.requirements.protocols import RequirementModel
+from travel_agent.execution.context import (
+    begin_llm,
+    begin_llm_attempt,
+    effective_timeout,
+    finish_llm,
+    llm_retry,
+    match_fault,
+)
+from travel_agent.execution.faults import FaultMode, FaultPoint
 
 
 logger = logging.getLogger(__name__)
@@ -127,6 +136,13 @@ class RequirementGateway:
         call: Callable[[], Awaitable[OutputT]],
     ) -> tuple[OutputT, RequirementExecutionSummary]:
         started = perf_counter()
+        parent_event_id = begin_llm(
+            operation.value,
+            provider=self._model.name,
+            model=self._model.model,
+            prompt_version=prompt_version,
+            input_chars=input_chars,
+        )
         _log_event(
             f"{event_prefix}.started",
             thread_id=thread_id,
@@ -140,9 +156,25 @@ class RequirementGateway:
         last_error: RequirementProviderError | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:
+                begin_llm_attempt(
+                    operation.value,
+                    provider=self._model.name,
+                    model=self._model.model,
+                    attempt=attempt,
+                    parent_event_id=parent_event_id,
+                )
+                injected = match_fault(
+                    FaultPoint.REQUIREMENT_LLM
+                    if operation is RequirementOperation.INITIAL_PARSE
+                    else FaultPoint.CLARIFICATION_LLM,
+                    operation=operation.value,
+                    attempt=attempt,
+                )
+                if injected is not None:
+                    raise _injected_requirement_error(injected)
                 output = await asyncio.wait_for(
                     call(),
-                    timeout=self._timeout_seconds,
+                    timeout=effective_timeout(self._timeout_seconds),
                 )
             except TimeoutError:
                 last_error = RequirementProviderError(
@@ -178,6 +210,18 @@ class RequirementGateway:
                     input_tokens=output.input_tokens,
                     output_tokens=output.output_tokens,
                 )
+                finish_llm(
+                    operation.value,
+                    provider=self._model.name,
+                    model=self._model.model,
+                    status="success",
+                    attempt_count=attempt,
+                    elapsed_ms=elapsed_ms,
+                    input_tokens=output.input_tokens,
+                    output_tokens=output.output_tokens,
+                    error_code=None,
+                    parent_event_id=parent_event_id,
+                )
                 return output, summary
 
             assert last_error is not None
@@ -192,6 +236,18 @@ class RequirementGateway:
                     category=last_error.category.value,
                     code=last_error.code,
                     retryable=last_error.retryable,
+                )
+                finish_llm(
+                    operation.value,
+                    provider=self._model.name,
+                    model=self._model.model,
+                    status="failed",
+                    attempt_count=attempt,
+                    elapsed_ms=round((perf_counter() - started) * 1000, 2),
+                    input_tokens=None,
+                    output_tokens=None,
+                    error_code=last_error.code,
+                    parent_event_id=parent_event_id,
                 )
                 raise RequirementUnavailableError(
                     provider=self._model.name,
@@ -223,6 +279,37 @@ class RequirementGateway:
                 category=last_error.category.value,
                 code=last_error.code,
             )
+            llm_retry(
+                operation.value,
+                attempt=attempt,
+                category=last_error.category.value,
+                code=last_error.code,
+                parent_event_id=parent_event_id,
+            )
             await self._sleeper(delay)
 
         raise RuntimeError("requirement retry loop exited unexpectedly")
+
+
+def _injected_requirement_error(mode: FaultMode) -> RequirementProviderError:
+    category = {
+        FaultMode.TIMEOUT: RequirementErrorCategory.TIMEOUT,
+        FaultMode.RATE_LIMIT: RequirementErrorCategory.RATE_LIMIT,
+        FaultMode.AUTH_ERROR: RequirementErrorCategory.AUTHENTICATION,
+        FaultMode.CONNECTION_ERROR: RequirementErrorCategory.CONNECTION,
+        FaultMode.INVALID_SCHEMA: RequirementErrorCategory.INVALID_RESPONSE,
+        FaultMode.EMPTY_BUSINESS_RESULT: RequirementErrorCategory.INVALID_RESPONSE,
+        FaultMode.WRITE_FAILURE: RequirementErrorCategory.UPSTREAM_UNAVAILABLE,
+    }[mode]
+    retryable = mode in {
+        FaultMode.TIMEOUT,
+        FaultMode.RATE_LIMIT,
+        FaultMode.CONNECTION_ERROR,
+        FaultMode.WRITE_FAILURE,
+    }
+    return RequirementProviderError(
+        category=category,
+        code=f"injected_{mode.value}",
+        retryable=retryable,
+        safe_message="Injected requirement failure for evaluation",
+    )

@@ -46,6 +46,14 @@ from travel_agent.domain.models import PlanningPOI, ValidationStatus, ViolationS
 from travel_agent.domain.tool_models import ToolCallContext, ToolStatus, route_key
 from travel_agent.domain.tool_models import POISearchQuery
 from travel_agent.edits.gateway import EditGateway
+from travel_agent.execution.checkpoints import ObservedCheckpointSaver
+from travel_agent.execution.instrumentation import (
+    execution_budget_guard,
+    instrument_node,
+    instrument_route,
+)
+from travel_agent.execution.context import record_degradation
+from travel_agent.execution.errors import ExecutionBudgetExceeded
 from travel_agent.lifecycle.actions import (
     apply_edit_patch,
     edit_item_context,
@@ -1153,6 +1161,9 @@ def build_lifecycle_workflow(
                     critic_summary = critic_result.summary
                     soft_critique = critic_result.critiques[0]
                     soft_after = quality_score(soft_critique, critic_policy)
+            except ExecutionBudgetExceeded:
+                critic_status = CriticStatus.UNAVAILABLE
+                record_degradation("lifecycle_soft_critic_budget_exhausted")
             except CriticUnavailableError:
                 critic_status = CriticStatus.UNAVAILABLE
 
@@ -1361,33 +1372,44 @@ def build_lifecycle_workflow(
         return {"status": session.status.value, "action": None}
 
     builder = StateGraph(PlanLifecycleState)
-    builder.add_node("await_user_action", await_user_action)
-    builder.add_node("dispatch_action", dispatch_action)
-    builder.add_node("select_candidate", select_candidate)
-    builder.add_node("change_lock", change_lock)
-    builder.add_node("parse_edit", parse_edit)
-    builder.add_node("apply_edit_clarification", apply_edit_clarification)
-    builder.add_node("analyze_change_impact", analyze_impact)
-    builder.add_node("build_local_preview", build_preview)
-    builder.add_node("resolve_approval", resolve_approval)
-    builder.add_node("resolve_weather_location", resolve_weather_location)
-    builder.add_node("fetch_weather_snapshot", fetch_weather_snapshot)
-    builder.add_node("classify_weather_risks", classify_weather_risks)
-    builder.add_node("derive_weather_event", derive_weather_change)
-    builder.add_node("deduplicate_weather_event", deduplicate_weather_event)
-    builder.add_node("analyze_weather_impact", analyze_weather_change_impact)
-    builder.add_node("build_weather_repair_plan", build_weather_repair)
-    builder.add_node("dismiss_weather_event", dismiss_weather_event)
-    builder.add_edge(START, "await_user_action")
+
+    def add_node(name: str, function, *, terminal: bool = False) -> None:
+        builder.add_node(
+            name, instrument_node("lifecycle", name, function, terminal=terminal)
+        )
+
+    add_node("execution_budget_guard", execution_budget_guard)
+    add_node("await_user_action", await_user_action, terminal=True)
+    add_node("dispatch_action", dispatch_action)
+    add_node("select_candidate", select_candidate)
+    add_node("change_lock", change_lock)
+    add_node("parse_edit", parse_edit)
+    add_node("apply_edit_clarification", apply_edit_clarification)
+    add_node("analyze_change_impact", analyze_impact)
+    add_node("build_local_preview", build_preview)
+    add_node("resolve_approval", resolve_approval)
+    add_node("resolve_weather_location", resolve_weather_location)
+    add_node("fetch_weather_snapshot", fetch_weather_snapshot)
+    add_node("classify_weather_risks", classify_weather_risks)
+    add_node("derive_weather_event", derive_weather_change)
+    add_node("deduplicate_weather_event", deduplicate_weather_event)
+    add_node("analyze_weather_impact", analyze_weather_change_impact)
+    add_node("build_weather_repair_plan", build_weather_repair)
+    add_node("dismiss_weather_event", dismiss_weather_event)
+    builder.add_edge(START, "execution_budget_guard")
+    builder.add_edge("execution_budget_guard", "await_user_action")
     builder.add_edge("await_user_action", "dispatch_action")
-    builder.add_conditional_edges("dispatch_action", route_action)
+    builder.add_conditional_edges(
+        "dispatch_action",
+        instrument_route("lifecycle", "dispatch_action", route_action),
+    )
     builder.add_edge("select_candidate", "await_user_action")
     builder.add_edge("change_lock", "await_user_action")
     builder.add_edge("parse_edit", "analyze_change_impact")
     builder.add_edge("apply_edit_clarification", "analyze_change_impact")
     builder.add_conditional_edges(
         "analyze_change_impact",
-        route_impact,
+        instrument_route("lifecycle", "analyze_change_impact", route_impact),
         {"build_preview": "build_local_preview", "await_user_action": "await_user_action"},
     )
     builder.add_edge("build_local_preview", "await_user_action")
@@ -1398,7 +1420,9 @@ def build_lifecycle_workflow(
     builder.add_edge("derive_weather_event", "deduplicate_weather_event")
     builder.add_conditional_edges(
         "deduplicate_weather_event",
-        route_weather_event,
+        instrument_route(
+            "lifecycle", "deduplicate_weather_event", route_weather_event
+        ),
         {
             "analyze_weather_impact": "analyze_weather_impact",
             "await_user_action": "await_user_action",
@@ -1406,7 +1430,9 @@ def build_lifecycle_workflow(
     )
     builder.add_conditional_edges(
         "analyze_weather_impact",
-        route_weather_impact,
+        instrument_route(
+            "lifecycle", "analyze_weather_impact", route_weather_impact
+        ),
         {
             "build_weather_repair_plan": "build_weather_repair_plan",
             "await_user_action": "await_user_action",
@@ -1414,14 +1440,18 @@ def build_lifecycle_workflow(
     )
     builder.add_conditional_edges(
         "build_weather_repair_plan",
-        route_weather_repair,
+        instrument_route(
+            "lifecycle", "build_weather_repair_plan", route_weather_repair
+        ),
         {
             "analyze_change_impact": "analyze_change_impact",
             "await_user_action": "await_user_action",
         },
     )
     builder.add_edge("dismiss_weather_event", "await_user_action")
-    return builder.compile(checkpointer=checkpointer or InMemorySaver())
+    return builder.compile(
+        checkpointer=checkpointer or ObservedCheckpointSaver(InMemorySaver())
+    )
 
 
 def initial_lifecycle_state(session: PlanSessionRecord) -> PlanLifecycleState:

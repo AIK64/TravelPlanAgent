@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class PlanLifecycleState(TypedDict):
+    execution: NotRequired[dict | None]
     session_id: str
     lifecycle_thread_id: str
     status: str

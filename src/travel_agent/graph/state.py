@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from travel_agent.domain.models import (
     PlanCandidate,
@@ -33,6 +33,7 @@ from travel_agent.planning.drafts import CandidateDraft
 
 
 class TravelState(TypedDict):
+    execution: NotRequired[dict | None]
     thread_id: str
     trip: TripSpec
     search_queries: list[POISearchQuery]

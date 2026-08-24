@@ -1,0 +1,29 @@
+{
+  "schema_version": "v1-release-manifest-v1",
+  "dataset_version": "travel-agent-v1.0-benchmark-v1",
+  "base_dataset": "evals/requirements/cases.jsonl",
+  "minimum_case_count": 120,
+  "minimum_workflow_execution_count": 100,
+  "matrix": [
+    {
+      "variant": "full",
+      "evidence_level": "workflow_execution",
+      "expected_terminal": "source_contract"
+    },
+    {
+      "variant": "cache_repeat",
+      "evidence_level": "workflow_execution",
+      "expected_terminal": "source_contract"
+    },
+    {
+      "variant": "budget_fault",
+      "evidence_level": "workflow_execution",
+      "expected_terminal": "execution_budget_exhausted"
+    },
+    {
+      "variant": "llm_fault",
+      "evidence_level": "workflow_execution",
+      "expected_terminal": "llm_provider_failure"
+    }
+  ]
+}

@@ -1,11 +1,12 @@
 # Constraint-Aware Travel Agent
 
-面向中国城市旅行场景的约束感知规划 Agent。v0.9 在可恢复计划生命周期上加入天气事件驱动的局部重规划：Agent 把标准化天气快照转换为风险和 ChangeEvent，识别受影响的户外活动，在锁、`must_visit` 和局部预算内生成 Preview，仍然只有用户批准后才提交新版本。
+面向中国城市旅行场景的约束感知规划 Agent。v1.0 把 Requirement、Planning、Lifecycle/HITL 与 Weather Replanning 纳入统一 `AgentRun → ExecutionBudget → Trace → Benchmark → Release Gate`：每次执行都有独立 Run、共享预算、强类型安全轨迹、明确失败分类和可重复评测证据。
 
-## 当前进度：v0.9.0
+## 当前进度：v1.0.0
 
 ```text
 Natural Language
+  → RunCoordinator / Shared ExecutionBudget / Safe Trace
   → Parse Requirement
   → Deterministic Validate
   → Interrupt ↔ Resume Clarification Patch
@@ -33,9 +34,19 @@ Natural Language
           ├─ lock / unknown / no safe repair → HITL Attention
           └─ bounded repair → Indoor POI Search → Route Delta
                              → Hard Validate → Preview → Approval
+  → RunTerminalReason / Usage / Trace API / Release Gate
 ```
 
 已完成：
+
+- 统一 `AgentRun`、Run/Thread/Session 边界和 Memory/SQLite Run Store；所有 Agent mutation 返回 `X-Agent-Run-Id` 与 Trace 状态。
+- 三个 Graph 的显式 `execution_budget_guard`，以及 Node、Conditional Route、Tool、LLM、Retry、Cache、Validator、Repair、Interrupt、Checkpoint、Repository 和终态观测。
+- Run 级 Graph Step、Tool Call、Provider Attempt、LLM、Token、Repair、Interrupt、Checkpoint、Trace 和 Deadline 共享预算；重复动作指纹也有统一上限。
+- Tool/LLM/Checkpoint/Repository 故障、预算耗尽和业务不可行分开分类；错误响应可关联失败 Run。
+- Trace 属性白名单、长度限制和秘密泄漏测试；原始请求、Prompt、Provider 响应、Key 与 Approval Token 不进入 Trace。
+- 120 次实际 Mock 工作流发布门禁通过；硬约束、有界终止、故障分类和 Trace 完整率均为 100%，不安全交付为 0。
+- 180 次实际工作流消融门禁通过；NO_VALIDATOR 暴露 2 次不安全交付，缓存将 Provider Attempt 从 403 降至 49 且领域结果一致。
+- 单次 DeepSeek Direct Plan Baseline 接口；必须显式 `--allow-live`，Mock 只验证 Contract，不冒充真实模型质量。
 
 - 显式 Requirement State、Node、Edge 与 `needs_clarification` 条件路由。
 - 可替换 `RequirementModel` Protocol；离线 Mock、OpenAI Structured Outputs 与 DeepSeek JSON Output 适配器。
@@ -85,11 +96,12 @@ Natural Language
 - 刷新、天气状态和事件查询 API；Provider 失败返回 503 并保留 Active Version，不会被伪装成 `infeasible` 或天气良好。
 - 30 条固定天气 Fixture；当前离线 Mock 基线 Event F1、Impact Exact Match、锁与未影响日保持率均为 100%，路线复用率为 66.41%。
 
-当前边界：天气刷新由客户端显式触发，不包含定时任务、推送、空气质量、分钟级降水或备用天气 Provider；计划编辑最多包含三个原子动作、影响两个日期。当前路线矩阵不是 OTA 级全量交通规划，SQLite 只用于单机演示；统一评测治理、长期 Memory、MCP、完整前端和生产化属于后续版本。
+当前边界：天气刷新由客户端显式触发，不包含定时任务、推送、空气质量、分钟级降水或备用天气 Provider；计划编辑最多包含三个原子动作、影响两个日期。当前路线矩阵不是 OTA 级全量交通规划，SQLite 只用于单机演示；长期 Memory 属于 v1.1，MCP、备用 Provider、完整前端和生产化属于 v1.2。
 
 ## 学习入口
 
-- 后续开发以 [v0.6 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md) 为准；v1.0 完成核心 Agent，v1.1 增加 Preference Memory，v1.2 完成 MCP 与平台化。
+- 后续开发以 [v0.9 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md) 为准；v1.0 已完成核心 Agent，v1.1 增加 Preference Memory，v1.2 完成 MCP 与平台化。
+- 从 [v1.0 实现文档](docs/v1.0/README.md) 查看 Run/Trace API、预算、DeepSeek/地图配置、发布门禁和消融结果；完整取舍见 [设计报告](docs/v1.0/design.md)。
 - 从 [v0.9 天气事件驱动局部重规划文档](docs/v0.9/README.md) 查看配置、API、Graph、失败语义和实际离线评测结果；完整取舍见 [设计报告](docs/v0.9/design.md)。
 - 从 [v0.8 计划生命周期 HITL 文档](docs/v0.8/README.md) 查看会话 API、DeepSeek 编辑配置、Graph、失败语义和评测；完整取舍见 [设计报告](docs/v0.8/design.md)。
 - 从 [v0.7 Grounded LLM Soft Critic 文档](docs/v0.7/README.md) 查看当前实现、配置、Graph、失败语义与评测；完整设计见 [设计报告](docs/v0.7/design.md)。
@@ -215,9 +227,12 @@ v0.6 默认同时请求驾车路线和阈值内的步行路线。`MAX_WALKING_LE
 .\.venv\Scripts\python.exe scripts\evaluate_soft_critic.py
 .\.venv\Scripts\python.exe scripts\evaluate_plan_lifecycle.py
 .\.venv\Scripts\python.exe scripts\evaluate_weather_replanning.py
+.\.venv\Scripts\python.exe scripts\evaluate_v1_release.py --profile mock --gate
+.\.venv\Scripts\python.exe scripts\evaluate_v1_ablations.py --gate
+.\.venv\Scripts\python.exe scripts\evaluate_v1_direct_baseline.py
 .\.venv\Scripts\python.exe -m pytest --cov=travel_agent --cov-report=term-missing
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m pip check
 ```
 
-显式配置 `REQUIREMENT_PROVIDER=openai` 或 `deepseek` 后，同一脚本可评测对应适配器；执行会产生实际 API 调用和费用，仓库不会自动运行。
+统一 Mock 发布门禁实际执行 120 次工作流；消融执行 180 次隔离工作流。显式配置真实 Provider 或运行 Direct DeepSeek Baseline 会产生实际 API 调用和费用，仓库不会自动运行，Direct Baseline 还要求 `--allow-live`。

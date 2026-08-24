@@ -17,6 +17,15 @@ from travel_agent.domain.critique_models import (
     SoftCriticRequest,
     SoftCriticResult,
 )
+from travel_agent.execution.context import (
+    begin_llm,
+    begin_llm_attempt,
+    effective_timeout,
+    finish_llm,
+    llm_retry,
+    match_fault,
+)
+from travel_agent.execution.faults import FaultMode, FaultPoint
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +77,13 @@ class CriticGateway:
         grounding_attempt: int,
     ) -> SoftCriticResult:
         started = perf_counter()
+        parent_event_id = begin_llm(
+            "soft_critic",
+            provider=self.provider,
+            model=self.model,
+            prompt_version=self.prompt_version,
+            input_chars=request.input_chars,
+        )
         logger.info(
             "critic.started | thread_id=%s provider=%s model=%s prompt_version=%s "
             "candidate_count=%s input_chars=%s grounding_attempt=%s",
@@ -82,9 +98,23 @@ class CriticGateway:
         last_error: CriticProviderError | None = None
         for attempt in range(1, self._max_attempts + 1):
             try:
+                begin_llm_attempt(
+                    "soft_critic",
+                    provider=self.provider,
+                    model=self.model,
+                    attempt=attempt,
+                    parent_event_id=parent_event_id,
+                )
+                injected = match_fault(
+                    FaultPoint.CRITIC_LLM,
+                    operation="soft_critic",
+                    attempt=attempt,
+                )
+                if injected is not None:
+                    raise _injected_critic_error(injected)
                 output = await asyncio.wait_for(
                     self._model.critique(request),
-                    timeout=self._timeout_seconds,
+                    timeout=effective_timeout(self._timeout_seconds),
                 )
             except TimeoutError:
                 last_error = CriticProviderError(
@@ -123,6 +153,18 @@ class CriticGateway:
                     output.output_tokens,
                     len(output.critiques),
                 )
+                finish_llm(
+                    "soft_critic",
+                    provider=self.provider,
+                    model=self.model,
+                    status="success",
+                    attempt_count=attempt,
+                    elapsed_ms=elapsed_ms,
+                    input_tokens=output.input_tokens,
+                    output_tokens=output.output_tokens,
+                    error_code=None,
+                    parent_event_id=parent_event_id,
+                )
                 return SoftCriticResult(critiques=output.critiques, summary=summary)
 
             assert last_error is not None
@@ -138,6 +180,18 @@ class CriticGateway:
                     grounding_attempt,
                     last_error.category.value,
                     last_error.code,
+                )
+                finish_llm(
+                    "soft_critic",
+                    provider=self.provider,
+                    model=self.model,
+                    status="failed",
+                    attempt_count=attempt,
+                    elapsed_ms=elapsed_ms,
+                    input_tokens=None,
+                    output_tokens=None,
+                    error_code=last_error.code,
+                    parent_event_id=parent_event_id,
                 )
                 raise CriticUnavailableError(
                     provider=self.provider,
@@ -169,5 +223,36 @@ class CriticGateway:
                 last_error.category.value,
                 last_error.code,
             )
+            llm_retry(
+                "soft_critic",
+                attempt=attempt,
+                category=last_error.category.value,
+                code=last_error.code,
+                parent_event_id=parent_event_id,
+            )
             await self._sleeper(delay)
         raise RuntimeError("critic retry loop exited unexpectedly")
+
+
+def _injected_critic_error(mode: FaultMode) -> CriticProviderError:
+    category = {
+        FaultMode.TIMEOUT: CriticErrorCategory.TIMEOUT,
+        FaultMode.RATE_LIMIT: CriticErrorCategory.RATE_LIMIT,
+        FaultMode.AUTH_ERROR: CriticErrorCategory.AUTHENTICATION,
+        FaultMode.CONNECTION_ERROR: CriticErrorCategory.CONNECTION,
+        FaultMode.INVALID_SCHEMA: CriticErrorCategory.INVALID_SCHEMA,
+        FaultMode.EMPTY_BUSINESS_RESULT: CriticErrorCategory.INVALID_SCHEMA,
+        FaultMode.WRITE_FAILURE: CriticErrorCategory.UPSTREAM_UNAVAILABLE,
+    }[mode]
+    return CriticProviderError(
+        category,
+        f"injected_{mode.value}",
+        mode
+        in {
+            FaultMode.TIMEOUT,
+            FaultMode.RATE_LIMIT,
+            FaultMode.CONNECTION_ERROR,
+            FaultMode.WRITE_FAILURE,
+        },
+        "Injected critic failure for evaluation",
+    )

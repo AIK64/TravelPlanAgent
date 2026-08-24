@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from travel_agent.domain.models import PlanningResponse, TripSpec
 from travel_agent.domain.tool_models import POIFacts, ToolExecutionSummary, ToolResult
@@ -17,6 +17,7 @@ from travel_agent.requirements.models import (
 
 
 class RequirementState(TypedDict):
+    execution: NotRequired[dict | None]
     thread_id: str
     natural_request: NaturalPlanningRequest
     requirement_draft: RequirementDraft | None

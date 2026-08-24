@@ -8,6 +8,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 
 from travel_agent.config import CheckpointBackend, Settings
+from travel_agent.execution.checkpoints import ObservedCheckpointSaver
 from travel_agent.requirements.workflow import requirement_checkpoint_serializer
 
 
@@ -18,7 +19,7 @@ async def open_requirement_checkpointer(
     """按配置持有 Requirement Graph 的 Checkpointer 生命周期。"""
     serde = requirement_checkpoint_serializer()
     if settings.checkpoint_backend is CheckpointBackend.MEMORY:
-        yield InMemorySaver(serde=serde)
+        yield ObservedCheckpointSaver(InMemorySaver(serde=serde))
         return
 
     try:
@@ -34,4 +35,4 @@ async def open_requirement_checkpointer(
     async with aiosqlite.connect(str(database_path)) as connection:
         saver = AsyncSqliteSaver(connection, serde=serde)
         await saver.setup()
-        yield saver
+        yield ObservedCheckpointSaver(saver)

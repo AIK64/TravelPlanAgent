@@ -50,11 +50,20 @@ from travel_agent.domain.tool_models import (
     ToolStatus,
 )
 from travel_agent.graph.state import TravelState
+from travel_agent.graph.evaluation import PlanningEvaluationOverrides
 from travel_agent.planning.defaults import POIDefaultPolicy
 from travel_agent.planning.drafts import (
     CandidateDraft,
     prepare_candidate_drafts,
 )
+from travel_agent.execution.checkpoints import ObservedCheckpointSaver
+from travel_agent.execution.instrumentation import (
+    execution_budget_guard,
+    instrument_node,
+    instrument_route,
+)
+from travel_agent.execution.context import record_degradation
+from travel_agent.execution.errors import ExecutionBudgetExceeded
 from travel_agent.planning.critic import (
     analyze_candidate,
     error_violations,
@@ -300,6 +309,29 @@ def route_after_validation(
     return next_node
 
 
+def _route_after_validation_without_soft_critic(
+    state: TravelState,
+) -> Literal[
+    "select_best",
+    "select_repair_target",
+    "mark_infeasible",
+    "restore_soft_baseline",
+]:
+    """评测消融仍保留 Hard Validator，只移除 Soft Critic 路径。"""
+    deliverable = _deliverable_candidates(state)
+    if state["pending_soft_replan_round"] is not None and not deliverable:
+        return "restore_soft_baseline"
+    if deliverable:
+        return "select_best"
+    if (
+        state["repair_terminal_reason"] is None
+        and state["planning_pois"]
+        and state["iterations"] < state["max_replan_rounds"]
+    ):
+        return "select_repair_target"
+    return "mark_infeasible"
+
+
 def route_after_critic(
     state: TravelState,
 ) -> Literal["build_repair_plan", "mark_infeasible"]:
@@ -377,8 +409,11 @@ def build_workflow(
     critic_gateway: CriticGateway | None = None,
     critic_policy: CriticPolicy = CriticPolicy(),
     evidence_budget: EvidenceBudget = EvidenceBudget(),
+    evaluation_overrides: PlanningEvaluationOverrides | None = None,
 ) -> CompiledStateGraph:
     """构建只通过注入 ToolGateway 获取外部事实的异步规划图。"""
+
+    eval_overrides = evaluation_overrides or PlanningEvaluationOverrides()
 
     def build_search_plan(state: TravelState) -> dict:
         _log_node_started(state, "build_search_plan")
@@ -489,7 +524,17 @@ def build_workflow(
             "status": "poi_context_loaded",
         }
 
-    active_optimizer = optimizer or ORToolsOptimizationSolver()
+    class _ForcedHeuristicOptimizer:
+        name = "evaluation-forced-heuristic"
+
+        def solve(self, _problem):
+            raise OptimizationTimeoutError("evaluation optimizer ablation")
+
+    active_optimizer = (
+        _ForcedHeuristicOptimizer()
+        if eval_overrides.force_heuristic_optimizer
+        else optimizer or ORToolsOptimizationSolver()
+    )
 
     async def build_route_matrix(state: TravelState) -> dict:
         _log_node_started(state, "build_route_matrix")
@@ -1077,11 +1122,12 @@ def build_workflow(
     def collect_delta_routes(state: TravelState) -> dict:
         _log_node_started(state, "collect_delta_routes")
         draft = state["candidate_drafts"][0]
+        reusable_routes = {} if eval_overrides.full_replan else state["route_results"]
         delta = collect_route_delta(
             state["trip"],
             draft,
             state["planning_pois"],
-            state["route_results"],
+            reusable_routes,
             route_strategy=policy.route_strategy,
             route_modes=policy.route_modes,
             max_walking_leg_meters=policy.max_walking_leg_meters,
@@ -1227,6 +1273,27 @@ def build_workflow(
                 thread_id=state["thread_id"],
                 grounding_attempt=semantic_attempt,
             )
+        except ExecutionBudgetExceeded:
+            record_degradation("soft_critic_budget_exhausted")
+            summary = CriticExecutionSummary(
+                provider=critic_gateway.provider,
+                model=critic_gateway.model,
+                prompt_version=critic_gateway.prompt_version,
+                status=CriticStatus.UNAVAILABLE,
+                attempt_count=0,
+                grounding_attempt_count=semantic_attempt,
+                elapsed_ms=0,
+                input_chars=request.input_chars,
+                error_category="execution_budget_exhausted",
+            )
+            return {
+                "critic_status": CriticStatus.UNAVAILABLE,
+                "critic_execution_summary": summary,
+                "soft_critiques": [],
+                "critic_grounding_attempts": semantic_attempt,
+                "critic_grounding_errors": [],
+                "status": "critic_budget_exhausted",
+            }
         except CriticUnavailableError as error:
             summary = CriticExecutionSummary(
                 provider=error.provider,
@@ -1435,11 +1502,12 @@ def build_workflow(
     def collect_soft_delta_routes(state: TravelState) -> dict:
         _log_node_started(state, "collect_soft_delta_routes")
         draft = state["candidate_drafts"][0]
+        reusable_routes = {} if eval_overrides.full_replan else state["route_results"]
         delta = collect_route_delta(
             state["trip"],
             draft,
             state["planning_pois"],
-            state["route_results"],
+            reusable_routes,
             route_strategy=policy.route_strategy,
             route_modes=policy.route_modes,
             max_walking_leg_meters=policy.max_walking_leg_meters,
@@ -1763,39 +1831,79 @@ def build_workflow(
             ),
         }
 
-    builder = StateGraph(TravelState)
-    builder.add_node("build_search_plan", build_search_plan)
-    builder.add_node("load_pois", load_pois)
-    builder.add_node("resolve_poi_facts", resolve_poi_facts)
-    builder.add_node("build_route_matrix", build_route_matrix)
-    builder.add_node("build_optimization_problem", build_optimization_problem)
-    builder.add_node("solve_candidate_variants", solve_candidate_variants)
-    builder.add_node("materialize_optimized_candidates", materialize_optimized)
-    builder.add_node("materialize_candidates", materialize_repaired)
-    builder.add_node("validate_candidates", validate)
-    builder.add_node("select_repair_target", select_repair_target)
-    builder.add_node("analyze_violations", analyze_violations)
-    builder.add_node("build_repair_plan", create_repair_plan)
-    builder.add_node("apply_local_repair", apply_local_repair)
-    builder.add_node("collect_delta_routes", collect_delta_routes)
-    builder.add_node("load_delta_routes", load_delta_routes)
-    builder.add_node("prepare_critic_context", prepare_critic_context)
-    builder.add_node("soft_constraint_critic", soft_constraint_critic)
-    builder.add_node("validate_critic_evidence", validate_critic_evidence)
-    builder.add_node("quality_gate", quality_gate)
-    builder.add_node("compile_soft_repair_plan", compile_soft_repair_plan)
-    builder.add_node("apply_soft_repair", apply_soft_repair)
-    builder.add_node("collect_soft_delta_routes", collect_soft_delta_routes)
-    builder.add_node("load_soft_delta_routes", load_soft_delta_routes)
-    builder.add_node("materialize_soft_candidate", materialize_soft_candidate)
-    builder.add_node("restore_soft_baseline", restore_soft_baseline)
-    builder.add_node("compare_soft_repair", compare_soft_repair)
-    builder.add_node("select_by_quality", select_by_quality)
-    builder.add_node("explain_selection", explain_selection)
-    builder.add_node("select_best", select_best)
-    builder.add_node("mark_infeasible", mark_infeasible)
+    def select_unvalidated_for_evaluation(state: TravelState) -> dict:
+        """评测沙箱专用：暴露无 Validator 的不安全基线，绝不用于生产 API。"""
+        _log_node_started(state, "select_unvalidated_for_evaluation")
+        if not state["candidates"]:
+            raise RuntimeError("unvalidated evaluation requires candidates")
+        selected = min(
+            state["candidates"],
+            key=lambda candidate: (
+                -(candidate.score if candidate.score is not None else float("-inf")),
+                candidate.id,
+            ),
+        )
+        logger.warning(
+            "evaluation.unsafe_validator_bypass | thread_id=%s candidate_id=%s",
+            state["thread_id"],
+            selected.id,
+        )
+        _log_node_completed(
+            state, "select_unvalidated_for_evaluation", "completed"
+        )
+        return {
+            "selected_plan": selected,
+            "status": "completed",
+            "message": "evaluation-only unvalidated candidate",
+        }
 
-    builder.add_edge(START, "build_search_plan")
+    builder = StateGraph(TravelState)
+
+    def add_node(name: str, function, *, terminal: bool = False) -> None:
+        builder.add_node(
+            name, instrument_node("planning", name, function, terminal=terminal)
+        )
+
+    add_node("execution_budget_guard", execution_budget_guard)
+    add_node("build_search_plan", build_search_plan)
+    add_node("load_pois", load_pois)
+    add_node("resolve_poi_facts", resolve_poi_facts)
+    add_node("build_route_matrix", build_route_matrix)
+    add_node("build_optimization_problem", build_optimization_problem)
+    add_node("solve_candidate_variants", solve_candidate_variants)
+    add_node("materialize_optimized_candidates", materialize_optimized)
+    add_node("materialize_candidates", materialize_repaired)
+    add_node("validate_candidates", validate, terminal=True)
+    add_node("select_repair_target", select_repair_target)
+    add_node("analyze_violations", analyze_violations)
+    add_node("build_repair_plan", create_repair_plan)
+    add_node("apply_local_repair", apply_local_repair)
+    add_node("collect_delta_routes", collect_delta_routes)
+    add_node("load_delta_routes", load_delta_routes)
+    add_node("prepare_critic_context", prepare_critic_context)
+    add_node("soft_constraint_critic", soft_constraint_critic)
+    add_node("validate_critic_evidence", validate_critic_evidence)
+    add_node("quality_gate", quality_gate)
+    add_node("compile_soft_repair_plan", compile_soft_repair_plan)
+    add_node("apply_soft_repair", apply_soft_repair)
+    add_node("collect_soft_delta_routes", collect_soft_delta_routes)
+    add_node("load_soft_delta_routes", load_soft_delta_routes)
+    add_node("materialize_soft_candidate", materialize_soft_candidate)
+    add_node("restore_soft_baseline", restore_soft_baseline)
+    add_node("compare_soft_repair", compare_soft_repair)
+    add_node("select_by_quality", select_by_quality)
+    add_node("explain_selection", explain_selection, terminal=True)
+    add_node("select_best", select_best, terminal=True)
+    add_node("mark_infeasible", mark_infeasible, terminal=True)
+    if eval_overrides.skip_validator:
+        add_node(
+            "select_unvalidated_for_evaluation",
+            select_unvalidated_for_evaluation,
+            terminal=True,
+        )
+
+    builder.add_edge(START, "execution_budget_guard")
+    builder.add_edge("execution_budget_guard", "build_search_plan")
     builder.add_edge("build_search_plan", "load_pois")
     builder.add_edge("load_pois", "resolve_poi_facts")
     builder.add_edge("resolve_poi_facts", "build_route_matrix")
@@ -1804,29 +1912,64 @@ def build_workflow(
     builder.add_edge(
         "solve_candidate_variants", "materialize_optimized_candidates"
     )
-    builder.add_edge("materialize_optimized_candidates", "validate_candidates")
-    builder.add_edge("materialize_candidates", "validate_candidates")
-    builder.add_conditional_edges("validate_candidates", route_after_validation)
+    initial_validation_target = (
+        "select_unvalidated_for_evaluation"
+        if eval_overrides.skip_validator
+        else "validate_candidates"
+    )
+    builder.add_edge("materialize_optimized_candidates", initial_validation_target)
+    builder.add_edge("materialize_candidates", initial_validation_target)
+    builder.add_conditional_edges(
+        "validate_candidates",
+        instrument_route(
+            "planning",
+            "validate_candidates",
+            (
+                _route_after_validation_without_soft_critic
+                if eval_overrides.skip_soft_critic
+                else route_after_validation
+            ),
+        ),
+    )
     builder.add_edge("select_repair_target", "analyze_violations")
-    builder.add_conditional_edges("analyze_violations", route_after_critic)
-    builder.add_conditional_edges("build_repair_plan", route_after_repair_plan)
+    builder.add_conditional_edges(
+        "analyze_violations",
+        instrument_route("planning", "analyze_violations", route_after_critic),
+    )
+    builder.add_conditional_edges(
+        "build_repair_plan",
+        instrument_route("planning", "build_repair_plan", route_after_repair_plan),
+    )
     builder.add_edge("apply_local_repair", "collect_delta_routes")
     builder.add_conditional_edges(
-        "collect_delta_routes", route_after_delta_routes
+        "collect_delta_routes",
+        instrument_route("planning", "collect_delta_routes", route_after_delta_routes),
     )
     builder.add_edge("load_delta_routes", "materialize_candidates")
     builder.add_edge("prepare_critic_context", "soft_constraint_critic")
     builder.add_edge("soft_constraint_critic", "validate_critic_evidence")
     builder.add_conditional_edges(
-        "validate_critic_evidence", route_after_grounding
+        "validate_critic_evidence",
+        instrument_route(
+            "planning", "validate_critic_evidence", route_after_grounding
+        ),
     )
-    builder.add_conditional_edges("quality_gate", route_after_quality_gate)
     builder.add_conditional_edges(
-        "compile_soft_repair_plan", route_after_soft_repair_plan
+        "quality_gate",
+        instrument_route("planning", "quality_gate", route_after_quality_gate),
+    )
+    builder.add_conditional_edges(
+        "compile_soft_repair_plan",
+        instrument_route(
+            "planning", "compile_soft_repair_plan", route_after_soft_repair_plan
+        ),
     )
     builder.add_edge("apply_soft_repair", "collect_soft_delta_routes")
     builder.add_conditional_edges(
-        "collect_soft_delta_routes", route_after_soft_delta_routes
+        "collect_soft_delta_routes",
+        instrument_route(
+            "planning", "collect_soft_delta_routes", route_after_soft_delta_routes
+        ),
     )
     builder.add_edge("load_soft_delta_routes", "materialize_soft_candidate")
     builder.add_edge("materialize_soft_candidate", "validate_candidates")
@@ -1836,10 +1979,14 @@ def build_workflow(
     builder.add_edge("explain_selection", END)
     builder.add_edge("select_best", END)
     builder.add_edge("mark_infeasible", END)
+    if eval_overrides.skip_validator:
+        builder.add_edge("select_unvalidated_for_evaluation", END)
     checkpoint_serde = JsonPlusSerializer(
         allowed_msgpack_modules=_CHECKPOINT_ALLOWED_TYPES
     )
-    return builder.compile(checkpointer=InMemorySaver(serde=checkpoint_serde))
+    return builder.compile(
+        checkpointer=ObservedCheckpointSaver(InMemorySaver(serde=checkpoint_serde))
+    )
 
 
 def initial_state(request: PlanningRequest, thread_id: str) -> TravelState:

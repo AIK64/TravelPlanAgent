@@ -33,6 +33,16 @@ from travel_agent.domain.weather_models import (
 from travel_agent.domain.optimization_models import OptimizationBudget
 from travel_agent.domain.tool_models import ProviderMode
 from travel_agent.graph.workflow import build_workflow, run_planning
+from travel_agent.graph.evaluation import PlanningEvaluationOverrides
+from travel_agent.execution.coordinator import ExecutionResult, RunCoordinator
+from travel_agent.execution.faults import FaultPlan
+from travel_agent.execution.models import (
+    AgentRunRecord,
+    ExecutionBudget,
+    RunKind,
+    TraceEvent,
+)
+from travel_agent.execution.repository import RunRepository, open_run_repository
 from travel_agent.edits.gateway import EditGateway
 from travel_agent.edits.protocols import EditModel
 from travel_agent.edits.providers.mock import MockEditModel
@@ -100,10 +110,19 @@ class PlanningRuntime:
     lifecycle_service: PlanLifecycleService | None = None
     checkpoint_context: Any | None = field(default=None, repr=False)
     repository_context: Any | None = field(default=None, repr=False)
+    run_repository: RunRepository | None = None
+    run_coordinator: RunCoordinator | None = None
+    run_repository_context: Any | None = field(default=None, repr=False)
     resume_locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
     @classmethod
-    async def create(cls, settings: Settings) -> "PlanningRuntime":
+    async def create(
+        cls,
+        settings: Settings,
+        *,
+        evaluation_overrides: PlanningEvaluationOverrides | None = None,
+        tool_cache_enabled: bool = True,
+    ) -> "PlanningRuntime":
         settings.validate()
         client: httpx.AsyncClient | None = None
         model_client: Any | None = None
@@ -111,8 +130,10 @@ class PlanningRuntime:
         edit_model_client: Any | None = None
         checkpoint_context: Any | None = None
         repository_context: Any | None = None
+        run_repository_context: Any | None = None
         checkpoint_entered = False
         repository_entered = False
+        run_repository_entered = False
         try:
             amap_client: AMapClient | None = None
             if (
@@ -134,7 +155,12 @@ class PlanningRuntime:
                 poi_provider = AMapPOIProvider(amap_client)
                 route_provider = AMapRouteProvider(amap_client)
 
-            gateway = build_gateway(settings, poi_provider, route_provider)
+            gateway = build_gateway(
+                settings,
+                poi_provider,
+                route_provider,
+                cache_enabled=tool_cache_enabled,
+            )
             if settings.weather_provider is WeatherProviderMode.MOCK:
                 weather_provider: WeatherProvider = MockWeatherProvider()
             else:
@@ -226,6 +252,7 @@ class PlanningRuntime:
                 evidence_budget=EvidenceBudget(
                     max_input_chars=settings.critic_max_input_chars
                 ),
+                evaluation_overrides=evaluation_overrides,
             )
             if settings.requirement_provider is RequirementProviderMode.MOCK:
                 requirement_model: RequirementModel = MockRequirementModel()
@@ -361,6 +388,25 @@ class PlanningRuntime:
                 requirement_workflow=requirement_workflow,
                 weather_stale_max_seconds=settings.weather_stale_max_seconds,
             )
+            run_repository_context = open_run_repository(
+                backend=settings.run_store_backend.value,
+                sqlite_path=settings.run_sqlite_path,
+            )
+            run_repository = await run_repository_context.__aenter__()
+            run_repository_entered = True
+            run_coordinator = RunCoordinator(
+                run_repository,
+                settings.execution_budget(),
+                trace_attribute_max_chars=settings.trace_attribute_max_chars,
+                config_values={
+                    "budget": settings.execution_budget().model_dump(mode="json"),
+                    "travel_provider": settings.provider.value,
+                    "requirement_provider": settings.requirement_provider.value,
+                    "critic_provider": settings.critic_provider.value,
+                    "edit_provider": settings.edit_provider.value,
+                    "weather_provider": settings.weather_provider.value,
+                },
+            )
             return cls(
                 poi_provider=poi_provider,
                 route_provider=route_provider,
@@ -384,8 +430,13 @@ class PlanningRuntime:
                 lifecycle_service=lifecycle_service,
                 checkpoint_context=checkpoint_context,
                 repository_context=repository_context,
+                run_repository=run_repository,
+                run_coordinator=run_coordinator,
+                run_repository_context=run_repository_context,
             )
         except BaseException:
+            if run_repository_context is not None and run_repository_entered:
+                await run_repository_context.__aexit__(None, None, None)
             if repository_context is not None and repository_entered:
                 await repository_context.__aexit__(None, None, None)
             if checkpoint_context is not None and checkpoint_entered:
@@ -423,6 +474,8 @@ class PlanningRuntime:
             await self.edit_model_client.close()
         if self.client is not None:
             await self.client.aclose()
+        if self.run_repository_context is not None:
+            await self.run_repository_context.__aexit__(None, None, None)
         if self.repository_context is not None:
             await self.repository_context.__aexit__(None, None, None)
         if self.checkpoint_context is not None:
@@ -433,7 +486,26 @@ class PlanningRuntime:
         request: PlanningRequest,
         thread_id: str,
     ) -> PlanningResponse:
-        return await run_planning(self.workflow, request, thread_id=thread_id)
+        return (await self.execute_plan(request, thread_id=thread_id)).payload
+
+    async def execute_plan(
+        self,
+        request: PlanningRequest,
+        *,
+        thread_id: str,
+        fault_plan: FaultPlan | None = None,
+        budget: ExecutionBudget | None = None,
+    ) -> ExecutionResult[PlanningResponse]:
+        call = lambda: run_planning(self.workflow, request, thread_id=thread_id)
+        if self.run_coordinator is None:
+            return ExecutionResult(payload=await call(), run=None)
+        return await self.run_coordinator.execute(
+            RunKind.STRUCTURED_PLAN,
+            call,
+            thread_id=thread_id,
+            fault_plan=fault_plan,
+            budget=budget,
+        )
 
     async def plan_from_text(
         self,
@@ -442,10 +514,31 @@ class PlanningRuntime:
     ) -> NaturalPlanningResponse:
         if self.requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
-        return await run_natural_planning(
-            self.requirement_workflow,
-            request,
+        return (
+            await self.execute_plan_from_text(request, thread_id=thread_id)
+        ).payload
+
+    async def execute_plan_from_text(
+        self,
+        request: NaturalPlanningRequest,
+        *,
+        thread_id: str,
+        fault_plan: FaultPlan | None = None,
+        budget: ExecutionBudget | None = None,
+    ) -> ExecutionResult[NaturalPlanningResponse]:
+        if self.requirement_workflow is None:
+            raise RuntimeError("natural-language planning is not configured")
+        call = lambda: run_natural_planning(
+            self.requirement_workflow, request, thread_id=thread_id
+        )
+        if self.run_coordinator is None:
+            return ExecutionResult(payload=await call(), run=None)
+        return await self.run_coordinator.execute(
+            RunKind.NATURAL_PLAN,
+            call,
             thread_id=thread_id,
+            fault_plan=fault_plan,
+            budget=budget,
         )
 
     async def resume_from_text(
@@ -455,28 +548,99 @@ class PlanningRuntime:
     ) -> NaturalPlanningResponse:
         if self.requirement_workflow is None:
             raise RuntimeError("natural-language planning is not configured")
-        lock = self.resume_locks.setdefault(thread_id, asyncio.Lock())
-        async with lock:
-            return await resume_natural_planning(
-                self.requirement_workflow,
-                request,
-                thread_id=thread_id,
-            )
+        return (
+            await self.execute_resume_from_text(request, thread_id=thread_id)
+        ).payload
+
+    async def execute_resume_from_text(
+        self,
+        request: ClarificationResumeRequest,
+        *,
+        thread_id: str,
+        fault_plan: FaultPlan | None = None,
+    ) -> ExecutionResult[NaturalPlanningResponse]:
+        if self.requirement_workflow is None:
+            raise RuntimeError("natural-language planning is not configured")
+
+        async def call() -> NaturalPlanningResponse:
+            lock = self.resume_locks.setdefault(thread_id, asyncio.Lock())
+            async with lock:
+                return await resume_natural_planning(
+                    self.requirement_workflow, request, thread_id=thread_id
+                )
+
+        if self.run_coordinator is None:
+            return ExecutionResult(payload=await call(), run=None)
+        return await self.run_coordinator.execute(
+            RunKind.CLARIFICATION_RESUME,
+            call,
+            thread_id=thread_id,
+            request_id=str(request.request_id),
+            causation_id=request.interrupt_id,
+            parent_run_id=await self._latest_run_id(thread_id=thread_id),
+            fault_plan=fault_plan,
+        )
 
     async def create_plan_session(
         self, request: PlanningRequest, *, session_id: str
     ) -> PlanSessionResponse:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
-        return await self.lifecycle_service.create(request, session_id=session_id)
+        return (
+            await self.execute_create_plan_session(request, session_id=session_id)
+        ).payload
+
+    async def execute_create_plan_session(
+        self,
+        request: PlanningRequest,
+        *,
+        session_id: str,
+        fault_plan: FaultPlan | None = None,
+    ) -> ExecutionResult[PlanSessionResponse]:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        call = lambda: self.lifecycle_service.create(request, session_id=session_id)
+        if self.run_coordinator is None:
+            return ExecutionResult(payload=await call(), run=None)
+        return await self.run_coordinator.execute(
+            RunKind.LIFECYCLE_CREATE,
+            call,
+            session_id=session_id,
+            thread_id=f"planning:{session_id}",
+            fault_plan=fault_plan,
+        )
 
     async def create_plan_session_from_text(
         self, request: NaturalPlanningRequest, *, session_id: str
     ) -> PlanSessionResponse:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
-        return await self.lifecycle_service.create_from_text(
+        return (
+            await self.execute_create_plan_session_from_text(
+                request, session_id=session_id
+            )
+        ).payload
+
+    async def execute_create_plan_session_from_text(
+        self,
+        request: NaturalPlanningRequest,
+        *,
+        session_id: str,
+        fault_plan: FaultPlan | None = None,
+    ) -> ExecutionResult[PlanSessionResponse]:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        call = lambda: self.lifecycle_service.create_from_text(
             request, session_id=session_id
+        )
+        if self.run_coordinator is None:
+            return ExecutionResult(payload=await call(), run=None)
+        return await self.run_coordinator.execute(
+            RunKind.LIFECYCLE_CREATE_FROM_TEXT,
+            call,
+            session_id=session_id,
+            thread_id=f"intake:{session_id}",
+            fault_plan=fault_plan,
         )
 
     async def resume_plan_session(
@@ -484,7 +648,32 @@ class PlanningRuntime:
     ) -> PlanSessionResponse:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
-        return await self.lifecycle_service.resume(session_id, request)
+        return (
+            await self.execute_resume_plan_session(request, session_id=session_id)
+        ).payload
+
+    async def execute_resume_plan_session(
+        self,
+        request: LifecycleResumeRequest,
+        *,
+        session_id: str,
+        fault_plan: FaultPlan | None = None,
+    ) -> ExecutionResult[PlanSessionResponse]:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        call = lambda: self.lifecycle_service.resume(session_id, request)
+        if self.run_coordinator is None:
+            return ExecutionResult(payload=await call(), run=None)
+        return await self.run_coordinator.execute(
+            RunKind.LIFECYCLE_RESUME,
+            call,
+            session_id=session_id,
+            thread_id=f"lifecycle:{session_id}",
+            request_id=str(request.request_id),
+            causation_id=request.interrupt_id,
+            parent_run_id=await self._latest_run_id(session_id=session_id),
+            fault_plan=fault_plan,
+        )
 
     async def get_plan_session(self, *, session_id: str) -> PlanSessionResponse:
         if self.lifecycle_service is None:
@@ -511,7 +700,31 @@ class PlanningRuntime:
     ) -> PlanSessionResponse:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
-        return await self.lifecycle_service.refresh_weather(session_id, request)
+        return (
+            await self.execute_refresh_plan_weather(request, session_id=session_id)
+        ).payload
+
+    async def execute_refresh_plan_weather(
+        self,
+        request: WeatherRefreshRequest,
+        *,
+        session_id: str,
+        fault_plan: FaultPlan | None = None,
+    ) -> ExecutionResult[PlanSessionResponse]:
+        if self.lifecycle_service is None:
+            raise RuntimeError("plan lifecycle is not configured")
+        call = lambda: self.lifecycle_service.refresh_weather(session_id, request)
+        if self.run_coordinator is None:
+            return ExecutionResult(payload=await call(), run=None)
+        return await self.run_coordinator.execute(
+            RunKind.WEATHER_REFRESH,
+            call,
+            session_id=session_id,
+            thread_id=f"lifecycle:{session_id}",
+            request_id=str(request.request_id),
+            parent_run_id=await self._latest_run_id(session_id=session_id),
+            fault_plan=fault_plan,
+        )
 
     async def get_plan_weather(self, *, session_id: str) -> WeatherStateView:
         if self.lifecycle_service is None:
@@ -531,3 +744,44 @@ class PlanningRuntime:
         if self.lifecycle_service is None:
             raise RuntimeError("plan lifecycle is not configured")
         return await self.lifecycle_service.weather_event(session_id, event_id)
+
+    async def get_agent_run(self, run_id: str) -> AgentRunRecord:
+        if self.run_repository is None:
+            raise RuntimeError("run repository is not configured")
+        return await self.run_repository.get(run_id)
+
+    async def get_agent_trace(
+        self, run_id: str, *, after_sequence: int = 0, limit: int = 100
+    ) -> tuple[TraceEvent, ...]:
+        if self.run_repository is None:
+            raise RuntimeError("run repository is not configured")
+        return await self.run_repository.trace(
+            run_id, after_sequence=after_sequence, limit=limit
+        )
+
+    async def get_session_runs(
+        self, session_id: str, *, limit: int = 50
+    ) -> tuple[AgentRunRecord, ...]:
+        if self.run_repository is None:
+            raise RuntimeError("run repository is not configured")
+        return await self.run_repository.list_for_session(session_id, limit=limit)
+
+    async def get_thread_runs(
+        self, thread_id: str, *, limit: int = 50
+    ) -> tuple[AgentRunRecord, ...]:
+        if self.run_repository is None:
+            raise RuntimeError("run repository is not configured")
+        return await self.run_repository.list_for_thread(thread_id, limit=limit)
+
+    async def _latest_run_id(
+        self, *, session_id: str | None = None, thread_id: str | None = None
+    ) -> str | None:
+        if self.run_repository is None:
+            return None
+        if session_id is not None:
+            runs = await self.run_repository.list_for_session(session_id, limit=1)
+        elif thread_id is not None:
+            runs = await self.run_repository.list_for_thread(thread_id, limit=1)
+        else:
+            return None
+        return runs[0].run_id if runs else None

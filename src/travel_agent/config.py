@@ -8,11 +8,17 @@ from urllib.parse import urlsplit
 
 from travel_agent.domain.optimization_models import OptimizationBudget
 from travel_agent.domain.tool_models import ProviderMode, UnknownFactPolicy
+from travel_agent.execution.models import ExecutionBudget
 from travel_agent.planning.policy import PlanningPolicy
 from travel_agent.requirements.models import RequirementProviderMode
 
 
 class CheckpointBackend(StrEnum):
+    MEMORY = "memory"
+    SQLITE = "sqlite"
+
+
+class RunStoreBackend(StrEnum):
     MEMORY = "memory"
     SQLITE = "sqlite"
 
@@ -95,6 +101,24 @@ class Settings:
     checkpoint_backend: CheckpointBackend = CheckpointBackend.MEMORY
     checkpoint_sqlite_path: str = ".data/travel-agent-checkpoints.sqlite3"
     plan_sqlite_path: str = ".data/travel-agent-plans.sqlite3"
+    run_store_backend: RunStoreBackend = RunStoreBackend.MEMORY
+    run_sqlite_path: str = ".data/travel-agent-runs.sqlite3"
+    run_budget_profile: str = "default-v1"
+    run_max_graph_steps: int = 120
+    run_max_tool_calls: int = 160
+    run_max_provider_attempts: int = 240
+    run_max_llm_calls: int = 8
+    run_max_llm_attempts: int = 12
+    run_max_llm_input_chars: int = 80_000
+    run_max_input_tokens: int = 40_000
+    run_max_output_tokens: int = 12_000
+    run_max_repair_rounds: int = 4
+    run_max_interrupts: int = 1
+    run_max_checkpoint_writes: int = 160
+    run_max_trace_events: int = 512
+    run_max_repeated_fingerprint_count: int = 2
+    run_deadline_seconds: float = 120.0
+    trace_attribute_max_chars: int = 256
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -237,6 +261,48 @@ class Settings:
             plan_sqlite_path=source.get(
                 "PLAN_SQLITE_PATH", ".data/travel-agent-plans.sqlite3"
             ).strip(),
+            run_store_backend=RunStoreBackend(
+                source.get("RUN_STORE_BACKEND", "memory").strip().lower()
+            ),
+            run_sqlite_path=source.get(
+                "RUN_SQLITE_PATH", ".data/travel-agent-runs.sqlite3"
+            ).strip(),
+            run_budget_profile=source.get(
+                "RUN_BUDGET_PROFILE", "default-v1"
+            ).strip(),
+            run_max_graph_steps=int(source.get("RUN_MAX_GRAPH_STEPS", "120")),
+            run_max_tool_calls=int(source.get("RUN_MAX_TOOL_CALLS", "160")),
+            run_max_provider_attempts=int(
+                source.get("RUN_MAX_PROVIDER_ATTEMPTS", "240")
+            ),
+            run_max_llm_calls=int(source.get("RUN_MAX_LLM_CALLS", "8")),
+            run_max_llm_attempts=int(source.get("RUN_MAX_LLM_ATTEMPTS", "12")),
+            run_max_llm_input_chars=int(
+                source.get("RUN_MAX_LLM_INPUT_CHARS", "80000")
+            ),
+            run_max_input_tokens=int(source.get("RUN_MAX_INPUT_TOKENS", "40000")),
+            run_max_output_tokens=int(
+                source.get("RUN_MAX_OUTPUT_TOKENS", "12000")
+            ),
+            run_max_repair_rounds=int(
+                source.get("RUN_MAX_REPAIR_ROUNDS", "4")
+            ),
+            run_max_interrupts=int(source.get("RUN_MAX_INTERRUPTS", "1")),
+            run_max_checkpoint_writes=int(
+                source.get("RUN_MAX_CHECKPOINT_WRITES", "160")
+            ),
+            run_max_trace_events=int(
+                source.get("RUN_MAX_TRACE_EVENTS", "512")
+            ),
+            run_max_repeated_fingerprint_count=int(
+                source.get("RUN_MAX_REPEATED_FINGERPRINT_COUNT", "2")
+            ),
+            run_deadline_seconds=float(
+                source.get("RUN_DEADLINE_SECONDS", "120")
+            ),
+            trace_attribute_max_chars=int(
+                source.get("TRACE_ATTRIBUTE_MAX_CHARS", "256")
+            ),
         )
         settings.validate()
         return settings
@@ -377,6 +443,13 @@ class Settings:
             )
         if self.checkpoint_backend is CheckpointBackend.SQLITE and not self.plan_sqlite_path:
             raise ValueError("PLAN_SQLITE_PATH is required when CHECKPOINT_BACKEND=sqlite")
+        if self.run_store_backend is RunStoreBackend.SQLITE and not self.run_sqlite_path:
+            raise ValueError("RUN_SQLITE_PATH is required when RUN_STORE_BACKEND=sqlite")
+        if not self.run_budget_profile:
+            raise ValueError("RUN_BUDGET_PROFILE must not be blank")
+        if not 32 <= self.trace_attribute_max_chars <= 2048:
+            raise ValueError("TRACE_ATTRIBUTE_MAX_CHARS must be between 32 and 2048")
+        self.execution_budget()
         PlanningPolicy(
             poi_query_limit=self.poi_query_limit,
             poi_candidate_limit=self.poi_candidate_limit,
@@ -398,6 +471,27 @@ class Settings:
             min_improvement=self.critic_min_improvement,
             max_soft_replan_rounds=self.max_soft_replan_rounds,
             grounding_max_attempts=self.critic_grounding_max_attempts,
+        )
+
+    def execution_budget(self) -> ExecutionBudget:
+        return ExecutionBudget(
+            profile=self.run_budget_profile,
+            max_graph_steps=self.run_max_graph_steps,
+            max_tool_calls=self.run_max_tool_calls,
+            max_provider_attempts=self.run_max_provider_attempts,
+            max_llm_calls=self.run_max_llm_calls,
+            max_llm_attempts=self.run_max_llm_attempts,
+            max_llm_input_chars=self.run_max_llm_input_chars,
+            max_input_tokens=self.run_max_input_tokens,
+            max_output_tokens=self.run_max_output_tokens,
+            max_repair_rounds=self.run_max_repair_rounds,
+            max_interrupts=self.run_max_interrupts,
+            max_checkpoint_writes=self.run_max_checkpoint_writes,
+            max_trace_events=self.run_max_trace_events,
+            max_repeated_fingerprint_count=(
+                self.run_max_repeated_fingerprint_count
+            ),
+            deadline_ms=round(self.run_deadline_seconds * 1000),
         )
 
 
