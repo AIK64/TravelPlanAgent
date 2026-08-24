@@ -1,7 +1,7 @@
-# Travel Agent v0.6 → v1.2 迭代路线
+# Travel Agent v0.7 → v1.2 迭代路线
 
 > 状态：当前唯一权威版本路线  
-> 当前基线：v0.6.0（已完成）  
+> 当前基线：v0.7.0（已完成）
 > 决策日期：2026-08-24
 
 ## 1. 路线决策
@@ -12,7 +12,7 @@
 2. `v1.1` 增加 Preference Memory、上下文裁剪、跨会话个性化及 Memory 消融实验。
 3. `v1.2` 增加 Travel MCP Server、备用 Provider、完整前端和生产化部署。
 
-v0.6 已完成。从当前 v0.6.0 到 v1.0 还需四个迭代：`v0.7`、`v0.8`、`v0.9` 和 `v1.0`。完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
+v0.7 已完成。从当前 v0.7.0 到 v1.0 还需三个迭代：`v0.8`、`v0.9` 和 `v1.0`。完成长期能力和平台化还需 `v1.1`、`v1.2` 两个迭代。
 
 多 Agent 不作为强制版本目标。只有当某项职责确实需要独立推理上下文、独立决策循环或独立运行预算，并且消融实验能证明它优于单 Graph/Subgraph，才允许升级为 Agent。地图查询、时间计算、约束验证、缓存和 Provider 适配器始终是工具或确定性服务，不为“多 Agent”标签进行包装。
 
@@ -43,8 +43,8 @@ v1.0 应能稳定演示以下轨迹：
 | 版本 | 唯一核心能力 | 关键 Graph 变化 | 主要验收证据 |
 |---|---|---|---|
 | v0.5（已完成） | 违规驱动的局部自修复 | `Validate → Critic → RepairPlan → LocalReplan → Revalidate` | Replanning Locality、路线复用率、轨迹测试 |
-| v0.6 | 约束优化与真实路线质量 | `BuildProblem → Optimize → Materialize → Validate` | 路线效率、求解终止、优化器消融 |
-| v0.7 | Grounded LLM Soft Critic | `HardValidate → SoftCritic → EvidenceGuard → QualityGate` | Grounding 准确率、软约束评测、Provider 降级轨迹 |
+| v0.6（已完成） | 约束优化与真实路线质量 | `BuildProblem → Optimize → Materialize → Validate` | 路线效率、求解终止、优化器消融 |
+| v0.7（已完成） | Grounded LLM Soft Critic | `HardValidate → SoftCritic → EvidenceGuard → QualityGate` | Grounding 准确率、软约束评测、Provider 降级轨迹 |
 | v0.8 | 计划生命周期 HITL | `Select/Change → Interrupt → Impact → LocalReplan → Version` | 锁定项不变、V1/V2 Diff、重启恢复 |
 | v0.9 | 天气事件驱动重规划 | `WeatherEvent → ImpactAnalyzer → LocalReplan` | 事件幂等性、affected-days 保持率、故障语义 |
 | v1.0 | 评测驱动的核心 Agent 发布 | 统一 ExecutionBudget、Trace 和回归门禁 | 100+ Benchmark、Baseline、消融、故障注入 |
@@ -173,6 +173,8 @@ Benchmark 至少比较：
 - 详细 Graph、配置、失败语义和消融结果见 `docs/v0.6/README.md`。
 
 ## 6. v0.7：Grounded LLM Soft Critic
+
+已按 [v0.7 实现文档](v0.7/README.md) 完成 Evidence Digest、Provider Gateway、Grounding Gate、确定性质量门、一次局部软修复、失败降级和离线消融基线。
 
 ### 6.1 Agent 能力
 
@@ -482,17 +484,16 @@ MCP 工具具有明确输入输出 Schema、权限、错误码、幂等规则、
 
 ## 15. 当前下一步
 
-当前下一迭代进入 v0.7。实现顺序固定为：
+当前下一迭代进入 v0.8：计划生命周期 HITL。下一版设计应以用户选择、锁定、编辑审批、局部 Impact Analysis 和 Plan V1/V2 Diff 为核心，并复用 v0.7 的硬/软评价边界。
 
 ```text
-CandidateEvidenceDigest
-  → SoftCritique Schema
-  → DeepSeek / OpenAI Critic Provider
-  → Grounded Soft Critic Node
-  → Soft Feedback to Repair Policy
-  → Prompt / Evidence Trajectory Tests
-  → Hard-only vs Soft-Critic Ablation
-  → docs/v0.7 与 README 更新
+Completed Plan
+  → User Select / Lock / Edit Intent
+  → Interrupt / Approval
+  → Impact Analysis
+  → Local Replan
+  → Hard Validate / Soft Critic
+  → Plan Version + Local Diff
 ```
 
-在 v0.7 验收完成前，不提前实现用户计划编辑、天气、Memory、MCP 或前端；Soft Critic 不得接管可由代码准确计算的硬约束。
+在 v0.8 验收完成前，不提前实现天气、Memory、MCP 或前端；用户编辑也不得绕过 Hard Validator、Grounding Gate 或局部性守卫。

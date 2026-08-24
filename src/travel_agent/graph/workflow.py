@@ -18,6 +18,22 @@ from travel_agent.domain.models import (
     TripSpec,
     ValidationStatus,
 )
+from travel_agent.critique.evidence import EvidenceBudget, build_evidence_digests
+from travel_agent.critique.errors import CriticUnavailableError
+from travel_agent.critique.explanation import build_grounded_explanation
+from travel_agent.critique.gateway import CriticGateway
+from travel_agent.critique.grounding import validate_critique_grounding
+from travel_agent.critique.quality import (
+    CriticPolicy,
+    quality_scores as calculate_quality_scores,
+    select_by_quality as choose_by_quality,
+)
+from travel_agent.domain.critique_models import (
+    CriticExecutionSummary,
+    CriticStatus,
+    SoftCriticRequest,
+    SoftRepairAttempt,
+)
 from travel_agent.domain.optimization_models import (
     OptimizationBudget,
     OptimizationProblem,
@@ -59,6 +75,10 @@ from travel_agent.planning.optimization import (
 )
 from travel_agent.planning.policy import PlanningPolicy
 from travel_agent.planning.repair import apply_repair_plan, build_repair_plan
+from travel_agent.planning.soft_repair import (
+    apply_soft_repair as apply_soft_repair_to_draft,
+    compile_soft_repair_plan as create_soft_repair_plan,
+)
 from travel_agent.planning.search_plan import build_search_plan as create_search_plan
 from travel_agent.planning.validator import validate_candidate
 from travel_agent.tools.errors import ToolUnavailableError
@@ -80,6 +100,20 @@ _CHECKPOINT_ALLOWED_TYPES = (
     ("travel_agent.domain.models", "TripSpec"),
     ("travel_agent.domain.models", "ValidationStatus"),
     ("travel_agent.domain.models", "ViolationSeverity"),
+    ("travel_agent.domain.critique_models", "CandidateEvidenceDigest"),
+    ("travel_agent.domain.critique_models", "CriticExecutionSummary"),
+    ("travel_agent.domain.critique_models", "CriticStatus"),
+    ("travel_agent.domain.critique_models", "DimensionCritique"),
+    ("travel_agent.domain.critique_models", "EvidenceItem"),
+    ("travel_agent.domain.critique_models", "EvidenceKind"),
+    ("travel_agent.domain.critique_models", "GroundedExplanation"),
+    ("travel_agent.domain.critique_models", "GroundedStatement"),
+    ("travel_agent.domain.critique_models", "SoftCritique"),
+    ("travel_agent.domain.critique_models", "SoftDimension"),
+    ("travel_agent.domain.critique_models", "SoftRepairAttempt"),
+    ("travel_agent.domain.critique_models", "SoftRepairPlan"),
+    ("travel_agent.domain.critique_models", "SuggestedActionKind"),
+    ("travel_agent.domain.critique_models", "SuggestedSoftAction"),
     ("travel_agent.domain.optimization_models", "ObjectiveBreakdown"),
     ("travel_agent.domain.optimization_models", "ObjectiveWeights"),
     ("travel_agent.domain.optimization_models", "OptimizationBudget"),
@@ -234,10 +268,18 @@ def select_best_candidate(candidates: list[PlanCandidate]) -> PlanCandidate:
 
 def route_after_validation(
     state: TravelState,
-) -> Literal["select_best", "select_repair_target", "mark_infeasible"]:
+) -> Literal[
+    "prepare_critic_context",
+    "select_best",
+    "select_repair_target",
+    "mark_infeasible",
+    "restore_soft_baseline",
+]:
     deliverable = _deliverable_candidates(state)
-    if deliverable:
-        next_node = "select_best"
+    if state["pending_soft_replan_round"] is not None and not deliverable:
+        next_node = "restore_soft_baseline"
+    elif deliverable:
+        next_node = "prepare_critic_context"
     elif (
         state["repair_terminal_reason"] is None
         and state["planning_pois"]
@@ -290,6 +332,41 @@ def route_after_delta_routes(
     )
 
 
+def route_after_grounding(
+    state: TravelState,
+) -> Literal["soft_constraint_critic", "quality_gate"]:
+    if (
+        state["critic_grounding_errors"]
+        and state["critic_grounding_attempts"]
+        < state["critic_grounding_max_attempts"]
+        and state["critic_status"] is CriticStatus.INVALID_GROUNDING
+    ):
+        return "soft_constraint_critic"
+    return "quality_gate"
+
+
+def route_after_quality_gate(
+    state: TravelState,
+) -> Literal["compare_soft_repair", "compile_soft_repair_plan", "select_by_quality"]:
+    if state["pending_soft_replan_round"] is not None:
+        return "compare_soft_repair"
+    if state["critic_status"] is CriticStatus.SUCCESS and state["quality_scores"]:
+        return "compile_soft_repair_plan"
+    return "select_by_quality"
+
+
+def route_after_soft_repair_plan(
+    state: TravelState,
+) -> Literal["apply_soft_repair", "select_by_quality"]:
+    return "apply_soft_repair" if state["soft_repair_plan"] is not None else "select_by_quality"
+
+
+def route_after_soft_delta_routes(
+    state: TravelState,
+) -> Literal["load_soft_delta_routes", "materialize_soft_candidate"]:
+    return "load_soft_delta_routes" if state["delta_route_queries"] else "materialize_soft_candidate"
+
+
 def build_workflow(
     gateway: ToolGateway,
     defaults: POIDefaultPolicy,
@@ -297,6 +374,9 @@ def build_workflow(
     *,
     optimizer: OptimizationSolver | None = None,
     optimization_budget: OptimizationBudget = OptimizationBudget(),
+    critic_gateway: CriticGateway | None = None,
+    critic_policy: CriticPolicy = CriticPolicy(),
+    evidence_budget: EvidenceBudget = EvidenceBudget(),
 ) -> CompiledStateGraph:
     """构建只通过注入 ToolGateway 获取外部事实的异步规划图。"""
 
@@ -319,7 +399,12 @@ def build_workflow(
             "search_planned",
             query_count=len(queries),
         )
-        return {"search_queries": queries, "status": "search_planned"}
+        return {
+            "search_queries": queries,
+            "max_soft_replan_rounds": critic_policy.max_soft_replan_rounds,
+            "critic_grounding_max_attempts": critic_policy.grounding_max_attempts,
+            "status": "search_planned",
+        }
 
     async def load_pois(state: TravelState) -> dict:
         _log_node_started(state, "load_pois")
@@ -661,6 +746,30 @@ def build_workflow(
             "candidates": validated,
             "status": "validated",
         }
+        pending_soft_round = state["pending_soft_replan_round"]
+        if pending_soft_round is not None and deliverable_count:
+            if len(validated) != 1:
+                raise RuntimeError("soft repair validation requires one candidate")
+            repaired_soft = validated[0]
+            soft_day_by_date = {
+                day.date.isoformat(): day for day in repaired_soft.days
+            }
+            for day_text, expected_fingerprint in state[
+                "preserved_day_hashes"
+            ].items():
+                day = soft_day_by_date.get(day_text)
+                if day is None or day_fingerprint(day) != expected_fingerprint:
+                    raise RuntimeError(
+                        f"soft repair changed preserved day: {day_text}"
+                    )
+            logger.info(
+                "soft_repair.validation_delta | thread_id=%s round=%s "
+                "candidate_id=%s hard_validation_passed=true preserved_days=%s",
+                state["thread_id"],
+                pending_soft_round,
+                repaired_soft.id,
+                len(state["preserved_day_hashes"]),
+            )
         pending_round = state["pending_replan_round"]
         if pending_round is not None:
             report = state["critic_report"]
@@ -1044,6 +1153,572 @@ def build_workflow(
             "status": "delta_routes_loaded",
         }
 
+    def prepare_critic_context(state: TravelState) -> dict:
+        _log_node_started(state, "prepare_critic_context")
+        deliverable = _deliverable_candidates(state)
+        digests = build_evidence_digests(
+            state["trip"],
+            deliverable,
+            state["planning_pois"],
+            evidence_budget,
+        )
+        if not digests:
+            raise RuntimeError("soft critic requires at least one evidence digest")
+        logger.info(
+            "critic.context_prepared | thread_id=%s candidate_count=%s "
+            "evidence_count=%s input_chars=%s truncated_count=%s",
+            state["thread_id"],
+            len(digests),
+            sum(len(digest.evidence) for digest in digests),
+            sum(digest.input_chars for digest in digests),
+            sum(digest.truncated for digest in digests),
+        )
+        _log_node_completed(
+            state,
+            "prepare_critic_context",
+            "critic_context_prepared",
+            candidate_count=len(digests),
+        )
+        return {
+            "critic_evidence_digests": list(digests),
+            "soft_critiques": [],
+            "critic_grounding_attempts": 0,
+            "critic_grounding_errors": [],
+            "quality_scores": {},
+            "critic_status": CriticStatus.PENDING,
+            "status": "critic_context_prepared",
+        }
+
+    async def soft_constraint_critic(state: TravelState) -> dict:
+        _log_node_started(state, "soft_constraint_critic")
+        semantic_attempt = state["critic_grounding_attempts"] + 1
+        if critic_gateway is None:
+            summary = CriticExecutionSummary(
+                provider="disabled",
+                model="disabled",
+                prompt_version="disabled",
+                status=CriticStatus.DISABLED,
+                attempt_count=0,
+                grounding_attempt_count=0,
+                elapsed_ms=0,
+                input_chars=sum(
+                    digest.input_chars for digest in state["critic_evidence_digests"]
+                ),
+            )
+            logger.info(
+                "critic.failed | thread_id=%s provider=disabled model=disabled "
+                "category=disabled code=disabled",
+                state["thread_id"],
+            )
+            return {
+                "critic_status": CriticStatus.DISABLED,
+                "critic_execution_summary": summary,
+                "soft_critiques": [],
+                "critic_grounding_attempts": 0,
+                "status": "critic_disabled",
+            }
+        request = SoftCriticRequest(
+            digests=tuple(state["critic_evidence_digests"]),
+            grounding_feedback=tuple(state["critic_grounding_errors"]),
+        )
+        try:
+            result = await critic_gateway.critique(
+                request,
+                thread_id=state["thread_id"],
+                grounding_attempt=semantic_attempt,
+            )
+        except CriticUnavailableError as error:
+            summary = CriticExecutionSummary(
+                provider=error.provider,
+                model=error.model,
+                prompt_version=critic_gateway.prompt_version,
+                status=CriticStatus.UNAVAILABLE,
+                attempt_count=error.attempt_count,
+                grounding_attempt_count=semantic_attempt,
+                elapsed_ms=error.elapsed_ms,
+                input_chars=request.input_chars,
+                error_category=error.category.value,
+            )
+            return {
+                "critic_status": CriticStatus.UNAVAILABLE,
+                "critic_execution_summary": summary,
+                "soft_critiques": [],
+                "critic_grounding_attempts": semantic_attempt,
+                "critic_grounding_errors": [],
+                "status": "critic_unavailable",
+            }
+        _log_node_completed(
+            state,
+            "soft_constraint_critic",
+            "critic_completed",
+            critique_count=len(result.critiques),
+        )
+        return {
+            "soft_critiques": list(result.critiques),
+            "critic_execution_summary": result.summary,
+            "critic_status": CriticStatus.SUCCESS,
+            "critic_grounding_attempts": semantic_attempt,
+            "status": "critic_completed",
+        }
+
+    def validate_critic_evidence(state: TravelState) -> dict:
+        _log_node_started(state, "validate_critic_evidence")
+        if state["critic_status"] is not CriticStatus.SUCCESS:
+            return {"critic_grounding_errors": [], "status": "critic_degraded"}
+        errors = validate_critique_grounding(
+            tuple(state["critic_evidence_digests"]),
+            tuple(state["soft_critiques"]),
+        )
+        if errors:
+            status = CriticStatus.INVALID_GROUNDING
+            logger.warning(
+                "critic.grounding_rejected | thread_id=%s attempt=%s "
+                "error_count=%s error_codes=%s",
+                state["thread_id"],
+                state["critic_grounding_attempts"],
+                len(errors),
+                ",".join(errors),
+            )
+        else:
+            status = CriticStatus.SUCCESS
+            logger.info(
+                "critic.grounding_validated | thread_id=%s attempt=%s "
+                "candidate_count=%s evidence_reference_count=%s",
+                state["thread_id"],
+                state["critic_grounding_attempts"],
+                len(state["soft_critiques"]),
+                sum(
+                    len(dimension.evidence_ids)
+                    for critique in state["soft_critiques"]
+                    for dimension in critique.dimensions
+                ),
+            )
+        summary = state["critic_execution_summary"]
+        if summary is not None and status is not summary.status:
+            summary = summary.model_copy(update={"status": status})
+        _log_node_completed(
+            state,
+            "validate_critic_evidence",
+            "grounding_valid" if not errors else "grounding_invalid",
+            error_count=len(errors),
+        )
+        return {
+            "critic_status": status,
+            "critic_execution_summary": summary,
+            "critic_grounding_errors": list(errors),
+            "status": "grounding_valid" if not errors else "grounding_invalid",
+        }
+
+    def quality_gate(state: TravelState) -> dict:
+        _log_node_started(state, "quality_gate")
+        scores = (
+            calculate_quality_scores(tuple(state["soft_critiques"]), critic_policy)
+            if state["critic_status"] is CriticStatus.SUCCESS
+            else {}
+        )
+        decision = "deterministic_fallback"
+        if scores:
+            best_score = max(scores.values())
+            decision = (
+                "acceptable"
+                if best_score >= critic_policy.quality_threshold
+                else "repairable_check"
+            )
+        else:
+            best_score = None
+        logger.info(
+            "quality_gate.decision | thread_id=%s critic_status=%s "
+            "decision=%s best_score=%s threshold=%s soft_round=%s",
+            state["thread_id"],
+            state["critic_status"].value,
+            decision,
+            best_score,
+            critic_policy.quality_threshold,
+            state["pending_soft_replan_round"] or 0,
+        )
+        _log_node_completed(state, "quality_gate", "quality_scored")
+        return {"quality_scores": scores, "status": "quality_scored"}
+
+    def compile_soft_repair_plan(state: TravelState) -> dict:
+        _log_node_started(state, "compile_soft_repair_plan")
+        deliverable = _deliverable_candidates(state)
+        selected = choose_by_quality(deliverable, state["quality_scores"])
+        score = state["quality_scores"].get(selected.id)
+        if (
+            score is None
+            or score >= critic_policy.quality_threshold
+            or state["soft_iterations"] >= critic_policy.max_soft_replan_rounds
+        ):
+            plan, reason = None, "quality_acceptable_or_budget_exhausted"
+        else:
+            critique = next(
+                item for item in state["soft_critiques"] if item.candidate_id == selected.id
+            )
+            draft = next(
+                item for item in state["candidate_drafts"] if item.id == selected.id
+            )
+            plan, reason = create_soft_repair_plan(
+                state["trip"],
+                selected,
+                draft,
+                state["planning_pois"],
+                critique,
+                repair_round=state["soft_iterations"] + 1,
+            )
+        logger.info(
+            "soft_repair.plan_created | thread_id=%s candidate_id=%s "
+            "score=%s action=%s status=%s reason=%s",
+            state["thread_id"],
+            selected.id,
+            score,
+            plan.action.kind.value if plan else "none",
+            "ready" if plan else "skipped",
+            reason or "none",
+        )
+        return {
+            "soft_repair_plan": plan,
+            "soft_repair_terminal_reason": reason,
+            "soft_baseline_candidates": list(state["candidates"]) if plan else [],
+            "soft_baseline_candidate_drafts": list(state["candidate_drafts"]) if plan else [],
+            "soft_baseline_critiques": list(state["soft_critiques"]) if plan else [],
+            "soft_baseline_evidence_digests": list(state["critic_evidence_digests"]) if plan else [],
+            "soft_baseline_quality_scores": dict(state["quality_scores"]) if plan else {},
+            "soft_baseline_critic_execution_summary": state["critic_execution_summary"] if plan else None,
+            "status": "soft_repair_ready" if plan else "soft_repair_skipped",
+        }
+
+    def apply_soft_repair(state: TravelState) -> dict:
+        _log_node_started(state, "apply_soft_repair")
+        plan = state["soft_repair_plan"]
+        if plan is None:
+            raise RuntimeError("soft repair requires a compiled plan")
+        baseline_candidate = next(
+            item for item in state["soft_baseline_candidates"] if item.id == plan.target_candidate_id
+        )
+        baseline_draft = next(
+            item for item in state["soft_baseline_candidate_drafts"] if item.id == plan.target_candidate_id
+        )
+        repaired = apply_soft_repair_to_draft(baseline_draft, plan)
+        preserved_hashes = {
+            day.date.isoformat(): day_fingerprint(day)
+            for day in baseline_candidate.days
+            if day.date in plan.preserved_days
+        }
+        logger.info(
+            "soft_repair.action_applied | thread_id=%s round=%s candidate_id=%s "
+            "repaired_candidate_id=%s action=%s affected_days=%s preserved_days=%s",
+            state["thread_id"],
+            plan.round,
+            plan.target_candidate_id,
+            repaired.id,
+            plan.action.kind.value,
+            len(plan.affected_days),
+            len(plan.preserved_days),
+        )
+        return {
+            "pending_soft_replan_round": plan.round,
+            "candidate_drafts": [repaired],
+            "candidates": [],
+            "selected_plan": None,
+            "route_queries": [],
+            "delta_route_queries": [],
+            "reused_route_keys": [],
+            "preserved_day_hashes": preserved_hashes,
+            "critic_status": CriticStatus.PENDING,
+            "soft_critiques": [],
+            "quality_scores": {},
+            "last_route_loaded_count": 0,
+            "last_route_reused_count": 0,
+            "status": "soft_repair_applied",
+        }
+
+    def collect_soft_delta_routes(state: TravelState) -> dict:
+        _log_node_started(state, "collect_soft_delta_routes")
+        draft = state["candidate_drafts"][0]
+        delta = collect_route_delta(
+            state["trip"],
+            draft,
+            state["planning_pois"],
+            state["route_results"],
+            route_strategy=policy.route_strategy,
+            route_modes=policy.route_modes,
+            max_walking_leg_meters=policy.max_walking_leg_meters,
+        )
+        logger.info(
+            "soft_repair.routes_reused | thread_id=%s round=%s required=%s "
+            "reused=%s missing=%s",
+            state["thread_id"],
+            state["pending_soft_replan_round"],
+            len(delta.required_queries),
+            len(delta.reused_route_keys),
+            len(delta.missing_queries),
+        )
+        return {
+            "route_queries": list(delta.required_queries),
+            "delta_route_queries": list(delta.missing_queries),
+            "reused_route_keys": list(delta.reused_route_keys),
+            "last_route_reused_count": len(delta.reused_route_keys),
+            "last_route_loaded_count": 0,
+            "status": "soft_delta_routes_collected",
+        }
+
+    async def load_soft_delta_routes(state: TravelState) -> dict:
+        _log_node_started(state, "load_soft_delta_routes")
+        queries = state["delta_route_queries"]
+        results = await gateway.get_routes(
+            queries,
+            ToolCallContext(thread_id=state["thread_id"]),
+        )
+        for result in results.values():
+            if result.status is ToolStatus.FAILED:
+                raise ToolUnavailableError.from_result(result, state["thread_id"])
+        loaded = {}
+        for key, result in results.items():
+            assert result.data is not None
+            loaded[key] = result.data
+        summaries = [
+            _tool_summary(
+                result,
+                f"route.get_{result.data.mode.value}" if result.data else "route.get",
+            )
+            for result in results.values()
+        ]
+        logger.info(
+            "soft_repair.routes_loaded | thread_id=%s round=%s route_count=%s",
+            state["thread_id"],
+            state["pending_soft_replan_round"],
+            len(loaded),
+        )
+        return {
+            "route_results": {**state["route_results"], **loaded},
+            "last_route_loaded_count": len(loaded),
+            "tool_summaries": [*state["tool_summaries"], *summaries],
+            "status": "soft_delta_routes_loaded",
+        }
+
+    def materialize_soft_candidate(state: TravelState) -> dict:
+        return _materialize(state, "materialize_soft_candidate")
+
+    def _restore_soft_values(
+        state: TravelState,
+        *,
+        reason: str,
+        hard_validation_passed: bool,
+        after_score: float | None,
+    ) -> dict:
+        plan = state["soft_repair_plan"]
+        if plan is None:
+            raise RuntimeError("soft baseline restore requires a repair plan")
+        before_score = state["soft_baseline_quality_scores"][plan.target_candidate_id]
+        attempt = SoftRepairAttempt(
+            round=plan.round,
+            before_quality_score=before_score,
+            after_quality_score=after_score,
+            hard_validation_passed=hard_validation_passed,
+            accepted=False,
+            reused_route_count=state["last_route_reused_count"],
+            loaded_route_count=state["last_route_loaded_count"],
+            terminal_reason=reason,
+        )
+        logger.info(
+            "soft_repair.rejected | thread_id=%s round=%s reason=%s "
+            "before_score=%s after_score=%s hard_validation_passed=%s",
+            state["thread_id"],
+            plan.round,
+            reason,
+            before_score,
+            after_score,
+            str(hard_validation_passed).lower(),
+        )
+        return {
+            "candidates": list(state["soft_baseline_candidates"]),
+            "candidate_drafts": list(state["soft_baseline_candidate_drafts"]),
+            "soft_critiques": list(state["soft_baseline_critiques"]),
+            "critic_evidence_digests": list(state["soft_baseline_evidence_digests"]),
+            "quality_scores": dict(state["soft_baseline_quality_scores"]),
+            "critic_execution_summary": state["soft_baseline_critic_execution_summary"],
+            "critic_status": CriticStatus.SUCCESS,
+            "critic_grounding_errors": [],
+            "pending_soft_replan_round": None,
+            "soft_iterations": plan.round,
+            "soft_repair_history": [*state["soft_repair_history"], attempt],
+            "soft_repair_terminal_reason": reason,
+            "soft_baseline_candidates": [],
+            "soft_baseline_candidate_drafts": [],
+            "soft_baseline_critiques": [],
+            "soft_baseline_evidence_digests": [],
+            "soft_baseline_quality_scores": {},
+            "soft_baseline_critic_execution_summary": None,
+            "status": "soft_baseline_restored",
+        }
+
+    def restore_soft_baseline(state: TravelState) -> dict:
+        return _restore_soft_values(
+            state,
+            reason="hard_validation_failed",
+            hard_validation_passed=False,
+            after_score=None,
+        )
+
+    def compare_soft_repair(state: TravelState) -> dict:
+        _log_node_started(state, "compare_soft_repair")
+        plan = state["soft_repair_plan"]
+        if plan is None or state["pending_soft_replan_round"] is None:
+            raise RuntimeError("soft comparison requires pending repair context")
+        before = state["soft_baseline_quality_scores"][plan.target_candidate_id]
+        after = next(iter(state["quality_scores"].values()), None)
+        accepted = (
+            state["critic_status"] is CriticStatus.SUCCESS
+            and after is not None
+            and after - before >= critic_policy.min_improvement
+        )
+        if not accepted:
+            reason = (
+                "critic_unavailable_after_repair"
+                if state["critic_status"] is not CriticStatus.SUCCESS
+                else "quality_improvement_below_threshold"
+            )
+            return _restore_soft_values(
+                state,
+                reason=reason,
+                hard_validation_passed=True,
+                after_score=after,
+            )
+        attempt = SoftRepairAttempt(
+            round=plan.round,
+            before_quality_score=before,
+            after_quality_score=after,
+            hard_validation_passed=True,
+            accepted=True,
+            reused_route_count=state["last_route_reused_count"],
+            loaded_route_count=state["last_route_loaded_count"],
+            terminal_reason="quality_improved",
+        )
+        logger.info(
+            "soft_repair.accepted | thread_id=%s round=%s before_score=%s "
+            "after_score=%s improvement=%s",
+            state["thread_id"],
+            plan.round,
+            before,
+            after,
+            round(after - before, 2),
+        )
+        repaired_candidates = list(state["candidates"])
+        repaired_drafts = list(state["candidate_drafts"])
+        repaired_critiques = list(state["soft_critiques"])
+        repaired_digests = list(state["critic_evidence_digests"])
+        repaired_scores = dict(state["quality_scores"])
+        merged_candidates = [
+            item
+            for item in state["soft_baseline_candidates"]
+            if item.id != plan.target_candidate_id
+        ] + repaired_candidates
+        merged_drafts = [
+            item
+            for item in state["soft_baseline_candidate_drafts"]
+            if item.id != plan.target_candidate_id
+        ] + repaired_drafts
+        merged_critiques = [
+            item
+            for item in state["soft_baseline_critiques"]
+            if item.candidate_id != plan.target_candidate_id
+        ] + repaired_critiques
+        merged_digests = [
+            item
+            for item in state["soft_baseline_evidence_digests"]
+            if item.candidate_id != plan.target_candidate_id
+        ] + repaired_digests
+        merged_scores = {
+            candidate_id: score
+            for candidate_id, score in state[
+                "soft_baseline_quality_scores"
+            ].items()
+            if candidate_id != plan.target_candidate_id
+        }
+        merged_scores.update(repaired_scores)
+        return {
+            "candidates": merged_candidates,
+            "candidate_drafts": merged_drafts,
+            "soft_critiques": merged_critiques,
+            "critic_evidence_digests": merged_digests,
+            "quality_scores": merged_scores,
+            "pending_soft_replan_round": None,
+            "soft_iterations": plan.round,
+            "soft_repair_history": [*state["soft_repair_history"], attempt],
+            "soft_repair_terminal_reason": "quality_improved",
+            "soft_baseline_candidates": [],
+            "soft_baseline_candidate_drafts": [],
+            "soft_baseline_critiques": [],
+            "soft_baseline_evidence_digests": [],
+            "soft_baseline_quality_scores": {},
+            "soft_baseline_critic_execution_summary": None,
+            "status": "soft_repair_accepted",
+        }
+
+    def select_by_quality(state: TravelState) -> dict:
+        _log_node_started(state, "select_by_quality")
+        deliverable = _deliverable_candidates(state)
+        selected = (
+            choose_by_quality(deliverable, state["quality_scores"])
+            if state["quality_scores"]
+            else select_best_candidate(deliverable)
+        )
+        logger.info(
+            "plan.selected | thread_id=%s candidate_id=%s style=%s "
+            "validation_status=%s deterministic_score=%s soft_score=%s critic_status=%s",
+            state["thread_id"],
+            selected.id,
+            selected.style.value,
+            selected.validation.status.value if selected.validation else "none",
+            selected.score,
+            state["quality_scores"].get(selected.id),
+            state["critic_status"].value,
+        )
+        return {"selected_plan": selected, "status": "quality_selected"}
+
+    def explain_selection(state: TravelState) -> dict:
+        _log_node_started(state, "explain_selection")
+        selected = state["selected_plan"]
+        if selected is None:
+            raise RuntimeError("selection explanation requires a selected plan")
+        digest = next(
+            (
+                item
+                for item in state["critic_evidence_digests"]
+                if item.candidate_id == selected.id
+            ),
+            None,
+        )
+        critique = next(
+            (
+                item
+                for item in state["soft_critiques"]
+                if item.candidate_id == selected.id
+            ),
+            None,
+        )
+        explanation = build_grounded_explanation(
+            selected,
+            status=state["critic_status"],
+            digest=digest,
+            critique=critique,
+        )
+        logger.info(
+            "explanation.generated | thread_id=%s candidate_id=%s "
+            "critic_status=%s highlight_count=%s tradeoff_count=%s",
+            state["thread_id"],
+            selected.id,
+            state["critic_status"].value,
+            len(explanation.highlights),
+            len(explanation.tradeoffs),
+        )
+        _log_node_completed(state, "explain_selection", "completed")
+        return {
+            "grounded_explanation": explanation,
+            "status": "completed",
+            "message": f"已选择 {selected.style.value} 方案",
+        }
+
     def select_best(state: TravelState) -> dict:
         _log_node_started(state, "select_best")
         deliverable = _deliverable_candidates(state)
@@ -1104,6 +1779,19 @@ def build_workflow(
     builder.add_node("apply_local_repair", apply_local_repair)
     builder.add_node("collect_delta_routes", collect_delta_routes)
     builder.add_node("load_delta_routes", load_delta_routes)
+    builder.add_node("prepare_critic_context", prepare_critic_context)
+    builder.add_node("soft_constraint_critic", soft_constraint_critic)
+    builder.add_node("validate_critic_evidence", validate_critic_evidence)
+    builder.add_node("quality_gate", quality_gate)
+    builder.add_node("compile_soft_repair_plan", compile_soft_repair_plan)
+    builder.add_node("apply_soft_repair", apply_soft_repair)
+    builder.add_node("collect_soft_delta_routes", collect_soft_delta_routes)
+    builder.add_node("load_soft_delta_routes", load_soft_delta_routes)
+    builder.add_node("materialize_soft_candidate", materialize_soft_candidate)
+    builder.add_node("restore_soft_baseline", restore_soft_baseline)
+    builder.add_node("compare_soft_repair", compare_soft_repair)
+    builder.add_node("select_by_quality", select_by_quality)
+    builder.add_node("explain_selection", explain_selection)
     builder.add_node("select_best", select_best)
     builder.add_node("mark_infeasible", mark_infeasible)
 
@@ -1127,6 +1815,25 @@ def build_workflow(
         "collect_delta_routes", route_after_delta_routes
     )
     builder.add_edge("load_delta_routes", "materialize_candidates")
+    builder.add_edge("prepare_critic_context", "soft_constraint_critic")
+    builder.add_edge("soft_constraint_critic", "validate_critic_evidence")
+    builder.add_conditional_edges(
+        "validate_critic_evidence", route_after_grounding
+    )
+    builder.add_conditional_edges("quality_gate", route_after_quality_gate)
+    builder.add_conditional_edges(
+        "compile_soft_repair_plan", route_after_soft_repair_plan
+    )
+    builder.add_edge("apply_soft_repair", "collect_soft_delta_routes")
+    builder.add_conditional_edges(
+        "collect_soft_delta_routes", route_after_soft_delta_routes
+    )
+    builder.add_edge("load_soft_delta_routes", "materialize_soft_candidate")
+    builder.add_edge("materialize_soft_candidate", "validate_candidates")
+    builder.add_edge("restore_soft_baseline", "select_by_quality")
+    builder.add_edge("compare_soft_repair", "select_by_quality")
+    builder.add_edge("select_by_quality", "explain_selection")
+    builder.add_edge("explain_selection", END)
     builder.add_edge("select_best", END)
     builder.add_edge("mark_infeasible", END)
     checkpoint_serde = JsonPlusSerializer(
@@ -1167,6 +1874,27 @@ def initial_state(request: PlanningRequest, thread_id: str) -> TravelState:
         "repair_terminal_reason": None,
         "last_route_loaded_count": 0,
         "last_route_reused_count": 0,
+        "critic_evidence_digests": [],
+        "soft_critiques": [],
+        "critic_execution_summary": None,
+        "critic_status": CriticStatus.NOT_RUN,
+        "critic_grounding_attempts": 0,
+        "critic_grounding_max_attempts": 2,
+        "critic_grounding_errors": [],
+        "quality_scores": {},
+        "soft_baseline_candidates": [],
+        "soft_baseline_candidate_drafts": [],
+        "soft_baseline_critiques": [],
+        "soft_baseline_evidence_digests": [],
+        "soft_baseline_quality_scores": {},
+        "soft_baseline_critic_execution_summary": None,
+        "soft_repair_plan": None,
+        "soft_repair_history": [],
+        "soft_iterations": 0,
+        "max_soft_replan_rounds": 1,
+        "pending_soft_replan_round": None,
+        "soft_repair_terminal_reason": None,
+        "grounded_explanation": None,
         "status": "started",
         "message": None,
     }
@@ -1179,6 +1907,15 @@ def response_from_state(state: TravelState) -> PlanningResponse:
         candidates=state["candidates"],
         iterations=state["iterations"],
         message=state["message"],
+        critic_status=state["critic_status"],
+        critic_summary=state["critic_execution_summary"],
+        candidate_critiques=(
+            state["soft_critiques"]
+            if state["critic_status"] is CriticStatus.SUCCESS
+            else []
+        ),
+        grounded_explanation=state["grounded_explanation"],
+        soft_iterations=state["soft_iterations"],
     )
 
 
@@ -1199,7 +1936,7 @@ async def run_planning(
         request.max_replan_rounds,
     )
     try:
-        recursion_limit = max(16, 12 + request.max_replan_rounds * 8)
+        recursion_limit = max(32, 24 + request.max_replan_rounds * 8)
         result = await workflow.ainvoke(
             initial_state(request, run_thread_id),
             config={

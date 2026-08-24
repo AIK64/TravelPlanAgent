@@ -651,7 +651,7 @@ async def test_validation_feedback_drives_one_bounded_local_repair(
         for message in messages
         if message.startswith("routing.decision")
     ]
-    assert decisions == ["select_repair_target", "select_best"]
+    assert decisions == ["select_repair_target", "prepare_critic_context"]
     events = _event_names(caplog.records, thread_id)
     _assert_in_order(
         events,
@@ -710,7 +710,7 @@ async def test_daily_window_missing_must_visit_is_repaired_without_bypassing_val
     assert response.status == "completed"
     assert response.selected_plan is not None
     assert response.iterations == 1
-    assert decisions == ["select_repair_target", "select_best"]
+    assert decisions == ["select_repair_target", "prepare_critic_context"]
     assert "repair.validation.delta" in events
     assert "plan.selected" in events
     scheduled_names = {

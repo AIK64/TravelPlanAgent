@@ -121,6 +121,19 @@ def test_graph_exposes_tool_use_and_replan_nodes(mock_workflow):
         "load_delta_routes",
         "select_best",
         "mark_infeasible",
+        "prepare_critic_context",
+        "soft_constraint_critic",
+        "validate_critic_evidence",
+        "quality_gate",
+        "compile_soft_repair_plan",
+        "apply_soft_repair",
+        "collect_soft_delta_routes",
+        "load_soft_delta_routes",
+        "materialize_soft_candidate",
+        "restore_soft_baseline",
+        "compare_soft_repair",
+        "select_by_quality",
+        "explain_selection",
     } <= node_names
     assert {
         ("__start__", "build_search_plan"),
@@ -137,6 +150,15 @@ def test_graph_exposes_tool_use_and_replan_nodes(mock_workflow):
         ("load_delta_routes", "materialize_candidates"),
         ("select_best", "__end__"),
         ("mark_infeasible", "__end__"),
+        ("prepare_critic_context", "soft_constraint_critic"),
+        ("soft_constraint_critic", "validate_critic_evidence"),
+        ("apply_soft_repair", "collect_soft_delta_routes"),
+        ("load_soft_delta_routes", "materialize_soft_candidate"),
+        ("materialize_soft_candidate", "validate_candidates"),
+        ("restore_soft_baseline", "select_by_quality"),
+        ("compare_soft_repair", "select_by_quality"),
+        ("select_by_quality", "explain_selection"),
+        ("explain_selection", "__end__"),
     } <= edges
     assert "replan" not in node_names
 

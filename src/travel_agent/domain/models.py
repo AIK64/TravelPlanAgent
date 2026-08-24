@@ -13,6 +13,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic.errors import PydanticUndefinedAnnotation
 
 
 class Pace(StrEnum):
@@ -301,6 +302,13 @@ class PlanningResponse(BaseModel):
     candidates: list[PlanCandidate]
     iterations: int
     message: str | None = None
+    critic_status: "CriticStatus" = Field(
+        default="disabled", validate_default=True
+    )
+    critic_summary: "CriticExecutionSummary | None" = None
+    candidate_critiques: list["SoftCritique"] = Field(default_factory=list)
+    grounded_explanation: "GroundedExplanation | None" = None
+    soft_iterations: int = Field(default=0, ge=0, le=1)
 
 
 def rebuild_provenance_models(
@@ -310,6 +318,47 @@ def rebuild_provenance_models(
     types_namespace = {"POIFacts": poi_facts, "ValueSource": value_source}
     for model in (PlanningAssumption, PlanningPOI, POIResolution, PlanCandidate):
         model.model_rebuild(force=True, _types_namespace=types_namespace)
+    _try_rebuild_critique_response_model()
+
+
+def rebuild_critique_response_model(
+    *,
+    critic_status: type[StrEnum],
+    execution_summary: type[BaseModel],
+    soft_critique: type[BaseModel],
+    grounded_explanation: type[BaseModel],
+) -> None:
+    try:
+        PlanningResponse.model_rebuild(
+            force=True,
+            _types_namespace={
+                "CriticStatus": critic_status,
+                "CriticExecutionSummary": execution_summary,
+                "SoftCritique": soft_critique,
+                "GroundedExplanation": grounded_explanation,
+            },
+        )
+    except PydanticUndefinedAnnotation:
+        # tool_models 先导入时，ValueSource 尚未定义；其模块完成后会再次触发。
+        return
+
+
+def _try_rebuild_critique_response_model() -> None:
+    try:
+        from travel_agent.domain.critique_models import (
+            CriticExecutionSummary,
+            CriticStatus,
+            GroundedExplanation,
+            SoftCritique,
+        )
+    except ImportError:
+        return
+    rebuild_critique_response_model(
+        critic_status=CriticStatus,
+        execution_summary=CriticExecutionSummary,
+        soft_critique=SoftCritique,
+        grounded_explanation=GroundedExplanation,
+    )
 
 
 try:
@@ -319,3 +368,21 @@ except ImportError:
     pass
 else:
     rebuild_provenance_models(poi_facts=POIFacts, value_source=ValueSource)
+
+
+try:
+    from travel_agent.domain.critique_models import (
+        CriticExecutionSummary,
+        CriticStatus,
+        GroundedExplanation,
+        SoftCritique,
+    )
+except ImportError:
+    pass
+else:
+    rebuild_critique_response_model(
+        critic_status=CriticStatus,
+        execution_summary=CriticExecutionSummary,
+        soft_critique=SoftCritique,
+        grounded_explanation=GroundedExplanation,
+    )

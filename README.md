@@ -1,8 +1,8 @@
 # Constraint-Aware Travel Agent
 
-面向中国城市旅行场景的约束感知规划 Agent。v0.6 在局部自修复闭环前加入显式约束优化：Agent 将标准化 POI、时间窗、预算、移动能力和真实驾车/步行路线矩阵组装为 `OptimizationProblem`，由有界 OR-Tools CP-SAT 求解三种风格候选；超时会留下可观察的降级结果并回退到 v0.5 确定性启发式。
+面向中国城市旅行场景的约束感知规划 Agent。v0.7 在 v0.6 硬合法候选之后加入 Grounded LLM Soft Critic：模型只评价节奏、兴趣覆盖、多样性、休息友好度和区域连贯性，结论必须引用有界 Evidence；确定性 Quality Gate 负责排序和动作准入，并支持一次经过 Hard Validator 回归的局部软修复。
 
-## 当前进度：v0.6.0
+## 当前进度：v0.7.0
 
 ```text
 Natural Language
@@ -14,7 +14,10 @@ Natural Language
   → Build Driving/Walking Route Matrix
   → Build OptimizationProblem → Solve Style Variants
   → Materialize Candidate Plans → Hard Validate
-      ├─ deliverable → Select Best
+      ├─ deliverable → Evidence Digest → LLM Soft Critic → Grounding Gate
+      │                  → Deterministic Quality Gate
+      │                    ├─ Select + Grounded Explanation
+      │                    └─ One Soft Repair → Route Delta → Hard Validate → Re-evaluate
       └─ invalid → Select Target → Critic → RepairPlan
                    → Local Repair → Delta Route Tool Use → Revalidate
 ```
@@ -45,12 +48,21 @@ Natural Language
 - 近距离腿使用真实步行路线，远距离腿明确使用驾车，不再把驾车距离按比例伪装成最终步行事实。
 - 求解超时和无可行解显式记录 `optimization.degraded`，继续使用确定性最近邻回退；外部 Tool 失败仍不会伪装成业务不可行。
 - 4 条固定 Optimization Benchmark 同时比较优化器/启发式、单候选/三候选、真实步行/估算消融，并报告约束满足率、求解成功率、路线效率和延迟。
+- 独立 `CriticModel` Protocol、Gateway 和 Mock、DeepSeek、OpenAI Provider；需求解析与软评审可以独立选型。
+- 有界 `CandidateEvidenceDigest`、稳定 Evidence ID 和 Prompt Injection 数据边界，原始 Provider 响应不会进入 Graph State。
+- 五维结构化 `SoftCritique` 与 Grounding Gate；跨候选引用、未知 Evidence、重复维度、非法实体和删除 `must_visit` 会被拒绝。
+- 确定性 Quality Gate 计算软分数，Hard Validation 等级始终优先，LLM 无权返回最终排序分。
+- 最多一次非必去 POI 移动、重排或移除；经 Route Delta、Hard Validator 和再评价后，提升不足会恢复 baseline。
+- Critic 超时、认证、Schema 或 Grounding 失败均降级交付硬合法计划，不会返回业务 `infeasible`。
+- API 返回 Critic 状态、执行摘要、有效 Critique、Grounded Explanation 和软修复轮次。
+- 15 条离线 Soft Critic Fixture 和 with/without critic 消融脚本，覆盖 Grounding、动作安全、选择一致率和硬约束回归。
 
-当前边界：v0.6 的 CP-SAT 负责硬约束和可计算目标，尚未加入 LLM 软质量评价；Grounded LLM Soft Critic 在 v0.7。当前路线矩阵覆盖 POI 候选的必要有向边，不是 OTA 级全量交通规划。SQLite 只用于单机演示；中断尚不支持完成计划后的编辑审批。长期 Memory、天气事件、计划版本 Diff、MCP 和生产化分别属于后续版本。
+当前边界：Soft Critic 只对规划时的候选执行一次受控评价/修复，尚不支持完成计划后的用户选择、锁定、编辑和审批；这些属于 v0.8。当前路线矩阵覆盖 POI 候选的必要有向边，不是 OTA 级全量交通规划。SQLite 只用于单机演示；长期 Memory、天气事件、计划版本 Diff、MCP 和生产化分别属于后续版本。
 
 ## 学习入口
 
-- 后续开发以 [v0.5 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md) 为准；v1.0 完成核心 Agent，v1.1 增加 Preference Memory，v1.2 完成 MCP 与平台化。
+- 后续开发以 [v0.6 → v1.2 权威迭代路线](docs/roadmap-to-v1.2.md) 为准；v1.0 完成核心 Agent，v1.1 增加 Preference Memory，v1.2 完成 MCP 与平台化。
+- 从 [v0.7 Grounded LLM Soft Critic 文档](docs/v0.7/README.md) 查看当前实现、配置、Graph、失败语义与评测；完整设计见 [设计报告](docs/v0.7/design.md)。
 - 从 [v0.6 约束优化与真实路线文档](docs/v0.6/README.md) 查看当前 Graph、求解预算、降级语义与消融 Benchmark。
 - [v0.5 局部自修复文档](docs/v0.5/README.md) 解释当前保留的 Critic/Repair 回退闭环。
 - 从 [v0.4 HITL 澄清恢复文档](docs/v0.4/README.md) 开始。
@@ -68,6 +80,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 $env:TRAVEL_PROVIDER = "mock"
 $env:REQUIREMENT_PROVIDER = "mock"
+$env:CRITIC_PROVIDER = "mock"
 $env:APP_LOG_LEVEL = "INFO"
 .\.venv\Scripts\python.exe -m uvicorn travel_agent.app:app --reload
 ```
@@ -144,6 +157,17 @@ $env:TRAVEL_PROVIDER = "mock"
 
 DeepSeek Provider 显式关闭 thinking mode：需求抽取是有界结构化任务，不需要额外推理 token。旧名称 `deepseek-chat`、`deepseek-reasoner` 已停止使用，配置阶段会拒绝。
 
+软质量评审 Provider 与需求解析独立配置。使用 DeepSeek Soft Critic：
+
+```powershell
+$env:CRITIC_PROVIDER = "deepseek"
+$env:CRITIC_MODEL = "replace-with-an-explicit-supported-model"
+$env:DEEPSEEK_API_KEY = "replace-with-your-own-key"
+$env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+```
+
+也可设置 `CRITIC_PROVIDER=openai` 并提供 `OPENAI_API_KEY` 与独立 `CRITIC_MODEL`。设置 `CRITIC_PROVIDER=disabled` 会完全跳过模型，但仍按硬约束和确定性指标交付。真实 Critic 失败不会回退 Mock。
+
 AMap 模式沿用 v0.2 的显式配置：设置 `TRAVEL_PROVIDER=amap` 与本机 `AMAP_API_KEY`。AMap 失败同样不会回退 Mock，也不会伪装成业务 `infeasible`。
 
 v0.6 默认同时请求驾车路线和阈值内的步行路线。`MAX_WALKING_LEG_METERS` 控制单段允许步行的最大距离；`USE_REAL_WALKING_ROUTES=false` 仅用于消融实验，会恢复历史估算语义，不建议用于最终计划。
@@ -157,6 +181,7 @@ v0.6 默认同时请求驾车路线和阈值内的步行路线。`MAX_WALKING_LE
 .\.venv\Scripts\python.exe scripts\evaluate_clarification_parser.py
 .\.venv\Scripts\python.exe scripts\evaluate_local_repair.py
 .\.venv\Scripts\python.exe scripts\evaluate_optimization.py
+.\.venv\Scripts\python.exe scripts\evaluate_soft_critic.py
 .\.venv\Scripts\python.exe -m pytest --cov=travel_agent --cov-report=term-missing
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m pip check

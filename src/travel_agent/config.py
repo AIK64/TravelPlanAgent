@@ -17,6 +17,13 @@ class CheckpointBackend(StrEnum):
     SQLITE = "sqlite"
 
 
+class CriticProviderMode(StrEnum):
+    DISABLED = "disabled"
+    MOCK = "mock"
+    OPENAI = "openai"
+    DEEPSEEK = "deepseek"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     provider: ProviderMode = ProviderMode.MOCK
@@ -40,6 +47,16 @@ class Settings:
     optimization_max_search_states: int = 20_000
     optimization_candidate_limit: int = 8
     optimization_variant_count: int = 3
+    critic_provider: CriticProviderMode = CriticProviderMode.MOCK
+    critic_model: str = "mock-soft-critic-v1"
+    critic_timeout_seconds: float = 20.0
+    critic_max_attempts: int = 2
+    critic_grounding_max_attempts: int = 2
+    critic_max_input_chars: int = 24_000
+    critic_max_output_tokens: int = 4_096
+    critic_quality_threshold: float = 70.0
+    critic_min_improvement: float = 5.0
+    max_soft_replan_rounds: int = 1
     requirement_provider: RequirementProviderMode = RequirementProviderMode.MOCK
     openai_api_key: str | None = field(default=None, repr=False)
     requirement_model: str = "mock-requirement-v1"
@@ -97,6 +114,34 @@ class Settings:
             optimization_variant_count=int(
                 source.get("OPTIMIZATION_VARIANT_COUNT", "3")
             ),
+            critic_provider=CriticProviderMode(
+                source.get("CRITIC_PROVIDER", "mock").strip().lower()
+            ),
+            critic_model=source.get(
+                "CRITIC_MODEL", "mock-soft-critic-v1"
+            ).strip(),
+            critic_timeout_seconds=float(
+                source.get("CRITIC_TIMEOUT_SECONDS", "20")
+            ),
+            critic_max_attempts=int(source.get("CRITIC_MAX_ATTEMPTS", "2")),
+            critic_grounding_max_attempts=int(
+                source.get("CRITIC_GROUNDING_MAX_ATTEMPTS", "2")
+            ),
+            critic_max_input_chars=int(
+                source.get("CRITIC_MAX_INPUT_CHARS", "24000")
+            ),
+            critic_max_output_tokens=int(
+                source.get("CRITIC_MAX_OUTPUT_TOKENS", "4096")
+            ),
+            critic_quality_threshold=float(
+                source.get("CRITIC_QUALITY_THRESHOLD", "70")
+            ),
+            critic_min_improvement=float(
+                source.get("CRITIC_MIN_IMPROVEMENT", "5")
+            ),
+            max_soft_replan_rounds=int(
+                source.get("MAX_SOFT_REPLAN_ROUNDS", "1")
+            ),
             requirement_provider=RequirementProviderMode(
                 source.get("REQUIREMENT_PROVIDER", "mock").strip().lower()
             ),
@@ -152,6 +197,39 @@ class Settings:
             raise ValueError("POI_CACHE_TTL_SECONDS must be positive")
         if self.route_cache_ttl_seconds <= 0:
             raise ValueError("ROUTE_CACHE_TTL_SECONDS must be positive")
+        if self.critic_provider is CriticProviderMode.OPENAI:
+            if not self.openai_api_key:
+                raise ValueError(
+                    "OPENAI_API_KEY is required when CRITIC_PROVIDER=openai"
+                )
+            if not self.critic_model or self.critic_model == "mock-soft-critic-v1":
+                raise ValueError(
+                    "CRITIC_MODEL is required when CRITIC_PROVIDER=openai"
+                )
+        if self.critic_provider is CriticProviderMode.DEEPSEEK:
+            if not self.deepseek_api_key:
+                raise ValueError(
+                    "DEEPSEEK_API_KEY is required when CRITIC_PROVIDER=deepseek"
+                )
+            if not self.critic_model or self.critic_model == "mock-soft-critic-v1":
+                raise ValueError(
+                    "CRITIC_MODEL is required when CRITIC_PROVIDER=deepseek"
+                )
+            if self.critic_model in {"deepseek-chat", "deepseek-reasoner"}:
+                raise ValueError(
+                    "CRITIC_MODEL uses a retired alias; choose an active model"
+                )
+            _validate_deepseek_base_url(self.deepseek_base_url)
+        if self.critic_timeout_seconds <= 0:
+            raise ValueError("CRITIC_TIMEOUT_SECONDS must be positive")
+        if self.critic_max_attempts < 1:
+            raise ValueError("CRITIC_MAX_ATTEMPTS must be at least 1")
+        if self.critic_grounding_max_attempts not in {1, 2}:
+            raise ValueError("CRITIC_GROUNDING_MAX_ATTEMPTS must be 1 or 2")
+        if self.critic_max_input_chars < 1:
+            raise ValueError("CRITIC_MAX_INPUT_CHARS must be positive")
+        if self.critic_max_output_tokens < 1:
+            raise ValueError("CRITIC_MAX_OUTPUT_TOKENS must be positive")
         if self.requirement_provider is RequirementProviderMode.OPENAI:
             if not self.openai_api_key:
                 raise ValueError(
@@ -208,6 +286,14 @@ class Settings:
             max_search_states=self.optimization_max_search_states,
             candidate_limit=self.optimization_candidate_limit,
             variant_count=self.optimization_variant_count,
+        )
+        from travel_agent.critique.quality import CriticPolicy
+
+        CriticPolicy(
+            quality_threshold=self.critic_quality_threshold,
+            min_improvement=self.critic_min_improvement,
+            max_soft_replan_rounds=self.max_soft_replan_rounds,
+            grounding_max_attempts=self.critic_grounding_max_attempts,
         )
 
 

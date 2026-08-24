@@ -7,7 +7,14 @@ from typing import Any
 import httpx
 from langgraph.graph.state import CompiledStateGraph
 
-from travel_agent.config import Settings
+from travel_agent.config import CriticProviderMode, Settings
+from travel_agent.critique.evidence import EvidenceBudget
+from travel_agent.critique.gateway import CriticGateway
+from travel_agent.critique.protocols import CriticModel
+from travel_agent.critique.providers.deepseek import DeepSeekCriticModel
+from travel_agent.critique.providers.mock import MockCriticModel
+from travel_agent.critique.providers.openai import OpenAICriticModel
+from travel_agent.critique.quality import CriticPolicy
 from travel_agent.domain.models import PlanningRequest, PlanningResponse
 from travel_agent.domain.optimization_models import OptimizationBudget
 from travel_agent.domain.tool_models import ProviderMode
@@ -54,6 +61,9 @@ class PlanningRuntime:
     requirement_gateway: RequirementGateway | None = None
     requirement_workflow: CompiledStateGraph | None = None
     model_client: Any | None = None
+    critic_model: CriticModel | None = None
+    critic_gateway: CriticGateway | None = None
+    critic_model_client: Any | None = None
     checkpoint_context: Any | None = field(default=None, repr=False)
     resume_locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False)
 
@@ -62,6 +72,7 @@ class PlanningRuntime:
         settings.validate()
         client: httpx.AsyncClient | None = None
         model_client: Any | None = None
+        critic_model_client: Any | None = None
         checkpoint_context: Any | None = None
         checkpoint_entered = False
         try:
@@ -95,11 +106,76 @@ class PlanningRuntime:
                 candidate_limit=settings.optimization_candidate_limit,
                 variant_count=settings.optimization_variant_count,
             )
+            critic_model: CriticModel | None
+            critic_gateway: CriticGateway | None
+            if settings.critic_provider is CriticProviderMode.DISABLED:
+                critic_model = None
+                critic_gateway = None
+            elif settings.critic_provider is CriticProviderMode.MOCK:
+                critic_model = MockCriticModel()
+                critic_gateway = CriticGateway(
+                    model=critic_model,
+                    timeout_seconds=settings.critic_timeout_seconds,
+                    max_attempts=settings.critic_max_attempts,
+                )
+            else:
+                try:
+                    from openai import AsyncOpenAI
+                except ImportError as error:
+                    extra = (
+                        "llm-openai"
+                        if settings.critic_provider is CriticProviderMode.OPENAI
+                        else "llm-deepseek"
+                    )
+                    raise RuntimeError(
+                        f"Install the {extra} extra to use "
+                        f"CRITIC_PROVIDER={settings.critic_provider.value}"
+                    ) from error
+                if settings.critic_provider is CriticProviderMode.OPENAI:
+                    assert settings.openai_api_key is not None
+                    critic_model_client = AsyncOpenAI(
+                        api_key=settings.openai_api_key,
+                        timeout=settings.critic_timeout_seconds,
+                        max_retries=0,
+                    )
+                    critic_model = OpenAICriticModel(
+                        client=critic_model_client,
+                        model=settings.critic_model,
+                    )
+                else:
+                    assert settings.deepseek_api_key is not None
+                    critic_model_client = AsyncOpenAI(
+                        api_key=settings.deepseek_api_key,
+                        base_url=settings.deepseek_base_url,
+                        timeout=settings.critic_timeout_seconds,
+                        max_retries=0,
+                    )
+                    critic_model = DeepSeekCriticModel(
+                        client=critic_model_client,
+                        model=settings.critic_model,
+                        max_tokens=settings.critic_max_output_tokens,
+                    )
+                critic_gateway = CriticGateway(
+                    model=critic_model,
+                    timeout_seconds=settings.critic_timeout_seconds,
+                    max_attempts=settings.critic_max_attempts,
+                )
+            critic_policy = CriticPolicy(
+                quality_threshold=settings.critic_quality_threshold,
+                min_improvement=settings.critic_min_improvement,
+                max_soft_replan_rounds=settings.max_soft_replan_rounds,
+                grounding_max_attempts=settings.critic_grounding_max_attempts,
+            )
             workflow = build_workflow(
                 gateway,
                 defaults,
                 policy,
                 optimization_budget=optimization_budget,
+                critic_gateway=critic_gateway,
+                critic_policy=critic_policy,
+                evidence_budget=EvidenceBudget(
+                    max_input_chars=settings.critic_max_input_chars
+                ),
             )
             if settings.requirement_provider is RequirementProviderMode.MOCK:
                 requirement_model: RequirementModel = MockRequirementModel()
@@ -166,6 +242,9 @@ class PlanningRuntime:
                 requirement_gateway=requirement_gateway,
                 requirement_workflow=requirement_workflow,
                 model_client=model_client,
+                critic_model=critic_model,
+                critic_gateway=critic_gateway,
+                critic_model_client=critic_model_client,
                 checkpoint_context=checkpoint_context,
             )
         except BaseException:
@@ -173,6 +252,11 @@ class PlanningRuntime:
                 await checkpoint_context.__aexit__(None, None, None)
             if model_client is not None:
                 await model_client.close()
+            if (
+                critic_model_client is not None
+                and critic_model_client is not model_client
+            ):
+                await critic_model_client.close()
             if client is not None:
                 await client.aclose()
             raise
@@ -180,6 +264,11 @@ class PlanningRuntime:
     async def close(self) -> None:
         if self.model_client is not None:
             await self.model_client.close()
+        if (
+            self.critic_model_client is not None
+            and self.critic_model_client is not self.model_client
+        ):
+            await self.critic_model_client.close()
         if self.client is not None:
             await self.client.aclose()
         if self.checkpoint_context is not None:

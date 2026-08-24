@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class RepairActionKind(StrEnum):
     REMOVE_OPTIONAL_POI = "remove_optional_poi"
     MOVE_POI = "move_poi"
+    REORDER_OPTIONAL_POI = "reorder_optional_poi"
     INSERT_MUST_VISIT = "insert_must_visit"
     ADD_AVAILABLE_POI = "add_available_poi"
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from travel_agent.config import CheckpointBackend, Settings
+from travel_agent.config import CheckpointBackend, CriticProviderMode, Settings
 from travel_agent.domain.tool_models import ProviderMode
 from travel_agent.requirements.models import RequirementProviderMode
 
@@ -13,6 +13,7 @@ def test_settings_default_to_mock():
 
     assert settings.provider is ProviderMode.MOCK
     assert settings.requirement_provider is RequirementProviderMode.MOCK
+    assert settings.critic_provider is CriticProviderMode.MOCK
     assert settings.requirement_model == "mock-requirement-v1"
     assert settings.requirement_max_attempts == 2
     assert settings.tool_max_attempts == 3
@@ -209,6 +210,14 @@ def test_settings_rejects_invalid_boolean():
         ("REQUIREMENT_MAX_ATTEMPTS", "0"),
         ("REQUIREMENT_BACKOFF_BASE_SECONDS", "-1"),
         ("REQUIREMENT_MAX_BACKOFF_SECONDS", "-1"),
+        ("CRITIC_TIMEOUT_SECONDS", "0"),
+        ("CRITIC_MAX_ATTEMPTS", "0"),
+        ("CRITIC_GROUNDING_MAX_ATTEMPTS", "3"),
+        ("CRITIC_MAX_INPUT_CHARS", "0"),
+        ("CRITIC_MAX_OUTPUT_TOKENS", "0"),
+        ("CRITIC_QUALITY_THRESHOLD", "101"),
+        ("CRITIC_MIN_IMPROVEMENT", "-1"),
+        ("MAX_SOFT_REPLAN_ROUNDS", "2"),
     ],
 )
 def test_settings_reject_invalid_execution_budget(name: str, value: str):
@@ -237,3 +246,28 @@ def test_sqlite_checkpoint_requires_path():
                 "CHECKPOINT_SQLITE_PATH": " ",
             }
         )
+
+
+def test_deepseek_critic_requires_independent_explicit_model():
+    with pytest.raises(ValueError, match="CRITIC_MODEL"):
+        Settings.from_env(
+            {
+                "CRITIC_PROVIDER": "deepseek",
+                "DEEPSEEK_API_KEY": "secret",
+            }
+        )
+
+    settings = Settings.from_env(
+        {
+            "CRITIC_PROVIDER": "deepseek",
+            "CRITIC_MODEL": "deepseek-explicit-model",
+            "DEEPSEEK_API_KEY": "secret",
+        }
+    )
+    assert settings.critic_provider is CriticProviderMode.DEEPSEEK
+    assert settings.critic_model == "deepseek-explicit-model"
+
+
+def test_disabled_critic_requires_no_model_key():
+    settings = Settings.from_env({"CRITIC_PROVIDER": "disabled"})
+    assert settings.critic_provider is CriticProviderMode.DISABLED
